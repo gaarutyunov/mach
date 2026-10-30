@@ -41,15 +41,16 @@ pub const Context = struct {
                 log.info("Backend selected: {s}", .{@tagName(b)});
                 break :blk d;
             } else {
-                inline for (std.meta.fields(Backend), 0..) |b, i| {
+                const all_backends = comptime std.enums.values(Backend);
+                inline for (all_backends, 0..) |b, i| {
                     if (@typeInfo(
-                        std.meta.fieldInfo(backends.Context, @as(Backend, @enumFromInt(b.value))).type,
+                        std.meta.fieldInfo(backends.Context, b).type,
                     ).pointer.child.init(allocator, options)) |d| {
-                        log.info("Backend selected: {s}", .{b.name});
+                        log.info("Backend selected: {s}", .{@tagName(b)});
                         break :blk d;
                     } else |err| {
-                        if (i == std.meta.fields(Backend).len - 1) {
-                            log.info("Init failed of Backend: {s}", .{b.name});
+                        if (i == all_backends.len - 1) {
+                            log.info("Init failed of Backend: {s}", .{@tagName(b)});
                             return err;
                         }
                     }
@@ -437,7 +438,7 @@ pub const Device = struct {
 
         var best: Format = device.formats[0];
         for (device.formats) |fmt| {
-            if (@intFromEnum(fmt) > @intFromEnum(best)) best = fmt;
+            if (@backingInt(fmt) > @backingInt(best)) best = fmt;
         }
         return best;
     }

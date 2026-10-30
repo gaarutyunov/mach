@@ -10,7 +10,7 @@ const quat = @import("quat.zig");
 pub const VecComponent = enum { x, y, z, w };
 
 pub fn Vec2(comptime Scalar: type) type {
-    return extern struct {
+    return struct {
         v: Vector,
 
         /// The vector dimension size, e.g. Vec3.n == 3
@@ -77,7 +77,7 @@ pub fn Vec2(comptime Scalar: type) type {
 }
 
 pub fn Vec3(comptime Scalar: type) type {
-    return extern struct {
+    return struct {
         v: Vector,
 
         /// The vector dimension size, e.g. Vec3.n == 3
@@ -116,9 +116,9 @@ pub fn Vec3(comptime Scalar: type) type {
             zc: VecComponent,
         ) VecN {
             return .{ .v = @shuffle(VecN.T, v.v, undefined, [3]T{
-                @intFromEnum(xc),
-                @intFromEnum(yc),
-                @intFromEnum(zc),
+                @backingInt(xc),
+                @backingInt(yc),
+                @backingInt(zc),
             }) };
         }
 
@@ -135,7 +135,7 @@ pub fn Vec3(comptime Scalar: type) type {
 
         /// Vector * Matrix multiplication
         pub inline fn mulMat(vector: *const VecN, matrix: *const mat.Mat3x3(T)) VecN {
-            var result = [_]VecN.T{0} ** 3;
+            var result: [3]VecN.T = @splat(0);
             inline for (0..3) |i| {
                 inline for (0..3) |j| {
                     result[i] += vector.v[j] * matrix.v[i].v[j];
@@ -191,7 +191,7 @@ pub fn Vec3(comptime Scalar: type) type {
 }
 
 pub fn Vec4(comptime Scalar: type) type {
-    return extern struct {
+    return struct {
         v: Vector,
 
         /// The vector dimension size, e.g. Vec3.n == 3
@@ -233,15 +233,15 @@ pub fn Vec4(comptime Scalar: type) type {
             zc: VecComponent,
         ) Vec3(Scalar) {
             return .{ .v = @shuffle(Scalar, v.v, undefined, [3]T{
-                @intFromEnum(xc),
-                @intFromEnum(yc),
-                @intFromEnum(zc),
+                @backingInt(xc),
+                @backingInt(yc),
+                @backingInt(zc),
             }) };
         }
 
         /// Vector * Matrix multiplication
         pub inline fn mulMat(vector: *const VecN, matrix: *const mat.Mat4x4(T)) VecN {
-            var result = [_]VecN.T{0} ** 4;
+            var result: [4]VecN.T = @splat(0);
             inline for (0..4) |i| {
                 inline for (0..4) |j| {
                     result[i] += vector.v[j] * matrix.v[i].v[j];

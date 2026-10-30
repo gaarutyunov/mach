@@ -743,7 +743,7 @@ fn emitVector(msl: *Msl, inst: Inst.Vector) !void {
 }
 
 fn emitVectorElems(msl: *Msl, size: Inst.Vector.Size, value: [4]InstIndex) !void {
-    for (value[0..@intFromEnum(size)], 0..) |elem_inst, i| {
+    for (value[0..@backingInt(size)], 0..) |elem_inst, i| {
         try msl.writeAll(if (i == 0) "" else ", ");
         try msl.emitExpr(elem_inst);
     }
@@ -754,7 +754,7 @@ fn emitMatrix(msl: *Msl, inst: Inst.Matrix) !void {
     try msl.writeAll("(");
 
     const value = msl.air.getValue(Inst.Matrix.Value, inst.value.?);
-    for (value[0..@intFromEnum(inst.cols)], 0..) |elem_inst, i| {
+    for (value[0..@backingInt(inst.cols)], 0..) |elem_inst, i| {
         try msl.writeAll(if (i == 0) "" else ", ");
         try msl.emitExpr(elem_inst);
     }
@@ -994,7 +994,7 @@ fn emitFieldAccess(msl: *Msl, inst: Inst.FieldAccess) !void {
 fn emitSwizzleAccess(msl: *Msl, inst: Inst.SwizzleAccess) !void {
     try msl.emitExpr(inst.base);
     try msl.writeAll(".");
-    for (0..@intFromEnum(inst.size)) |i| {
+    for (0..@backingInt(inst.size)) |i| {
         switch (inst.pattern[i]) {
             .x => try msl.writeAll("x"),
             .y => try msl.writeAll("y"),
@@ -1232,7 +1232,7 @@ fn emitSamplerType(msl: *Msl) !void {
 fn writeName(msl: *Msl, name: Air.StringIndex) !void {
     // Suffix with index as WGSL has different scoping rules and to avoid conflicts with keywords
     const str = msl.air.getStr(name);
-    try msl.print("{s}_{}", .{ str, @intFromEnum(name) });
+    try msl.print("{s}_{}", .{ str, @backingInt(name) });
 }
 
 fn writeAll(msl: *Msl, bytes: []const u8) !void {

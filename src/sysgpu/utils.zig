@@ -22,7 +22,7 @@ pub fn Manager(comptime T: type) type {
 }
 
 pub fn findChained(comptime T: type, next_in_chain: ?*const sysgpu.ChainedStruct) ?*const T {
-    const search = @as(*align(1) const sysgpu.ChainedStruct, @ptrCast(std.meta.fieldInfo(T, .chain).default_value_ptr.?));
+    const search = @as(*align(1) const sysgpu.ChainedStruct, @ptrCast(std.meta.fieldInfo(T, .chain).attrs.default_value_ptr.?));
     var chain = next_in_chain;
     while (chain) |c| {
         if (c.s_type == search.s_type) {

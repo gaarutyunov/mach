@@ -76,26 +76,26 @@ pub fn generate(
 }
 
 pub fn refToList(air: Air, ref: RefIndex) []const InstIndex {
-    return std.mem.sliceTo(air.refs[@intFromEnum(ref)..], .none);
+    return std.mem.sliceTo(air.refs[@backingInt(ref)..], .none);
 }
 
 pub fn getInst(air: Air, index: InstIndex) Inst {
-    return air.instructions[@intFromEnum(index)];
+    return air.instructions[@backingInt(index)];
 }
 
 pub fn getStr(air: Air, index: StringIndex) []const u8 {
-    return std.mem.sliceTo(air.strings[@intFromEnum(index)..], 0);
+    return std.mem.sliceTo(air.strings[@backingInt(index)..], 0);
 }
 
 pub fn getValue(air: Air, comptime T: type, value: ValueIndex) T {
-    return std.mem.bytesAsValue(T, air.values[@intFromEnum(value)..][0..@sizeOf(T)]).*;
+    return std.mem.bytesAsValue(T, air.values[@backingInt(value)..][0..@sizeOf(T)]).*;
 }
 
 pub fn typeSize(air: Air, index: InstIndex) ?u32 {
     return switch (air.getInst(index)) {
         inline .int, .float => |num| num.type.size(),
-        .vector => |vec| @as(u32, @intFromEnum(vec.size)),
-        .matrix => |mat| @as(u32, @intFromEnum(mat.cols)) * @as(u32, @intFromEnum(mat.rows)),
+        .vector => |vec| @as(u32, @backingInt(vec.size)),
+        .matrix => |mat| @as(u32, @backingInt(mat.cols)) * @as(u32, @backingInt(mat.rows)),
         .array => |arr| {
             if (arr.len == .none) return null;
             return @intCast(air.resolveInt(arr.len) orelse return null);
@@ -294,7 +294,7 @@ pub fn resolveConstExpr(air: Air, inst_idx: InstIndex) ?ConstExpr {
         .vector => |vec| {
             if (vec.value.? == .none) return .guaranteed;
             switch (air.getValue(Inst.Vector.Value, vec.value.?)) {
-                .literal => |literal| for (literal[0..@intFromEnum(vec.size)]) |elem_val| {
+                .literal => |literal| for (literal[0..@backingInt(vec.size)]) |elem_val| {
                     if (air.resolveConstExpr(elem_val) == null) {
                         return null;
                     }
@@ -306,7 +306,7 @@ pub fn resolveConstExpr(air: Air, inst_idx: InstIndex) ?ConstExpr {
         },
         .matrix => |mat| {
             if (mat.value.? == .none) return .guaranteed;
-            for (air.getValue(Inst.Matrix.Value, mat.value.?)[0..@intFromEnum(mat.cols)]) |elem_val| {
+            for (air.getValue(Inst.Matrix.Value, mat.value.?)[0..@backingInt(mat.cols)]) |elem_val| {
                 if (air.resolveConstExpr(elem_val) == null) {
                     return null;
                 }

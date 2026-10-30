@@ -280,7 +280,7 @@ fn initWindow(
 }
 
 fn windowIdFromHwnd(hwnd: w.HWND) mach.ObjectID {
-    const userdata: usize = @bitCast(w.GetWindowLongPtrW(hwnd, @enumFromInt(0)));
+    const userdata: usize = @bitCast(w.GetWindowLongPtrW(hwnd, @fromBackingInt(@intCast(0))));
     if (userdata == 0) unreachable;
     return @bitCast(userdata - 1);
 }
@@ -301,14 +301,14 @@ fn getClientSize(hwnd: w.HWND) Size {
 
 fn getKeyboardModifiers() KeyMods {
     return .{
-        .shift = w.GetKeyState(@as(i32, @intFromEnum(w.VK_SHIFT))) < 0, //& 0x8000 == 0x8000,
-        .control = w.GetKeyState(@as(i32, @intFromEnum(w.VK_CONTROL))) < 0, // & 0x8000 == 0x8000,
-        .alt = w.GetKeyState(@as(i32, @intFromEnum(w.VK_MENU))) < 0, // & 0x8000 == 0x8000,
-        .super = (w.GetKeyState(@as(i32, @intFromEnum(w.VK_LWIN)))) < 0 // & 0x8000 == 0x8000)
-        or (w.GetKeyState(@as(i32, @intFromEnum(w.VK_RWIN)))) < 0, // & 0x8000 == 0x8000),
-        .caps_lock = w.GetKeyState(@as(i32, @intFromEnum(w.VK_CAPITAL))) & 1 == 1,
-        .num_lock = w.GetKeyState(@as(i32, @intFromEnum(w.VK_NUMLOCK))) & 1 == 1,
-        .help = w.GetKeyState(@as(i32, @intFromEnum(w.VK_HELP))) < 0,
+        .shift = w.GetKeyState(@as(i32, @backingInt(w.VK_SHIFT))) < 0, //& 0x8000 == 0x8000,
+        .control = w.GetKeyState(@as(i32, @backingInt(w.VK_CONTROL))) < 0, // & 0x8000 == 0x8000,
+        .alt = w.GetKeyState(@as(i32, @backingInt(w.VK_MENU))) < 0, // & 0x8000 == 0x8000,
+        .super = (w.GetKeyState(@as(i32, @backingInt(w.VK_LWIN)))) < 0 // & 0x8000 == 0x8000)
+        or (w.GetKeyState(@as(i32, @backingInt(w.VK_RWIN)))) < 0, // & 0x8000 == 0x8000),
+        .caps_lock = w.GetKeyState(@as(i32, @backingInt(w.VK_CAPITAL))) & 1 == 1,
+        .num_lock = w.GetKeyState(@as(i32, @backingInt(w.VK_NUMLOCK))) & 1 == 1,
+        .help = w.GetKeyState(@as(i32, @backingInt(w.VK_HELP))) < 0,
         .function = false,
     };
 }
@@ -334,7 +334,7 @@ fn wndProc(hwnd: w.HWND, msg: u32, wParam: w.WPARAM, lParam: w.LPARAM) callconv(
 
             core.windows.setRaw(window_id, .native, .{ .hwnd = hwnd });
             // we add 1 to distinguish between a valid window id and an uninitialized slot
-            std.debug.assert(0 == w.SetWindowLongPtrW(hwnd, @enumFromInt(0), @bitCast(create_args.window_id + 1)));
+            std.debug.assert(0 == w.SetWindowLongPtrW(hwnd, @fromBackingInt(@intCast(0)), @bitCast(create_args.window_id + 1)));
             std.debug.assert(create_args.window_id == windowIdFromHwnd(hwnd));
             return 0;
         },
@@ -396,7 +396,7 @@ fn wndProc(hwnd: w.HWND, msg: u32, wParam: w.WPARAM, lParam: w.LPARAM) callconv(
             // Virtulkey: A key with a name, multiple physical buttons can produce the same virtual key.
             const window_id = windowIdFromHwnd(hwnd);
 
-            const vkey: w.VIRTUAL_KEY = @enumFromInt(wParam);
+            const vkey: w.VIRTUAL_KEY = @fromBackingInt(@intCast(wParam));
             if (vkey == w.VK_PROCESSKEY) return 0;
 
             if (msg == w.WM_SYSKEYDOWN and vkey == w.VK_F4) {

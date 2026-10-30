@@ -863,10 +863,10 @@ fn getStride(spv: *SpirV, inst: InstIndex, direct: bool) u8 {
         inline .int, .float => |num| num.type.sizeBits() / 8,
         .array => |arr| spv.getStride(arr.elem_type, false),
         .vector => |vec| return spv.getStride(vec.elem_type, false) *
-            if (direct) 1 else @as(u8, @intCast(@intFromEnum(vec.size))),
-        .matrix => |mat| return @as(u8, @intCast(@intFromEnum(mat.cols))) *
+            if (direct) 1 else @as(u8, @intCast(@backingInt(vec.size))),
+        .matrix => |mat| return @as(u8, @intCast(@backingInt(mat.cols))) *
             spv.getStride(mat.elem_type, false) *
-            if (direct) 1 else @as(u8, @intCast(@intFromEnum(mat.rows))),
+            if (direct) 1 else @as(u8, @intCast(@backingInt(mat.rows))),
         .@"struct" => |strct| {
             var total: u8 = 0;
             const members = spv.air.refToList(strct.members);
@@ -884,8 +884,8 @@ fn getSize(spv: *SpirV, inst: InstIndex) u16 {
     return switch (spv.air.getInst(inst)) {
         inline .int, .float => |num| num.type.sizeBits() / 8,
         .array => |arr| return @intCast(spv.air.resolveInt(arr.len).? * spv.getSize(arr.elem_type)),
-        .vector => |vec| return spv.getSize(vec.elem_type) * @intFromEnum(vec.size),
-        .matrix => |mat| return @as(u8, @intCast(@intFromEnum(mat.cols))) * @intFromEnum(mat.rows) * spv.getSize(mat.elem_type),
+        .vector => |vec| return spv.getSize(vec.elem_type) * @backingInt(vec.size),
+        .matrix => |mat| return @as(u8, @intCast(@backingInt(mat.cols))) * @backingInt(mat.rows) * spv.getSize(mat.elem_type),
         .@"struct" => |strct| {
             var size: u16 = 0;
             const members = spv.air.refToList(strct.members);
@@ -1458,7 +1458,7 @@ fn emitSwizzleAccess(spv: *SpirV, section: *Section, inst: Inst.SwizzleAccess) !
                 .type = try spv.resolve(.{
                     .vector_type = .{
                         .elem_type = try spv.emitType(inst.type),
-                        .size = @enumFromInt(@intFromEnum(inst.size)),
+                        .size = @fromBackingInt(@intCast(@backingInt(inst.size))),
                     },
                 }),
                 .value = swizzles,
@@ -1476,7 +1476,7 @@ fn emitSwizzleAccess(spv: *SpirV, section: *Section, inst: Inst.SwizzleAccess) !
 
     const vec_ty = try spv.resolve(.{ .vector_type = .{
         .elem_type = try spv.emitType(inst.type),
-        .size = @enumFromInt(@intFromEnum(inst.size)),
+        .size = @fromBackingInt(@intCast(@backingInt(inst.size))),
     } });
 
     const id = spv.allocId();
@@ -1490,14 +1490,14 @@ fn emitSwizzleAccess(spv: *SpirV, section: *Section, inst: Inst.SwizzleAccess) !
 
 fn extractSwizzle(spv: *SpirV, section: *Section, inst: Inst.SwizzleAccess) ![]const IdRef {
     const base = try spv.emitExpr(section, inst.base);
-    const swizzles = try spv.allocator.alloc(IdRef, @intFromEnum(inst.size));
+    const swizzles = try spv.allocator.alloc(IdRef, @backingInt(inst.size));
     for (swizzles, 0..) |*id, i| {
         id.* = spv.allocId();
         try section.emit(.OpCompositeExtract, .{
             .id_result_type = try spv.emitType(inst.type),
             .id_result = id.*,
             .composite = base,
-            .indexes = &.{@intFromEnum(inst.pattern[i])},
+            .indexes = &.{@backingInt(inst.pattern[i])},
         });
     }
     return swizzles;
@@ -1767,23 +1767,23 @@ fn emitBinary(
 
     if (lhs_ty == .vector and rhs_ty != .vector) {
         var constituents: [4]IdRef = undefined;
-        @memset(constituents[0..@intFromEnum(lhs_ty.vector.size)], rhs.*);
+        @memset(constituents[0..@backingInt(lhs_ty.vector.size)], rhs.*);
         rhs.* = spv.allocId();
         try section.emit(.OpCompositeConstruct, .{
             .id_result_type = result_ty,
             .id_result = rhs.*,
-            .constituents = constituents[0..@intFromEnum(lhs_ty.vector.size)],
+            .constituents = constituents[0..@backingInt(lhs_ty.vector.size)],
         });
     }
 
     if (rhs_ty == .vector and lhs_ty != .vector) {
         var constituents: [4]IdRef = undefined;
-        @memset(constituents[0..@intFromEnum(rhs_ty.vector.size)], lhs.*);
+        @memset(constituents[0..@backingInt(rhs_ty.vector.size)], lhs.*);
         lhs.* = spv.allocId();
         try section.emit(.OpCompositeConstruct, .{
             .id_result_type = result_ty,
             .id_result = lhs.*,
-            .constituents = constituents[0..@intFromEnum(rhs_ty.vector.size)],
+            .constituents = constituents[0..@backingInt(rhs_ty.vector.size)],
         });
     }
 
@@ -2023,7 +2023,7 @@ fn emitTripleIntrinsic(spv: *SpirV, section: *Section, triple: Inst.TripleIntrin
         const vec_type_inst = spv.air.getInst(triple.result_type).vector;
         var constituents_buf: [4]IdRef = undefined;
         var constituents = std.ArrayList(IdRef).initBuffer(&constituents_buf);
-        constituents.appendNTimesAssumeCapacity(a3, @intFromEnum(vec_type_inst.size));
+        constituents.appendNTimesAssumeCapacity(a3, @backingInt(vec_type_inst.size));
         a3 = spv.allocId();
         try section.emit(.OpCompositeConstruct, .{
             .id_result_type = result_type,
@@ -2208,7 +2208,7 @@ fn accessPtr(spv: *SpirV, section: *Section, decl: InstIndex) error{OutOfMemory}
             const id = spv.allocId();
             const index_id = try spv.resolve(.{ .int = .{
                 .type = .u32,
-                .value = @intFromEnum(swizzle_access.pattern[0]),
+                .value = @backingInt(swizzle_access.pattern[0]),
             } });
             const type_id = try spv.emitType(swizzle_access.type);
             const base = try spv.accessPtr(section, swizzle_access.base);
@@ -2395,15 +2395,15 @@ fn emitVector(spv: *SpirV, section: *Section, inst: Inst.Vector) !IdRef {
     var constituents: std.ArrayList(IdRef) = .empty;
     defer constituents.deinit(spv.allocator);
 
-    try constituents.ensureTotalCapacityPrecise(spv.allocator, @intFromEnum(inst.size));
+    try constituents.ensureTotalCapacityPrecise(spv.allocator, @backingInt(inst.size));
 
     const value = spv.air.getValue(Inst.Vector.Value, inst.value.?);
     switch (value) {
-        .literal => for (value.literal[0..@intFromEnum(inst.size)]) |elem_inst| {
+        .literal => for (value.literal[0..@backingInt(inst.size)]) |elem_inst| {
             const elem_id = try spv.emitExpr(section, elem_inst);
             constituents.appendAssumeCapacity(elem_id);
         },
-        .cast => |cast| for (cast.value[0..@intFromEnum(inst.size)]) |elem_inst| {
+        .cast => |cast| for (cast.value[0..@backingInt(inst.size)]) |elem_inst| {
             const elem_id = switch (elem_type_key) {
                 .float_type => |float| try spv.emitFloatCast(section, float, .{ .type = cast.type, .value = elem_inst }),
                 .int_type => |int| try spv.emitIntCast(section, int, .{ .type = cast.type, .value = elem_inst }),
@@ -2443,10 +2443,10 @@ fn emitMatrix(spv: *SpirV, section: *Section, inst: Inst.Matrix) !IdRef {
 
     var constituents: std.ArrayList(IdRef) = .empty;
     defer constituents.deinit(spv.allocator);
-    try constituents.ensureTotalCapacityPrecise(spv.allocator, @intFromEnum(inst.cols));
+    try constituents.ensureTotalCapacityPrecise(spv.allocator, @backingInt(inst.cols));
 
     const value = spv.air.getValue(Inst.Matrix.Value, inst.value.?);
-    for (value[0..@intFromEnum(inst.cols)]) |elem_inst| {
+    for (value[0..@backingInt(inst.cols)]) |elem_inst| {
         const elem_id = try spv.emitExpr(section, elem_inst);
         constituents.appendAssumeCapacity(elem_id);
     }
@@ -2638,12 +2638,12 @@ pub fn resolve(spv: *SpirV, key: Key) !IdRef {
         .vector_type => |vector| try spv.global_section.emit(.OpTypeVector, .{
             .id_result = id,
             .component_type = vector.elem_type,
-            .component_count = @intFromEnum(vector.size),
+            .component_count = @backingInt(vector.size),
         }),
         .matrix_type => |matrix| try spv.global_section.emit(.OpTypeMatrix, .{
             .id_result = id,
             .column_type = matrix.elem_type,
-            .column_count = @intFromEnum(matrix.cols),
+            .column_count = @backingInt(matrix.cols),
         }),
         .array_type => |array| {
             if (array.len) |len| {

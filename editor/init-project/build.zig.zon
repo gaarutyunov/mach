@@ -17,9 +17,10 @@
     // modify the field.
     .fingerprint = 0x72e87e5112345678, // Changing this has security and trust implications.
 
-    // The Mach nominated version our project targets.
+    // The Zig version our project targets.
     // https://machengine.org/docs/zig-version
-    .mach_zig_version = "2026.4.10-mach",
+    .mach_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.0",
 
     // Specifies the set of files and directories that are included in this package.
     // As a rule of thumb, one should list files required for compilation plus any license(s).

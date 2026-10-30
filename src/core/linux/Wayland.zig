@@ -10,19 +10,7 @@ const log = std.log.scoped(.mach);
 
 pub const Wayland = @This();
 
-pub const c = @cImport({
-    @cInclude("wayland-client-protocol.h");
-    @cInclude("wayland-xdg-shell-client-protocol.h");
-    @cInclude("wayland-xdg-decoration-client-protocol.h");
-    @cInclude("wayland-viewporter-client-protocol.h");
-    @cInclude("wayland-relative-pointer-unstable-v1-client-protocol.h");
-    @cInclude("wayland-pointer-constraints-unstable-v1-client-protocol.h");
-    @cInclude("wayland-idle-inhibit-unstable-v1-client-protocol.h");
-    @cInclude("xkbcommon/xkbcommon.h");
-    @cInclude("xkbcommon/xkbcommon-compose.h");
-    @cInclude("linux/input-event-codes.h");
-    @cInclude("libdecor.h");
-});
+pub const c = @import("c_wayland");
 
 // This needs to be declared here so it can be used in the exported functions below,
 // but doesn't need to be defined until run time (and can't be defined until run time).
@@ -340,10 +328,10 @@ pub const LibXkbCommon = struct {
         var lib: LibXkbCommon = undefined;
         lib.handle = mach.dynLibOpen(.{ "libxkbcommon.so.0", "libxkbcommon.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibXkbCommon).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibXkbCommon).@"struct".field_names[1..], @typeInfo(LibXkbCommon).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse {
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse {
                 log.err("Symbol lookup failed for {s}", .{name});
                 return error.SymbolLookup;
             };
@@ -402,10 +390,10 @@ pub const LibWaylandClient = struct {
         var lib: LibWaylandClient = undefined;
         lib.handle = mach.dynLibOpen(.{ "libwayland-client.so.0", "libwayland-client.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibWaylandClient).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibWaylandClient).@"struct".field_names[1..], @typeInfo(LibWaylandClient).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse {
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse {
                 log.err("Symbol lookup failed for {s}", .{name});
                 return error.SymbolLookup;
             };
@@ -431,10 +419,10 @@ pub const LibDecor = struct {
         var lib: LibDecor = undefined;
         lib.handle = mach.dynLibOpen(.{ "libdecor-0.so.0", "libdecor-0.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibDecor).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibDecor).@"struct".field_names[1..], @typeInfo(LibDecor).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse {
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse {
                 log.err("Symbol lookup failed for {s}", .{name});
                 return error.SymbolLookup;
             };
@@ -857,7 +845,7 @@ const pointer_listener = struct {
         _ = time;
         const wl = &core_ptr.windows.getValue(window_id).native.?.wayland;
 
-        const mouse_button: Core.MouseButtonID = @enumFromInt(button - c.BTN_LEFT);
+        const mouse_button: Core.MouseButtonID = @fromBackingInt(@intCast(button - c.BTN_LEFT));
         const pressed = state == c.WL_POINTER_BUTTON_STATE_PRESSED;
         const x = core_ptr.input_state.mouse_position.x;
         const y = core_ptr.input_state.mouse_position.y;

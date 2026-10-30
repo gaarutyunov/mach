@@ -6,7 +6,7 @@ const std = @import("std");
 
 const log = std.log.scoped(.mach);
 
-pub const is_debug = builtin.mode == .Debug;
+pub const is_debug = builtin.mode == .debug;
 
 // Core
 pub const Core = if (build_options.want_core) @import("Core.zig") else struct {};
@@ -35,12 +35,38 @@ pub const initGraph = module.initGraph;
 pub const schedule = module.schedule;
 pub const startThread = module.startThread;
 
+/// Dynamic library loading and symbol lookup. Same as `std.DynLib`, except that it also supports
+/// Windows (which `std.DynLib` no longer does as of Zig 0.17.)
+pub const DynLib = if (builtin.os.tag == .windows) WindowsDynLib else std.DynLib;
+
+const WindowsDynLib = struct {
+    module: *anyopaque,
+
+    extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn FreeLibrary(hLibModule: *anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetProcAddress(hModule: *anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+
+    pub fn open(path: [:0]const u8) error{FileNotFound}!WindowsDynLib {
+        return .{ .module = LoadLibraryA(path) orelse return error.FileNotFound };
+    }
+
+    pub fn close(self: *WindowsDynLib) void {
+        _ = FreeLibrary(self.module);
+        self.* = undefined;
+    }
+
+    pub fn lookup(self: *WindowsDynLib, comptime T: type, name: [:0]const u8) ?T {
+        const symbol: T = @ptrCast(@alignCast(GetProcAddress(self.module, name) orelse return null));
+        return symbol;
+    }
+};
+
 // Instrumented function to load system libraries and print nicer error
 // messages. Accepts a tuple of library names to try in order (e.g.,
 // versioned soname first, then unversioned fallback).
-pub inline fn dynLibOpen(comptime lib_names: anytype) !std.DynLib {
+pub inline fn dynLibOpen(comptime lib_names: anytype) !DynLib {
     inline for (lib_names) |name| {
-        if (std.DynLib.open(name)) |lib| return lib else |_| {}
+        if (DynLib.open(name)) |lib| return lib else |_| {}
     }
     log.err("missing system library, tried:", .{});
     inline for (lib_names) |name| {

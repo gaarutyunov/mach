@@ -90,7 +90,7 @@ fn Printer(comptime Writer: type) type {
                 .var_ref => |ref| {
                     try self.instStart(index);
                     try self.tty.setColor(self.writer, .yellow);
-                    try self.writer.print("{d}", .{@intFromEnum(ref)});
+                    try self.writer.print("{d}", .{@backingInt(ref)});
                     try self.tty.setColor(self.writer, .reset);
                     try self.instEnd();
                 },
@@ -356,7 +356,7 @@ fn Printer(comptime Writer: type) type {
                         .literal => |lit| {
                             try self.printFieldName(indent + 1, "literal");
                             try self.listStart();
-                            for (0..@intFromEnum(vec.size)) |i| {
+                            for (0..@backingInt(vec.size)) |i| {
                                 try self.printIndent(indent + 2);
                                 try self.printInst(indent + 2, lit[i]);
                                 try self.printFieldEnd();
@@ -367,7 +367,7 @@ fn Printer(comptime Writer: type) type {
                         .cast => |cast| {
                             try self.printFieldName(indent + 1, "cast");
                             try self.listStart();
-                            for (0..@intFromEnum(vec.size)) |i| {
+                            for (0..@backingInt(vec.size)) |i| {
                                 try self.printIndent(indent + 2);
                                 try self.printInst(indent + 2, cast.value[i]);
                                 try self.printFieldEnd();
@@ -389,7 +389,7 @@ fn Printer(comptime Writer: type) type {
                 const value = self.ir.getValue(Air.Inst.Matrix.Value, value_idx);
                 try self.printFieldName(indent + 1, "value");
                 try self.listStart();
-                for (0..@intFromEnum(mat.cols) * @intFromEnum(mat.rows)) |i| {
+                for (0..@backingInt(mat.cols) * @backingInt(mat.rows)) |i| {
                     try self.printIndent(indent + 2);
                     try self.printInst(indent + 2, value[i]);
                     try self.printFieldEnd();
@@ -426,7 +426,7 @@ fn Printer(comptime Writer: type) type {
             try self.writer.writeAll("<");
             try self.tty.setColor(self.writer, .reset);
             try self.tty.setColor(self.writer, .blue);
-            try self.writer.print("{d}", .{@intFromEnum(index)});
+            try self.writer.print("{d}", .{@backingInt(index)});
             try self.tty.setColor(self.writer, .reset);
             try self.tty.setColor(self.writer, .dim);
             try self.writer.writeAll(">");
@@ -449,7 +449,7 @@ fn Printer(comptime Writer: type) type {
             try self.writer.writeAll("<");
             try self.tty.setColor(self.writer, .reset);
             try self.tty.setColor(self.writer, .blue);
-            try self.writer.print("{d}", .{@intFromEnum(index)});
+            try self.writer.print("{d}", .{@backingInt(index)});
             try self.tty.setColor(self.writer, .reset);
             try self.tty.setColor(self.writer, .dim);
             try self.writer.writeAll(">");

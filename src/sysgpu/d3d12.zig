@@ -31,8 +31,8 @@ var gpu_validation_enabled: bool = undefined;
 const DXGI_PRESENT_ALLOW_TEARING: c.UINT = 0x00000200;
 
 pub const InitOptions = struct {
-    debug_enabled: bool = builtin.mode == .Debug,
-    gpu_validation_enabled: bool = builtin.mode == .Debug,
+    debug_enabled: bool = builtin.mode == .debug,
+    gpu_validation_enabled: bool = builtin.mode == .debug,
 };
 
 pub fn init(alloc: std.mem.Allocator, options: InitOptions) !void {
@@ -2739,7 +2739,7 @@ pub const RenderPipeline = struct {
         }
 
         var num_render_targets: usize = 0;
-        var rtv_formats = [_]c.DXGI_FORMAT{c.DXGI_FORMAT_UNKNOWN} ** limits.max_color_attachments;
+        var rtv_formats: [limits.max_color_attachments]c.DXGI_FORMAT = @splat(c.DXGI_FORMAT_UNKNOWN);
         if (desc.fragment) |frag| {
             num_render_targets = frag.target_count;
             for (0..frag.target_count) |i| {

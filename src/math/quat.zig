@@ -5,7 +5,7 @@ const vec = @import("vec.zig");
 const mat = @import("mat.zig");
 
 pub fn Quat(comptime Scalar: type) type {
-    return extern struct {
+    return struct {
         v: vec.Vec4(Scalar),
 
         /// The scalar type of this matrix, e.g. Mat3x3.T == f32

@@ -4,14 +4,7 @@ const InitOptions = Core.InitOptions;
 
 const builtin = @import("builtin");
 const std = @import("std");
-const c = @cImport({
-    @cInclude("X11/Xlib.h");
-    @cInclude("X11/Xatom.h");
-    @cInclude("X11/cursorfont.h");
-    @cInclude("X11/Xcursor/Xcursor.h");
-    @cInclude("X11/extensions/Xrandr.h");
-    @cInclude("xkbcommon/xkbcommon.h");
-});
+const c = @import("c_x11");
 const mach = @import("../../main.zig");
 const gpu = mach.gpu;
 const Event = Core.Event;
@@ -38,7 +31,7 @@ pub var libgl: ?LibGL = null;
 
 pub const Native = struct {
     backend_type: gpu.BackendType,
-    cursors: [@typeInfo(CursorShape).@"enum".fields.len]?c.Cursor,
+    cursors: [@typeInfo(CursorShape).@"enum".field_names.len]?c.Cursor,
     display: *c.Display,
     empty_event_pipe: [2]std.c.fd_t,
     gl_ctx: ?*LibGL.Context,
@@ -149,7 +142,7 @@ pub fn initWindow(
 
     core_window.native = .{ .x11 = .{
         .backend_type = try Core.detectBackendType(core.allocator),
-        .cursors = std.mem.zeroes([@typeInfo(CursorShape).@"enum".fields.len]?c.Cursor),
+        .cursors = std.mem.zeroes([@typeInfo(CursorShape).@"enum".field_names.len]?c.Cursor),
         .display = display,
         .empty_event_pipe = try std.Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }),
         .gl_ctx = null,
@@ -207,7 +200,7 @@ pub fn initWindow(
         _ = libx11.?.XDrawPoint(x11.display, blank_pixmap, gc, 0, 0);
         _ = libx11.?.XFreeGC(x11.display, gc);
     }
-    x11.cursors[@intFromEnum(CursorShape.arrow)] = try createStandardCursor(x11, .arrow);
+    x11.cursors[@backingInt(CursorShape.arrow)] = try createStandardCursor(x11, .arrow);
 
     core.windows.setValue(window_id, core_window);
     try core.initWindow(window_id);
@@ -399,10 +392,10 @@ pub const LibX11 = struct {
         var lib: LibX11 = undefined;
         lib.handle = mach.dynLibOpen(.{ "libX11.so.6", "libX11.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibX11).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibX11).@"struct".field_names[1..], @typeInfo(LibX11).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse return error.SymbolLookup;
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse return error.SymbolLookup;
         }
         return lib;
     }
@@ -420,10 +413,10 @@ const LibXCursor = struct {
         var lib: LibXCursor = undefined;
         lib.handle = mach.dynLibOpen(.{ "libXcursor.so.1", "libXcursor.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibXCursor).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibXCursor).@"struct".field_names[1..], @typeInfo(LibXCursor).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse return error.SymbolLookup;
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse return error.SymbolLookup;
         }
         return lib;
     }
@@ -437,10 +430,10 @@ const LibXRR = struct {
         var lib: LibXRR = undefined;
         lib.handle = mach.dynLibOpen(.{ "libXrandr.so.1", "libXrandr.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibXRR).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibXRR).@"struct".field_names[1..], @typeInfo(LibXRR).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse return error.SymbolLookup;
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse return error.SymbolLookup;
         }
         return lib;
     }
@@ -470,10 +463,10 @@ pub const LibGL = struct {
         var lib: LibGL = undefined;
         lib.handle = mach.dynLibOpen(.{ "libGL.so.1", "libGL.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibGL).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibGL).@"struct".field_names[1..], @typeInfo(LibGL).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse return error.SymbolLookup;
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse return error.SymbolLookup;
         }
         return lib;
     }
@@ -503,10 +496,10 @@ pub const LibXkbCommon = struct {
         var lib: LibXkbCommon = undefined;
         lib.handle = mach.dynLibOpen(.{ "libxkbcommon.so.0", "libxkbcommon.so" }) catch return error.LibraryNotFound;
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(LibXkbCommon).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(LibXkbCommon).@"struct".field_names[1..], @typeInfo(LibXkbCommon).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse {
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse {
                 log.err("Symbol lookup failed for {s}", .{name});
                 return error.SymbolLookup;
             };

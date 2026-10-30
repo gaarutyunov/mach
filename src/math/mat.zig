@@ -10,7 +10,7 @@ const quat = @import("quat.zig");
 pub fn Mat2x2(
     comptime Scalar: type,
 ) type {
-    return extern struct {
+    return struct {
         /// The column vectors of the matrix.
         ///
         /// Mach matrices use [column-major storage and column-vectors](https://machengine.org/engine/math/matrix-storage/).
@@ -129,7 +129,7 @@ pub fn Mat2x2(
 pub fn Mat3x3(
     comptime Scalar: type,
 ) type {
-    return extern struct {
+    return struct {
         /// The column vectors of the matrix.
         ///
         /// Mach matrices use [column-major storage and column-vectors](https://machengine.org/engine/math/matrix-storage/).
@@ -289,7 +289,7 @@ pub fn Mat3x3(
 pub fn Mat4x4(
     comptime Scalar: type,
 ) type {
-    return extern struct {
+    return struct {
         /// The column vectors of the matrix.
         ///
         /// Mach matrices use [column-major storage and column-vectors](https://machengine.org/engine/math/matrix-storage/).
@@ -563,7 +563,7 @@ pub fn MatShared(comptime RowVec: type, comptime ColVec: type, comptime Matrix: 
 
         /// Matrix * Vector multiplication
         pub inline fn mulVec(matrix: *const Matrix, vector: *const ColVec) ColVec {
-            var result = [_]ColVec.T{0} ** ColVec.n;
+            var result: [ColVec.n]ColVec.T = @splat(0);
             inline for (0..Matrix.rows) |row| {
                 inline for (0..ColVec.n) |i| {
                     result[i] += matrix.v[row].v[i] * vector.v[row];

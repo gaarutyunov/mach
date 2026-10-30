@@ -1,9 +1,6 @@
 const std = @import("std");
 const Air = @import("Air.zig");
-const c = @cImport({
-    @cInclude("spirv-cross/spirv_cross_c.h");
-    @cInclude("spirv-tools/libspirv.h");
-});
+const c = @import("c_spirv");
 const genGlsl = @import("codegen/glsl.zig").gen;
 const genHlsl = @import("codegen/hlsl.zig").gen;
 const genMsl = @import("codegen/msl.zig").gen;

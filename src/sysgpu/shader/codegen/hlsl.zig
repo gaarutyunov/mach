@@ -146,7 +146,7 @@ fn structMemberLessThan(hlsl: *Hlsl, lhs: InstIndex, rhs: InstIndex) bool {
     const lhs_builtin = lhs_member.builtin orelse .vertex_index;
     const rhs_builtin = rhs_member.builtin orelse .vertex_index;
 
-    return @intFromEnum(lhs_builtin) < @intFromEnum(rhs_builtin);
+    return @backingInt(lhs_builtin) < @backingInt(rhs_builtin);
 }
 
 fn fnParamLessThan(hlsl: *Hlsl, lhs: InstIndex, rhs: InstIndex) bool {
@@ -170,7 +170,7 @@ fn fnParamLessThan(hlsl: *Hlsl, lhs: InstIndex, rhs: InstIndex) bool {
     const lhs_builtin = lhs_param.builtin orelse .vertex_index;
     const rhs_builtin = rhs_param.builtin orelse .vertex_index;
 
-    return @intFromEnum(lhs_builtin) < @intFromEnum(rhs_builtin);
+    return @backingInt(lhs_builtin) < @backingInt(rhs_builtin);
 }
 
 const StructKind = enum {
@@ -191,7 +191,7 @@ fn emitStruct(hlsl: *Hlsl, inst_idx: InstIndex, kind: StructKind) !void {
         "{s}{d}",
         .{
             if (kind == .frag_out) "FragOut" else hlsl.air.getStr(inst.name),
-            @intFromEnum(inst_idx),
+            @backingInt(inst_idx),
         },
     );
 
@@ -286,7 +286,7 @@ fn emitWrapperStruct(hlsl: *Hlsl, inst: Inst.Var) !void {
     if (type_inst == .@"struct")
         return;
 
-    try hlsl.print("struct Wrapper{} {{ ", .{@intFromEnum(inst.type)});
+    try hlsl.print("struct Wrapper{} {{ ", .{@backingInt(inst.type)});
     try hlsl.emitType(inst.type);
     try hlsl.writeAll(" data");
     try hlsl.emitTypeSuffix(inst.type);
@@ -395,7 +395,7 @@ fn emitGlobalVar(hlsl: *Hlsl, inst_idx: InstIndex) !void {
                     try hlsl.emitWrapperStruct(inst);
                     try hlsl.writeAll("ConstantBuffer<");
                     if (type_inst != .@"struct") {
-                        try hlsl.print("Wrapper{}", .{@intFromEnum(inst.type)});
+                        try hlsl.print("Wrapper{}", .{@backingInt(inst.type)});
                     } else {
                         try hlsl.emitType(inst.type);
                     }
@@ -791,7 +791,7 @@ fn emitVector(hlsl: *Hlsl, inst: Inst.Vector) !void {
 }
 
 fn emitVectorElems(hlsl: *Hlsl, size: Inst.Vector.Size, value: [4]InstIndex) !void {
-    for (value[0..@intFromEnum(size)], 0..) |elem_inst, i| {
+    for (value[0..@backingInt(size)], 0..) |elem_inst, i| {
         try hlsl.writeAll(if (i == 0) "" else ", ");
         try hlsl.emitExpr(elem_inst);
     }
@@ -802,7 +802,7 @@ fn emitMatrix(hlsl: *Hlsl, inst: Inst.Matrix) !void {
     try hlsl.writeAll("(");
 
     const value = hlsl.air.getValue(Inst.Matrix.Value, inst.value.?);
-    for (value[0..@intFromEnum(inst.cols)], 0..) |elem_inst, i| {
+    for (value[0..@backingInt(inst.cols)], 0..) |elem_inst, i| {
         try hlsl.writeAll(if (i == 0) "" else ", ");
         try hlsl.emitExpr(elem_inst);
     }
@@ -1073,7 +1073,7 @@ fn emitFieldAccessRegular(hlsl: *Hlsl, inst: Inst.FieldAccess) !void {
 fn emitSwizzleAccess(hlsl: *Hlsl, inst: Inst.SwizzleAccess) !void {
     try hlsl.emitExpr(inst.base);
     try hlsl.writeAll(".");
-    for (0..@intFromEnum(inst.size)) |i| {
+    for (0..@backingInt(inst.size)) |i| {
         switch (inst.pattern[i]) {
             .x => try hlsl.writeAll("x"),
             .y => try hlsl.writeAll("y"),
@@ -1201,7 +1201,7 @@ fn writeEntrypoint(hlsl: *Hlsl, name: Air.StringIndex) !void {
 fn writeName(hlsl: *Hlsl, name: Air.StringIndex) !void {
     // Suffix with index as WGSL has different scoping rules and to avoid conflicts with keywords
     const str = hlsl.air.getStr(name);
-    try hlsl.print("{s}_{}", .{ str, @intFromEnum(name) });
+    try hlsl.print("{s}_{}", .{ str, @backingInt(name) });
 }
 
 fn writeAll(hlsl: *Hlsl, bytes: []const u8) !void {

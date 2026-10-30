@@ -28,7 +28,7 @@ pub fn Ray3(comptime Scalar: type) type {
             @typeName(Vec3P) ++ "'"),
     };
 
-    return extern struct {
+    return struct {
         origin: Vec3P,
         direction: Vec3P,
 

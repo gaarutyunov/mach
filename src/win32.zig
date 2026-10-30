@@ -395,7 +395,7 @@ fn typedConst2(comptime ReturnType: type, comptime SwitchType: type, comptime va
             else => @compileError(value_type_error),
         },
         .@"enum" => switch (@typeInfo(@TypeOf(value))) {
-            .int => return @as(ReturnType, @enumFromInt(value)),
+            .int => return @as(ReturnType, @fromBackingInt(@intCast(value))),
             else => @compileError(value_type_error),
         },
         else => @compileError(value_type_error),

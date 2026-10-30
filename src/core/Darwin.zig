@@ -193,7 +193,7 @@ const MACHView = objc.objc.DefineClass(struct {
     fn pushMousePress(n: *NativeState, event: *objc.app_kit.Event) void {
         n.core.pushEvent(.{ .mouse_press = .{
             .window_id = n.window_id,
-            .button = @enumFromInt(event.buttonNumber()),
+            .button = @fromBackingInt(@intCast(event.buttonNumber())),
             .pos = .{ .x = event.locationInWindow().x, .y = event.locationInWindow().y },
             .mods = machModifierFromModifierFlag(event.modifierFlags()),
         } });
@@ -203,7 +203,7 @@ const MACHView = objc.objc.DefineClass(struct {
     fn pushMouseRelease(n: *NativeState, event: *objc.app_kit.Event) void {
         n.core.pushEvent(.{ .mouse_release = .{
             .window_id = n.window_id,
-            .button = @enumFromInt(event.buttonNumber()),
+            .button = @fromBackingInt(@intCast(event.buttonNumber())),
             .pos = .{ .x = event.locationInWindow().x, .y = event.locationInWindow().y },
             .mods = machModifierFromModifierFlag(event.modifierFlags()),
         } });
@@ -245,7 +245,7 @@ const MACHView = objc.objc.DefineClass(struct {
         }
 
         /// Prevent AppKit's default key handling (e.g. Esc exiting fullscreen) from firing.
-        pub fn @"doCommandBySelector:"(_: *Self, _: objc.objc.SEL) void {}
+        pub fn @"doCommandBySelector:"(_: *Self, _: ?*objc.objc.Selector) void {}
 
         /// Pushes a `key_press` or `key_repeat` event, then forwards the event through
         /// `interpretKeyEvents:` so AppKit can turn it into an `insertText:` call where
@@ -427,6 +427,8 @@ const MACHView = objc.objc.DefineClass(struct {
         /// fires on every vsync.
         pub fn startDisplayLink(self: *Self) callconv(.c) bool {
             if (implementation._displayLink.get(self) != null) return true;
+            // CAMetalDisplayLink requires macOS 14+; fall back to a render thread when unavailable.
+            if (objc.quartz_core.MetalDisplayLink.InternalInfo.classOrNull() == null) return false;
 
             const base_layer = objc.app_kit.View.layer(@ptrCast(self));
             if (!objc.objc.isKindOf(base_layer, objc.quartz_core.MetalLayer)) return false;
@@ -626,6 +628,7 @@ const RenderLoop = struct {
         if (!n.view.call(.startDisplayLink, .{})) {
             log.err("CAMetalDisplayLink unavailable (requires macOS 14+)", .{});
             @atomicStore(bool, &n.surface.use_display_link, false, .release);
+            n.surface.layer.setDisplaySyncEnabled(true);
             return;
         }
     }

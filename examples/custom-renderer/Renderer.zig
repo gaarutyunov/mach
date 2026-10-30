@@ -17,7 +17,7 @@ const num_bind_groups = 1024 * 32;
 const uniform_offset = 256;
 
 const UniformBufferObject = extern struct {
-    offset: Vec3,
+    offset: gpu.Vec3 align(16),
     scale: f32,
 };
 
@@ -156,7 +156,7 @@ pub fn renderFrame(
     while (objs.next()) |obj_id| {
         const obj = renderer.render_objects.getValue(obj_id);
         const ubo = UniformBufferObject{
-            .offset = obj.position,
+            .offset = obj.position.gpu(),
             .scale = obj.scale,
         };
         encoder.writeBuffer(renderer.uniform_buffer.?, uniform_offset * num_objects, &[_]UniformBufferObject{ubo});

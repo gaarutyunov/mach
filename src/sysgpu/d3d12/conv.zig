@@ -33,7 +33,7 @@ pub fn d3d12Blend(factor: sysgpu.BlendFactor) c.D3D12_BLEND {
 }
 
 pub fn d3d12BlendDesc(desc: *const sysgpu.RenderPipeline.Descriptor) c.D3D12_BLEND_DESC {
-    var d3d12_targets = [_]c.D3D12_RENDER_TARGET_BLEND_DESC{d3d12RenderTargetBlendDesc(null)} ** 8;
+    var d3d12_targets: [8]c.D3D12_RENDER_TARGET_BLEND_DESC = @splat(d3d12RenderTargetBlendDesc(null));
     if (desc.fragment) |frag| {
         for (0..frag.target_count) |i| {
             const target = frag.targets.?[i];

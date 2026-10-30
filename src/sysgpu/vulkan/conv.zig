@@ -18,20 +18,20 @@ pub fn sysgpuAdapterType(device_type: vk.PhysicalDeviceType) sysgpu.Adapter.Type
 
 pub fn vulkanAccessFlagsForBufferRead(usage: sysgpu.Buffer.UsageFlags) vk.AccessFlags {
     return .{
-        .indirect_command_read_bit = usage.indirect,
-        .index_read_bit = usage.index,
-        .vertex_attribute_read_bit = usage.vertex,
-        .uniform_read_bit = usage.uniform,
-        .shader_read_bit = usage.storage,
-        .host_read_bit = usage.map_read,
+        .indirect_command_read = usage.indirect,
+        .index_read = usage.index,
+        .vertex_attribute_read = usage.vertex,
+        .uniform_read = usage.uniform,
+        .shader_read = usage.storage,
+        .host_read = usage.map_read,
     };
 }
 
 pub fn vulkanAccessFlagsForImageRead(usage: sysgpu.Texture.UsageFlags, format: sysgpu.Texture.Format) vk.AccessFlags {
     return .{
-        .shader_read_bit = usage.texture_binding or usage.storage_binding,
-        .color_attachment_read_bit = usage.render_attachment and !utils.formatHasDepthOrStencil(format),
-        .depth_stencil_attachment_read_bit = usage.render_attachment and utils.formatHasDepthOrStencil(format),
+        .shader_read = usage.texture_binding or usage.storage_binding,
+        .color_attachment_read = usage.render_attachment and !utils.formatHasDepthOrStencil(format),
+        .depth_stencil_attachment_read = usage.render_attachment and utils.formatHasDepthOrStencil(format),
     };
 }
 
@@ -69,13 +69,13 @@ pub fn vulkanBlendFactor(op: sysgpu.BlendFactor, color: bool) vk.BlendFactor {
 
 pub fn vulkanBufferUsageFlags(flags: sysgpu.Buffer.UsageFlags) vk.BufferUsageFlags {
     return .{
-        .transfer_src_bit = flags.copy_src,
-        .transfer_dst_bit = flags.copy_dst or flags.query_resolve,
-        .uniform_buffer_bit = flags.uniform,
-        .storage_buffer_bit = flags.storage,
-        .index_buffer_bit = flags.index,
-        .vertex_buffer_bit = flags.vertex,
-        .indirect_buffer_bit = flags.indirect,
+        .transfer_src = flags.copy_src,
+        .transfer_dst = flags.copy_dst or flags.query_resolve,
+        .uniform_buffer = flags.uniform,
+        .storage_buffer = flags.storage,
+        .index_buffer = flags.index,
+        .vertex_buffer = flags.vertex,
+        .indirect_buffer = flags.indirect,
     };
 }
 
@@ -95,8 +95,8 @@ pub fn vulkanCompareOp(op: sysgpu.CompareFunction) vk.CompareOp {
 
 pub fn vulkanCullMode(cull_mode: sysgpu.CullMode) vk.CullModeFlags {
     return .{
-        .front_bit = cull_mode == .front,
-        .back_bit = cull_mode == .back,
+        .front = cull_mode == .front,
+        .back = cull_mode == .back,
     };
 }
 
@@ -235,34 +235,34 @@ pub fn vulkanFormat(device: *const vulkan.Device, format: sysgpu.Texture.Format)
         .eacr11_snorm => .eac_r11_snorm_block,
         .eacrg11_unorm => .eac_r11g11_unorm_block,
         .eacrg11_snorm => .eac_r11g11_snorm_block,
-        .astc4x4_unorm => .astc_4x_4_unorm_block,
-        .astc4x4_unorm_srgb => .astc_4x_4_srgb_block,
-        .astc5x4_unorm => .astc_5x_4_unorm_block,
-        .astc5x4_unorm_srgb => .astc_5x_4_srgb_block,
-        .astc5x5_unorm => .astc_5x_5_unorm_block,
-        .astc5x5_unorm_srgb => .astc_5x_5_srgb_block,
-        .astc6x5_unorm => .astc_6x_5_unorm_block,
-        .astc6x5_unorm_srgb => .astc_6x_5_srgb_block,
-        .astc6x6_unorm => .astc_6x_6_unorm_block,
-        .astc6x6_unorm_srgb => .astc_6x_6_srgb_block,
-        .astc8x5_unorm => .astc_8x_5_unorm_block,
-        .astc8x5_unorm_srgb => .astc_8x_5_srgb_block,
-        .astc8x6_unorm => .astc_8x_6_unorm_block,
-        .astc8x6_unorm_srgb => .astc_8x_6_srgb_block,
-        .astc8x8_unorm => .astc_8x_8_unorm_block,
-        .astc8x8_unorm_srgb => .astc_8x_8_srgb_block,
-        .astc10x5_unorm => .astc_1_0x_5_unorm_block,
-        .astc10x5_unorm_srgb => .astc_1_0x_5_srgb_block,
-        .astc10x6_unorm => .astc_1_0x_6_unorm_block,
-        .astc10x6_unorm_srgb => .astc_1_0x_6_srgb_block,
-        .astc10x8_unorm => .astc_1_0x_8_unorm_block,
-        .astc10x8_unorm_srgb => .astc_1_0x_8_srgb_block,
-        .astc10x10_unorm => .astc_1_0x_10_unorm_block,
-        .astc10x10_unorm_srgb => .astc_1_0x_10_srgb_block,
-        .astc12x10_unorm => .astc_1_2x_10_unorm_block,
-        .astc12x10_unorm_srgb => .astc_1_2x_10_srgb_block,
-        .astc12x12_unorm => .astc_1_2x_12_unorm_block,
-        .astc12x12_unorm_srgb => .astc_1_2x_12_srgb_block,
+        .astc4x4_unorm => .astc_4x4_unorm_block,
+        .astc4x4_unorm_srgb => .astc_4x4_srgb_block,
+        .astc5x4_unorm => .astc_5x4_unorm_block,
+        .astc5x4_unorm_srgb => .astc_5x4_srgb_block,
+        .astc5x5_unorm => .astc_5x5_unorm_block,
+        .astc5x5_unorm_srgb => .astc_5x5_srgb_block,
+        .astc6x5_unorm => .astc_6x5_unorm_block,
+        .astc6x5_unorm_srgb => .astc_6x5_srgb_block,
+        .astc6x6_unorm => .astc_6x6_unorm_block,
+        .astc6x6_unorm_srgb => .astc_6x6_srgb_block,
+        .astc8x5_unorm => .astc_8x5_unorm_block,
+        .astc8x5_unorm_srgb => .astc_8x5_srgb_block,
+        .astc8x6_unorm => .astc_8x6_unorm_block,
+        .astc8x6_unorm_srgb => .astc_8x6_srgb_block,
+        .astc8x8_unorm => .astc_8x8_unorm_block,
+        .astc8x8_unorm_srgb => .astc_8x8_srgb_block,
+        .astc10x5_unorm => .astc_10x5_unorm_block,
+        .astc10x5_unorm_srgb => .astc_10x5_srgb_block,
+        .astc10x6_unorm => .astc_10x6_unorm_block,
+        .astc10x6_unorm_srgb => .astc_10x6_srgb_block,
+        .astc10x8_unorm => .astc_10x8_unorm_block,
+        .astc10x8_unorm_srgb => .astc_10x8_srgb_block,
+        .astc10x10_unorm => .astc_10x10_unorm_block,
+        .astc10x10_unorm_srgb => .astc_10x10_srgb_block,
+        .astc12x10_unorm => .astc_12x10_unorm_block,
+        .astc12x10_unorm_srgb => .astc_12x10_srgb_block,
+        .astc12x12_unorm => .astc_12x12_unorm_block,
+        .astc12x12_unorm_srgb => .astc_12x12_srgb_block,
         .r8_bg8_biplanar420_unorm => .g8_b8r8_2plane_420_unorm,
         .undefined => unreachable,
     };
@@ -278,27 +278,27 @@ pub fn vulkanFrontFace(front_face: sysgpu.FrontFace) vk.FrontFace {
 pub fn vulkanImageAspectFlags(aspect: sysgpu.Texture.Aspect, format: sysgpu.Texture.Format) vk.ImageAspectFlags {
     return switch (aspect) {
         .all => vulkanImageAspectFlagsForFormat(format),
-        .stencil_only => .{ .stencil_bit = true },
-        .depth_only => .{ .depth_bit = true },
-        .plane0_only => .{ .plane_0_bit = true },
-        .plane1_only => .{ .plane_1_bit = true },
+        .stencil_only => .{ .stencil = true },
+        .depth_only => .{ .depth = true },
+        .plane0_only => .{ .plane_0 = true },
+        .plane1_only => .{ .plane_1 = true },
     };
 }
 
 pub fn vulkanImageAspectFlagsForFormat(format: sysgpu.Texture.Format) vk.ImageAspectFlags {
     return switch (format) {
-        .stencil8 => .{ .stencil_bit = true },
-        .depth16_unorm, .depth24_plus, .depth32_float => .{ .depth_bit = true },
-        .depth24_plus_stencil8, .depth32_float_stencil8 => .{ .depth_bit = true, .stencil_bit = true },
-        .r8_bg8_biplanar420_unorm => .{ .plane_0_bit = true, .plane_1_bit = true },
-        else => .{ .color_bit = true },
+        .stencil8 => .{ .stencil = true },
+        .depth16_unorm, .depth24_plus, .depth32_float => .{ .depth = true },
+        .depth24_plus_stencil8, .depth32_float_stencil8 => .{ .depth = true, .stencil = true },
+        .r8_bg8_biplanar420_unorm => .{ .plane_0 = true, .plane_1 = true },
+        else => .{ .color = true },
     };
 }
 
 pub fn vulkanImageCreateFlags(cube_compatible: bool, view_format_count: usize) vk.ImageCreateFlags {
     return .{
-        .mutable_format_bit = view_format_count > 0,
-        .cube_compatible_bit = cube_compatible,
+        .mutable_format = view_format_count > 0,
+        .cube_compatible = cube_compatible,
     };
 }
 
@@ -331,13 +331,13 @@ pub fn vulkanImageType(dimension: sysgpu.Texture.Dimension) vk.ImageType {
 
 pub fn vulkanImageUsageFlags(usage: sysgpu.Texture.UsageFlags, format: sysgpu.Texture.Format) vk.ImageUsageFlags {
     return .{
-        .transfer_src_bit = usage.copy_src,
-        .transfer_dst_bit = usage.copy_dst,
-        .sampled_bit = usage.texture_binding,
-        .storage_bit = usage.storage_binding,
-        .color_attachment_bit = usage.render_attachment and !utils.formatHasDepthOrStencil(format),
-        .transient_attachment_bit = usage.transient_attachment,
-        .depth_stencil_attachment_bit = usage.render_attachment and utils.formatHasDepthOrStencil(format),
+        .transfer_src = usage.copy_src,
+        .transfer_dst = usage.copy_dst,
+        .sampled = usage.texture_binding,
+        .storage = usage.storage_binding,
+        .color_attachment = usage.render_attachment and !utils.formatHasDepthOrStencil(format),
+        .transient_attachment = usage.transient_attachment,
+        .depth_stencil_attachment = usage.render_attachment and utils.formatHasDepthOrStencil(format),
     };
 }
 
@@ -371,23 +371,23 @@ pub fn vulkanLoadOp(op: sysgpu.LoadOp) vk.AttachmentLoadOp {
 
 pub fn vulkanPipelineStageFlagsForBufferRead(usage: sysgpu.Buffer.UsageFlags) vk.PipelineStageFlags {
     return .{
-        .draw_indirect_bit = usage.indirect,
-        .vertex_input_bit = usage.index or usage.vertex,
-        .vertex_shader_bit = usage.uniform or usage.storage,
-        .fragment_shader_bit = usage.uniform or usage.storage,
-        .compute_shader_bit = usage.uniform or usage.storage,
-        .host_bit = usage.map_read,
+        .draw_indirect = usage.indirect,
+        .vertex_input = usage.index or usage.vertex,
+        .vertex_shader = usage.uniform or usage.storage,
+        .fragment_shader = usage.uniform or usage.storage,
+        .compute_shader = usage.uniform or usage.storage,
+        .host = usage.map_read,
     };
 }
 
 pub fn vulkanPipelineStageFlagsForImageRead(usage: sysgpu.Texture.UsageFlags, format: sysgpu.Texture.Format) vk.PipelineStageFlags {
     return .{
-        .vertex_shader_bit = usage.texture_binding or usage.storage_binding,
-        .fragment_shader_bit = usage.texture_binding or usage.storage_binding,
-        .early_fragment_tests_bit = usage.render_attachment and utils.formatHasDepthOrStencil(format),
-        .late_fragment_tests_bit = usage.render_attachment and utils.formatHasDepthOrStencil(format),
-        .color_attachment_output_bit = usage.render_attachment and !utils.formatHasDepthOrStencil(format),
-        .compute_shader_bit = usage.texture_binding or usage.storage_binding,
+        .vertex_shader = usage.texture_binding or usage.storage_binding,
+        .fragment_shader = usage.texture_binding or usage.storage_binding,
+        .early_fragment_tests = usage.render_attachment and utils.formatHasDepthOrStencil(format),
+        .late_fragment_tests = usage.render_attachment and utils.formatHasDepthOrStencil(format),
+        .color_attachment_output = usage.render_attachment and !utils.formatHasDepthOrStencil(format),
+        .compute_shader = usage.texture_binding or usage.storage_binding,
     };
 }
 
@@ -413,12 +413,12 @@ pub fn vulkanPresentMode(present_mode: sysgpu.PresentMode) vk.PresentModeKHR {
 pub fn vulkanSampleCount(samples: u32) vk.SampleCountFlags {
     // TODO: https://github.com/Snektron/vulkan-zig/issues/27
     return switch (samples) {
-        1 => .{ .@"1_bit" = true },
-        2 => .{ .@"2_bit" = true },
-        4 => .{ .@"4_bit" = true },
-        8 => .{ .@"8_bit" = true },
-        16 => .{ .@"16_bit" = true },
-        32 => .{ .@"32_bit" = true },
+        1 => .{ .@"1" = true },
+        2 => .{ .@"2" = true },
+        4 => .{ .@"4" = true },
+        8 => .{ .@"8" = true },
+        16 => .{ .@"16" = true },
+        32 => .{ .@"32" = true },
         else => unreachable,
     };
 }
@@ -440,9 +440,9 @@ pub fn vulkanSamplerMipmapMode(filter: sysgpu.MipmapFilterMode) vk.SamplerMipmap
 
 pub fn vulkanShaderStageFlags(flags: sysgpu.ShaderStageFlags) vk.ShaderStageFlags {
     return .{
-        .vertex_bit = flags.vertex,
-        .fragment_bit = flags.fragment,
-        .compute_bit = flags.compute,
+        .vertex = flags.vertex,
+        .fragment = flags.fragment,
+        .compute = flags.compute,
     };
 }
 

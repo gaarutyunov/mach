@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @cImport(@cInclude("alsa/asoundlib.h"));
+const c = @import("c_alsa");
 const main = @import("main.zig");
 const backends = @import("backends.zig");
 const util = @import("util.zig");
@@ -81,10 +81,10 @@ const Lib = struct {
     pub fn load() !void {
         lib.handle = try mach.dynLibOpen(.{ "libasound.so.2", "libasound.so" });
         @setEvalBranchQuota(10000);
-        inline for (@typeInfo(Lib).@"struct".fields[1..]) |field| {
-            const name = std.fmt.comptimePrint("{s}\x00", .{field.name});
+        inline for (@typeInfo(Lib).@"struct".field_names[1..], @typeInfo(Lib).@"struct".field_types[1..]) |field_name, field_type| {
+            const name = std.fmt.comptimePrint("{s}\x00", .{field_name});
             const name_z: [:0]const u8 = @ptrCast(name[0 .. name.len - 1]);
-            @field(lib, field.name) = lib.handle.lookup(field.type, name_z) orelse return error.SymbolLookup;
+            @field(lib, field_name) = lib.handle.lookup(field_type, name_z) orelse return error.SymbolLookup;
         }
     }
 };
@@ -340,8 +340,8 @@ pub const Context = struct {
                         .max = @as(u24, @intCast(rate_max)),
                     };
                 },
-                .id = try ctx.allocator.dupeZ(u8, "default"),
-                .name = try ctx.allocator.dupeZ(u8, "Default"),
+                .id = try ctx.allocator.dupeSentinel(u8, "default", 0),
+                .name = try ctx.allocator.dupeSentinel(u8, "Default", 0),
             };
 
             try ctx.devices_info.list.append(ctx.allocator, device);
@@ -358,12 +358,12 @@ pub const Context = struct {
 
         while (card_idx >= 0) {
             var card_id_buf: [8]u8 = undefined;
-            const card_id = std.fmt.bufPrintZ(&card_id_buf, "hw:{d}", .{card_idx}) catch break;
+            const card_id = std.fmt.bufPrintSentinel(&card_id_buf, "hw:{d}", .{card_idx}, 0) catch break;
 
             var ctl: ?*c.snd_ctl_t = undefined;
             _ = switch (-lib.snd_ctl_open(&ctl, card_id.ptr, 0)) {
                 0 => {},
-                @intFromEnum(std.posix.E.NOENT) => break,
+                @backingInt(std.posix.E.NOENT) => break,
                 else => return error.OpeningDevice,
             };
             defer _ = lib.snd_ctl_close(ctl);
@@ -380,7 +380,7 @@ pub const Context = struct {
                 const snd_stream = modeToStream(mode);
                 lib.snd_pcm_info_set_stream(pcm_info, snd_stream);
                 const err = lib.snd_ctl_pcm_info(ctl, pcm_info);
-                switch (@as(std.posix.E, @enumFromInt(-err))) {
+                switch (@as(std.posix.E, @fromBackingInt(@intCast(-err)))) {
                     .SUCCESS => {},
                     .NOENT,
                     .NXIO,
@@ -390,7 +390,7 @@ pub const Context = struct {
                 }
 
                 var buf: [9]u8 = undefined; // 'hw' + max(card|device) * 2 + ':' + \0
-                const id = std.fmt.bufPrintZ(&buf, "hw:{d},{d}", .{ card_idx, dev_idx }) catch continue;
+                const id = std.fmt.bufPrintSentinel(&buf, "hw:{d},{d}", .{ card_idx, dev_idx }, 0) catch continue;
 
                 var pcm: ?*c.snd_pcm_t = null;
                 if (lib.snd_pcm_open(&pcm, id.ptr, snd_stream, 0) < 0)
@@ -473,8 +473,8 @@ pub const Context = struct {
                             .max = @as(u24, @intCast(rate_max)),
                         };
                     },
-                    .id = try ctx.allocator.dupeZ(u8, id),
-                    .name = try ctx.allocator.dupeZ(u8, name),
+                    .id = try ctx.allocator.dupeSentinel(u8, id, 0),
+                    .name = try ctx.allocator.dupeSentinel(u8, name, 0),
                 };
 
                 try ctx.devices_info.list.append(ctx.allocator, device);
@@ -541,7 +541,7 @@ pub const Context = struct {
             if (lib.snd_mixer_open(mixer, 0) < 0)
                 return;
 
-            const card_id = try ctx.allocator.dupeZ(u8, std.mem.sliceTo(device.id, ','));
+            const card_id = try ctx.allocator.dupeSentinel(u8, std.mem.sliceTo(device.id, ','), 0);
             defer ctx.allocator.free(card_id);
 
             if (lib.snd_mixer_attach(mixer.*, card_id.ptr) < 0) {

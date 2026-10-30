@@ -692,15 +692,15 @@ pub fn events(core: *@This(), mode_arg: EventMode) EventIterator {
     // Update input_state from swapped events.
     for (core.iter_events.items) |event| {
         switch (event) {
-            .key_press => |ev| core.input_state.keys.setValue(@intFromEnum(ev.key), true),
-            .key_release => |ev| core.input_state.keys.setValue(@intFromEnum(ev.key), false),
-            .mouse_press => |ev| core.input_state.mouse_buttons.setValue(@intFromEnum(ev.button), true),
-            .mouse_release => |ev| core.input_state.mouse_buttons.setValue(@intFromEnum(ev.button), false),
+            .key_press => |ev| core.input_state.keys.setValue(@backingInt(ev.key), true),
+            .key_release => |ev| core.input_state.keys.setValue(@backingInt(ev.key), false),
+            .mouse_press => |ev| core.input_state.mouse_buttons.setValue(@backingInt(ev.button), true),
+            .mouse_release => |ev| core.input_state.mouse_buttons.setValue(@backingInt(ev.button), false),
             .mouse_motion => |ev| core.input_state.mouse_position = ev.pos,
             .focus_lost => {
                 // Clear input state that may be 'stuck' when focus is regained.
-                core.input_state.keys = InputState.KeyButtonBitSet.initEmpty();
-                core.input_state.mouse_buttons = InputState.MouseButtonSet.initEmpty();
+                core.input_state.keys = InputState.KeyButtonBitSet.empty;
+                core.input_state.mouse_buttons = InputState.MouseButtonSet.empty;
             },
             else => {},
         }
@@ -822,15 +822,15 @@ const Platform = switch (builtin.target.os.tag) {
 };
 
 pub const InputState = struct {
-    const KeyButtonBitSet = std.StaticBitSet(@as(u8, @intFromEnum(KeyButtonID.max)) + 1);
-    const MouseButtonSet = std.StaticBitSet(@as(u4, @intFromEnum(MouseButtonID.max)) + 1);
+    const KeyButtonBitSet = std.StaticBitSet(@as(u8, @backingInt(KeyButtonID.max)) + 1);
+    const MouseButtonSet = std.StaticBitSet(@as(u4, @backingInt(MouseButtonID.max)) + 1);
 
-    keys: KeyButtonBitSet = KeyButtonBitSet.initEmpty(),
-    mouse_buttons: MouseButtonSet = MouseButtonSet.initEmpty(),
+    keys: KeyButtonBitSet = KeyButtonBitSet.empty,
+    mouse_buttons: MouseButtonSet = MouseButtonSet.empty,
     mouse_position: Position = .{ .x = 0, .y = 0 },
 
     pub inline fn keyPressed(input: InputState, key: KeyButtonID) bool {
-        return input.keys.isSet(@intFromEnum(key));
+        return input.keys.isSet(@backingInt(key));
     }
 
     pub inline fn keyReleased(input: InputState, key: KeyButtonID) bool {
@@ -838,7 +838,7 @@ pub const InputState = struct {
     }
 
     pub inline fn mousePressed(input: InputState, button: MouseButtonID) bool {
-        return input.mouse_buttons.isSet(@intFromEnum(button));
+        return input.mouse_buttons.isSet(@backingInt(button));
     }
 
     pub inline fn mouseReleased(input: InputState, button: MouseButtonID) bool {

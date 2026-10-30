@@ -159,7 +159,7 @@ test "signedToSigned single" {
 test "signedToSigned multi" {
     const len = 32 + 7;
     var i16_to_i32: [len]i32 = undefined;
-    const items = [1]i16{5} ** (len);
+    const items: [len]i16 = @splat(5);
     signedToSigned(i16, 2, asBytes(&items), i32, 4, asBytes(&i16_to_i32), len);
     try expectEqual(@as(i32, 327680), i16_to_i32[0]);
     try expectEqual(i16_to_i32[0], i16_to_i32[i16_to_i32.len - 1]);
@@ -215,7 +215,7 @@ test "signedToFloat single" {
 test "signedToFloat multi" {
     const len = 32 + 7;
     var i32_to_f32: [len]f32 = undefined;
-    const items = [1]i32{5} ** (len);
+    const items: [len]i32 = @splat(5);
     signedToFloat(i32, 4, asBytes(&items), f32, 4, asBytes(&i32_to_f32), len);
     try expectEqual(@as(f32, 2.32830643e-09), i32_to_f32[0]);
     try expectEqual(i32_to_f32[0], i32_to_f32[i32_to_f32.len - 1]);
@@ -265,7 +265,7 @@ test "floatToUnsigned single" {
 test "floatToUnsigned multi" {
     const len = 32 + 7;
     var f32_to_u8: [len]u8 = undefined;
-    const items = [1]f32{0.5} ** (len);
+    const items: [len]f32 = @splat(0.5);
     floatToUnsigned(f32, 4, asBytes(&items), u8, 1, asBytes(&f32_to_u8), len);
     try expectEqual(@as(u8, 191), f32_to_u8[0]);
     try expectEqual(f32_to_u8[0], f32_to_u8[f32_to_u8.len - 1]);
@@ -282,7 +282,7 @@ pub fn floatToSigned(
 ) void {
     const max = maxInt(DstType) + 1;
     // The largest float that fits in DstType: nextDown(2^(bits-1)) to avoid overflow in @intFromFloat.
-    const FloatBits = std.meta.Int(.unsigned, @typeInfo(SrcType).float.bits);
+    const FloatBits = @Int(.unsigned, @typeInfo(SrcType).float.bits);
     const max_clamp_val: SrcType = @bitCast(@as(FloatBits, @bitCast(@as(SrcType, max))) - 1);
     const min_clamp_val: SrcType = @floatFromInt(std.math.minInt(DstType));
     var i: usize = 0;
@@ -335,7 +335,7 @@ test "floatToSigned single" {
 test "floatToSigned multi" {
     const len = 32 + 7;
     var f32_to_i16: [len]i16 = undefined;
-    const items = [1]f32{0.5} ** (len);
+    const items: [len]f32 = @splat(0.5);
     floatToSigned(f32, 4, asBytes(&items), i16, 2, asBytes(&f32_to_i16), len);
     try expectEqual(@as(i16, 16384), f32_to_i16[0]);
     try expectEqual(f32_to_i16[0], f32_to_i16[f32_to_i16.len - 1]);

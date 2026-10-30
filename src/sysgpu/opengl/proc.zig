@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const mach = @import("../../main.zig");
 
-pub var libgl: std.DynLib = undefined;
+pub var libgl: mach.DynLib = undefined;
 
 const GlFuncPtr = *align(1) const fn () callconv(.c) void;
 

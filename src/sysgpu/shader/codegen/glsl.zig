@@ -735,7 +735,7 @@ fn emitVector(glsl: *Glsl, inst: Inst.Vector) !void {
 }
 
 fn emitVectorElems(glsl: *Glsl, size: Inst.Vector.Size, value: [4]InstIndex) !void {
-    for (value[0..@intFromEnum(size)], 0..) |elem_inst, i| {
+    for (value[0..@backingInt(size)], 0..) |elem_inst, i| {
         try glsl.writeAll(if (i == 0) "" else ", ");
         try glsl.emitExpr(elem_inst);
     }
@@ -934,7 +934,7 @@ fn emitFieldAccess(glsl: *Glsl, inst: Inst.FieldAccess) !void {
 fn emitSwizzleAccess(glsl: *Glsl, inst: Inst.SwizzleAccess) !void {
     try glsl.emitExpr(inst.base);
     try glsl.writeAll(".");
-    for (0..@intFromEnum(inst.size)) |i| {
+    for (0..@backingInt(inst.size)) |i| {
         switch (inst.pattern[i]) {
             .x => try glsl.writeAll("x"),
             .y => try glsl.writeAll("y"),
@@ -989,7 +989,7 @@ fn writeEntrypoint(glsl: *Glsl) !void {
 fn writeName(glsl: *Glsl, name: Air.StringIndex) !void {
     // Suffix with index as WGSL has different scoping rules and to avoid conflicts with keywords
     const str = glsl.air.getStr(name);
-    try glsl.print("{s}_{}", .{ str, @intFromEnum(name) });
+    try glsl.print("{s}_{}", .{ str, @backingInt(name) });
 }
 
 fn writeAll(glsl: *Glsl, bytes: []const u8) !void {

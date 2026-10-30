@@ -1550,7 +1550,7 @@ fn coerce(astgen: *AstGen, src: InstIndex, dst: InstIndex) !bool {
                         Air.Inst.Int.Value,
                         Air.Inst.Int.Value{ .literal = @intCast(int_value.literal) },
                     );
-                    astgen.instructions.keys()[@intFromEnum(src)] = .{
+                    astgen.instructions.keys()[@backingInt(src)] = .{
                         .int = .{
                             .type = dst_int.type,
                             .value = value,
@@ -1563,7 +1563,7 @@ fn coerce(astgen: *AstGen, src: InstIndex, dst: InstIndex) !bool {
                         Air.Inst.Float.Value,
                         Air.Inst.Float.Value{ .literal = @floatFromInt(int_value.literal) },
                     );
-                    astgen.instructions.keys()[@intFromEnum(src)] = .{
+                    astgen.instructions.keys()[@backingInt(src)] = .{
                         .float = .{
                             .type = dst_float.type,
                             .value = value,
@@ -2154,9 +2154,9 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
             var args: [4]InstIndex = undefined;
             var cast = InstIndex.none;
 
-            var capacity = @intFromEnum(size);
+            var capacity = @backingInt(size);
             for (arg_nodes) |arg_node| {
-                const i = @intFromEnum(size) - capacity;
+                const i = @backingInt(size) - capacity;
                 const arg = try astgen.genExpr(scope, arg_node);
                 const arg_loc = astgen.tree.nodeLoc(arg_node);
                 const arg_res = try astgen.resolve(arg);
@@ -2174,8 +2174,8 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                             cast = arg_vec.elem_type;
                         }
 
-                        if (capacity >= @intFromEnum(arg_vec.size)) {
-                            for (0..@intFromEnum(arg_vec.size)) |component_i| {
+                        if (capacity >= @backingInt(arg_vec.size)) {
+                            for (0..@backingInt(arg_vec.size)) |component_i| {
                                 args[i + component_i] =
                                     astgen.resolveVectorValue(arg, @intCast(component_i)) orelse
                                     try astgen.addInst(.{
@@ -2184,7 +2184,7 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                                             .type = astgen.getInst(arg_res).vector.elem_type,
                                             .size = .one,
                                             .pattern = [_]Inst.SwizzleAccess.Component{
-                                                @enumFromInt(component_i),
+                                                @fromBackingInt(@intCast(component_i)),
                                                 undefined,
                                                 undefined,
                                                 undefined,
@@ -2192,7 +2192,7 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                                         },
                                     });
                             }
-                            capacity -= @intFromEnum(arg_vec.size);
+                            capacity -= @backingInt(arg_vec.size);
                         } else {
                             try astgen.errors.add(arg_loc, "doesn't fit in this vector", .{}, null);
                             return error.AnalysisFail;
@@ -2240,7 +2240,7 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                         }
 
                         if (arg_nodes.len == 1) {
-                            @memset(args[i + 1 .. @intFromEnum(size)], args[i]);
+                            @memset(args[i + 1 .. @backingInt(size)], args[i]);
                             capacity = 1;
                         }
 
@@ -2321,9 +2321,9 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
             const arg_nodes = astgen.tree.spanToList(node_lhs);
             var args: [4]InstIndex = undefined;
 
-            var capacity = @intFromEnum(cols);
+            var capacity = @backingInt(cols);
             for (arg_nodes) |arg_node| {
-                const i = @intFromEnum(cols) - capacity;
+                const i = @backingInt(cols) - capacity;
                 const arg = try astgen.genExpr(scope, arg_node);
                 const arg_loc = astgen.tree.nodeLoc(arg_node);
                 const arg_res = try astgen.resolve(arg);
@@ -2361,7 +2361,7 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                             }
                         }
 
-                        if (@intFromEnum(arg_vec.size) != @intFromEnum(rows)) {
+                        if (@backingInt(arg_vec.size) != @backingInt(rows)) {
                             try astgen.errors.add(arg_loc, "invalid argument", .{}, null);
                             return error.AnalysisFail;
                         }
@@ -2379,9 +2379,9 @@ fn genCall(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                             return error.AnalysisFail;
                         }
 
-                        for (args[0..@intFromEnum(cols)]) |*arg_col| {
+                        for (args[0..@backingInt(cols)]) |*arg_col| {
                             var arg_vec_value: [4]InstIndex = undefined;
-                            @memset(arg_vec_value[0..@intFromEnum(rows)], arg);
+                            @memset(arg_vec_value[0..@backingInt(rows)], arg);
 
                             const arg_vec = try astgen.addInst(.{
                                 .vector = .{
@@ -3772,7 +3772,7 @@ fn genFieldAccess(astgen: *AstGen, scope: *Scope, node: NodeIndex) !InstIndex {
                 .swizzle_access = .{
                     .base = base,
                     .type = base_vec.elem_type,
-                    .size = @enumFromInt(field_name.len),
+                    .size = @fromBackingInt(@intCast(field_name.len)),
                     .pattern = pattern,
                 },
             });
@@ -4355,7 +4355,7 @@ fn resolve(astgen: *AstGen, index: InstIndex) !InstIndex {
                 return astgen.addInst(.{
                     .vector = .{
                         .elem_type = swizzle_access.type,
-                        .size = @enumFromInt(@intFromEnum(swizzle_access.size)),
+                        .size = @fromBackingInt(@intCast(@backingInt(swizzle_access.size))),
                         .value = null,
                     },
                 });
@@ -4434,7 +4434,7 @@ fn eqlMatrix(astgen: *AstGen, a: Air.Inst.Matrix, b: Air.Inst.Matrix) bool {
 
 fn addInst(astgen: *AstGen, inst: Inst) error{OutOfMemory}!InstIndex {
     try astgen.instructions.put(astgen.allocator, inst, {});
-    return @enumFromInt(astgen.instructions.getIndex(inst).?);
+    return @fromBackingInt(@intCast(astgen.instructions.getIndex(inst).?));
 }
 
 fn addRefList(astgen: *AstGen, list: []const InstIndex) error{OutOfMemory}!RefIndex {
@@ -4442,7 +4442,7 @@ fn addRefList(astgen: *AstGen, list: []const InstIndex) error{OutOfMemory}!RefIn
     try astgen.refs.ensureUnusedCapacity(astgen.allocator, len);
     astgen.refs.appendSliceAssumeCapacity(list);
     astgen.refs.appendAssumeCapacity(.none);
-    return @as(RefIndex, @enumFromInt(astgen.refs.items.len - len));
+    return @as(RefIndex, @fromBackingInt(@intCast(astgen.refs.items.len - len)));
 }
 
 fn addString(astgen: *AstGen, str: []const u8) error{OutOfMemory}!StringIndex {
@@ -4450,30 +4450,30 @@ fn addString(astgen: *AstGen, str: []const u8) error{OutOfMemory}!StringIndex {
     try astgen.strings.ensureUnusedCapacity(astgen.allocator, len);
     astgen.strings.appendSliceAssumeCapacity(str);
     astgen.strings.appendAssumeCapacity(0);
-    return @enumFromInt(astgen.strings.items.len - len);
+    return @fromBackingInt(@intCast(astgen.strings.items.len - len));
 }
 
 fn addValue(astgen: *AstGen, comptime T: type, value: T) error{OutOfMemory}!ValueIndex {
     const value_bytes = std.mem.asBytes(&value);
     try astgen.values.appendSlice(astgen.allocator, value_bytes);
     std.testing.expectEqual(value, std.mem.bytesToValue(T, value_bytes)) catch unreachable;
-    return @enumFromInt(astgen.values.items.len - value_bytes.len);
+    return @fromBackingInt(@intCast(astgen.values.items.len - value_bytes.len));
 }
 
 fn getInst(astgen: *AstGen, inst: InstIndex) Inst {
-    return astgen.instructions.entries.slice().items(.key)[@intFromEnum(inst)];
+    return astgen.instructions.entries.slice().items(.key)[@backingInt(inst)];
 }
 
 fn getValue(astgen: *AstGen, comptime T: type, value: ValueIndex) T {
-    return std.mem.bytesAsValue(T, astgen.values.items[@intFromEnum(value)..][0..@sizeOf(T)]).*;
+    return std.mem.bytesAsValue(T, astgen.values.items[@backingInt(value)..][0..@sizeOf(T)]).*;
 }
 
 fn getStr(astgen: *AstGen, index: StringIndex) []const u8 {
-    return std.mem.sliceTo(astgen.strings.items[@intFromEnum(index)..], 0);
+    return std.mem.sliceTo(astgen.strings.items[@backingInt(index)..], 0);
 }
 
 fn refToList(astgen: *AstGen, ref: RefIndex) []const InstIndex {
-    return std.mem.sliceTo(astgen.refs.items[@intFromEnum(ref)..], .none);
+    return std.mem.sliceTo(astgen.refs.items[@backingInt(ref)..], .none);
 }
 
 fn failArgCountMismatch(

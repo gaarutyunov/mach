@@ -466,7 +466,7 @@ fn renderBitEnum(
 ) !void {
     try writer.print("pub const {s} = packed struct {{\n", .{std.zig.fmtId(enumeration.kind)});
 
-    var flags_by_bitpos = [_]?usize{null} ** 32;
+    var flags_by_bitpos: [32]?usize = @splat(null);
     const enumerants = enumeration.enumerants orelse return error.InvalidRegistry;
 
     var aliases = std.ArrayList(struct { flag: usize, alias: u5 }).init(allocator);

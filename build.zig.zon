@@ -2,7 +2,8 @@
     .name = .mach,
     .fingerprint = 0xaca480db7d077c8d, // Changing this has security and trust implications.
     .version = "0.5.0",
-    .mach_zig_version = "2026.4.10-mach",
+    .mach_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "src",
         "build.zig",
@@ -25,8 +26,9 @@
             .lazy = true,
         },
         .mach_objc = .{
-            .url = "https://pkg.hexops.org/pkg/hexops/mach-objc/2d38fb258d8c15f382c8789ee9b5d52db17e94e3.tar.gz",
-            .hash = "mach_objc-0.0.0-pF1e0p4LDgBoJKtFRfDSWyVFtfyDcy_7YUBiuY74JkMT",
+            // TODO: upstream the Zig 0.17 port to code.hexops.org/hexops/mach-objc and mirror to pkg.hexops.org
+            .url = "git+https://github.com/gaarutyunov/mach-objc#09dc93774fd835db1ee3c0bc0e3e06a77b12394e",
+            .hash = "mach_objc-0.0.0-pF1e0lFEDQD2J3JTgIIebKO7XOove4EIxdy1iTtgqgCv",
             .lazy = true,
         },
         .xcode_frameworks = .{
@@ -45,8 +47,9 @@
             .lazy = true,
         },
         .vulkan_zig = .{
-            .url = "https://pkg.hexops.org/pkg/thirdparty/vulkan-zig/8dd11cfb44b3897b2cd8b026184306e46e7b1e40.tar.gz",
-            .hash = "vulkan-0.0.0-r7Ytx-lrAwDA6o57xnZ2Fs7AGKNBEkyGgsfQKyBlJw-2",
+            // TODO: mirror to pkg.hexops.org
+            .url = "git+https://github.com/Snektron/vulkan-zig#91a3537868952be63763db2b0725bcf9cf7f0d93",
+            .hash = "vulkan-0.0.0-r7Ytx1eHAwDInvlQSbl5gMYemczKJa6GimvWcgnOjibX",
             .lazy = true,
         },
         .vulkan_headers = .{
@@ -72,12 +75,9 @@
 
         // Dependencies used by examples only
         .zigimg = .{
-            // TODO: switch back to upstream zigimg once it supports Zig 0.16
-            // and once https://codeberg.org/ziglang/zig/issues/31617 is resolved
-            // .url = "https://pkg.hexops.org/pkg/thirdparty/zigimg/7b98e82621fe302a9edc147df1191f4d1b7ff7a5.tar.gz",
-            // .hash = "zigimg-0.1.0-8_eo2qWHFwA-S24SH7x7NplPii0EbIQiUfDrimgA6rzN",
-            .url = "https://github.com/emidoots/zigimg/archive/204076da6e0cce50ca19c46570793deda6c2b8cb.tar.gz",
-            .hash = "zigimg-0.1.0-8_eo2naZFwDyZ1zDEeRFB2EDzeZ37qxhxXVWsdUAWkE8",
+            // TODO: mirror to pkg.hexops.org
+            .url = "git+https://github.com/zigimg/zigimg#083d0304840a3f5fd547c2e2005148a18886c401",
+            .hash = "zigimg-0.1.0-8_eo2j1pGAA3ArMKhXcipNR-tdjmeWmByLJhOff2A_X4",
             .lazy = true,
         },
         .opusfile = .{

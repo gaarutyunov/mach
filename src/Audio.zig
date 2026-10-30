@@ -155,9 +155,9 @@ fn initAudioContext(allocator: std.mem.Allocator) sysaudio.Context.InitError!sys
         return sysaudio.Context.init(null, allocator, .{});
     const forced = std.mem.sliceTo(forced_ptr, 0);
 
-    inline for (std.meta.fields(sysaudio.Backend)) |field| {
-        if (std.ascii.eqlIgnoreCase(forced, field.name)) {
-            return sysaudio.Context.init(@enumFromInt(field.value), allocator, .{});
+    inline for (comptime std.enums.values(sysaudio.Backend)) |backend| {
+        if (std.ascii.eqlIgnoreCase(forced, @tagName(backend))) {
+            return sysaudio.Context.init(backend, allocator, .{});
         }
     }
     log.err("unknown MACH_FORCE_AUDIO_BACKEND: {s}", .{forced});
@@ -469,8 +469,8 @@ inline fn mixSamples(
 }
 
 test "mixSamples - basic mono to mono mixing" {
-    var dst_buffer align(alignment) = [_]f32{0} ** 16;
-    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0 } ** 4;
+    var dst_buffer: [16]f32 align(alignment) = @splat(0);
+    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 };
 
     const new_index = mixSamples(
         &dst_buffer,
@@ -489,8 +489,8 @@ test "mixSamples - basic mono to mono mixing" {
 }
 
 test "mixSamples - stereo to stereo mixing" {
-    var dst_buffer align(alignment) = [_]f32{0} ** 16;
-    const src_buffer align(alignment) = [_]f32{ 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0 } ** 2;
+    var dst_buffer: [16]f32 align(alignment) = @splat(0);
+    const src_buffer align(alignment) = [_]f32{ 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0 };
 
     const new_index = mixSamples(
         &dst_buffer,
@@ -509,8 +509,8 @@ test "mixSamples - stereo to stereo mixing" {
 }
 
 test "mixSamples - mono to stereo mixing (channel duplication)" {
-    var dst_buffer align(alignment) = [_]f32{0} ** 16;
-    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0 } ** 2;
+    var dst_buffer: [16]f32 align(alignment) = @splat(0);
+    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 };
 
     const new_index = mixSamples(
         &dst_buffer,
@@ -529,8 +529,8 @@ test "mixSamples - mono to stereo mixing (channel duplication)" {
 }
 
 test "mixSamples - partial buffer processing" {
-    var dst_buffer align(alignment) = [_]f32{0} ** 8;
-    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0 } ** 4;
+    var dst_buffer: [8]f32 align(alignment) = @splat(0);
+    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 };
 
     const new_index = mixSamples(
         &dst_buffer,
@@ -548,8 +548,8 @@ test "mixSamples - partial buffer processing" {
 }
 
 test "mixSamples - mixing with volume adjustment" {
-    var dst_buffer align(alignment) = [_]f32{0} ** 8;
-    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0 } ** 2;
+    var dst_buffer: [8]f32 align(alignment) = @splat(0);
+    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 };
 
     const new_index = mixSamples(
         &dst_buffer,
@@ -567,8 +567,8 @@ test "mixSamples - mixing with volume adjustment" {
 }
 
 test "mixSamples - accumulation test" {
-    var dst_buffer align(alignment) = [_]f32{1.0} ** 8;
-    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0 } ** 2;
+    var dst_buffer: [8]f32 align(alignment) = @splat(1.0);
+    const src_buffer align(alignment) = [_]f32{ 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0 };
 
     const new_index = mixSamples(
         &dst_buffer,

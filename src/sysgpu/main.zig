@@ -38,7 +38,7 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn createInstance(descriptor: ?*const sysgpu.Instance.Descriptor) ?*sysgpu.Instance {
-        if (builtin.mode == .Debug and !inited) {
+        if (builtin.mode == .debug and !inited) {
             std.log.err("sysgpu not initialized; did you forget to call sysgpu.Impl.init()?", .{});
         }
 

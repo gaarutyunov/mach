@@ -1,22 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const c = @cImport({
-    // TODO(translate-c): workaround for Zig translate-c failures on aarch64-windows-gnu and x86_64-windows-gnu
-    // release builds only:
-    if (builtin.target.abi == .gnu) @cDefine("_FORTIFY_SOURCE", "0");
-
-    // TODO(translate-c): workaround for Zig translate-c failures on aarch64-windows-gnu release and debug builds:
-    // - aro's stddef.h defines wchar_t via __WCHAR_TYPE__ (unsigned int on aarch64), conflicting
-    //   with mingw's corecrt.h which typedefs it as unsigned short
-    // - mingw's winnt.h uses `register` storage class on a global variable for __mingw_current_teb
-    if (builtin.target.cpu.arch == .aarch64 and builtin.target.os.tag == .windows and builtin.target.abi == .gnu) {
-        @cDefine("__WCHAR_TYPE__", "unsigned short");
-        @cDefine("register", "");
-    }
-
-    @cInclude("opusfile.h");
-    @cInclude("opusenc.h");
-});
+const c = @import("c_opus");
 
 const Opus = @This();
 
@@ -237,7 +220,7 @@ pub const Comments = struct {
             comments.opus_comments,
             image.ptr,
             image.len,
-            @intFromEnum(picture_type),
+            @backingInt(picture_type),
             description,
         );
         if (err != c.OPE_OK) return error.OutOfMemory;
@@ -277,7 +260,7 @@ pub fn encodeStream(
         comments.opus_comments,
         sample_rate,
         channels,
-        @intFromEnum(channel_mapping),
+        @backingInt(channel_mapping),
         &err,
     );
     try checkEncoderErr(err);

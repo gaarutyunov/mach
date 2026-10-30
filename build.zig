@@ -112,36 +112,43 @@ pub fn build(b: *std.Build) !void {
     });
     module.addImport("build-options", build_options.createModule());
 
-    buildExamples(
-        b,
-        optimize,
-        target,
-        module,
-        &examples,
-    );
-
     if (want_mach) {
         if (target.result.cpu.arch != .wasm32) {
             if (b.lazyDependency("freetype", .{
                 .target = target,
                 .optimize = optimize,
-            })) |dep| module.linkLibrary(dep.artifact("freetype"));
+            })) |dep| {
+                const lib = dep.artifact("freetype");
+                module.linkLibrary(lib);
+                addCImport(b, module, "freetype", .{ .windows_gnu_workarounds = true })
+                    .addIncludePath(lib.getEmittedIncludeTree());
+            }
             if (b.lazyDependency("kb-text-shape", .{
                 .target = target,
                 .optimize = optimize,
-            })) |dep| module.linkLibrary(dep.artifact("kb-text-shape"));
+            })) |dep| {
+                const lib = dep.artifact("kb-text-shape");
+                module.linkLibrary(lib);
+                addCImport(b, module, "kb_text_shape", .{ .windows_gnu_workarounds = true })
+                    .addIncludePath(lib.getEmittedIncludeTree());
+            }
             if (b.lazyDependency("opusfile", .{
                 .target = target,
-                .optimize = .ReleaseFast,
-            })) |dep| module.linkLibrary(dep.artifact("opusfile"));
-            if (b.lazyDependency("opusenc", .{
-                .target = target,
-                .optimize = .ReleaseFast,
-            })) |dep| module.linkLibrary(dep.artifact("opusenc"));
-        }
-
-        if (want_examples) {
-            for (examples) |example| b.getInstallStep().dependOn(example.install_step);
+                .optimize = .fast,
+            })) |opusfile| {
+                if (b.lazyDependency("opusenc", .{
+                    .target = target,
+                    .optimize = .fast,
+                })) |opusenc| {
+                    const opusfile_lib = opusfile.artifact("opusfile");
+                    const opusenc_lib = opusenc.artifact("opusenc");
+                    module.linkLibrary(opusfile_lib);
+                    module.linkLibrary(opusenc_lib);
+                    const opus_c = addCImport(b, module, "opus", .{ .windows_gnu_workarounds = true });
+                    opus_c.addIncludePath(opusfile_lib.getEmittedIncludeTree());
+                    opus_c.addIncludePath(opusenc_lib.getEmittedIncludeTree());
+                }
+            }
         }
     }
     if (want_core) {
@@ -151,9 +158,39 @@ pub fn build(b: *std.Build) !void {
             });
         }
         linkCore(b, module);
+        if (target.result.os.tag == .linux) {
+            const x11_c = addCImport(b, module, "x11", .{});
+            const wayland_c = addCImport(b, module, "wayland", .{});
+            if (b.lazyDependency("wayland_headers", .{
+                .target = target,
+                .optimize = optimize,
+            })) |dep| {
+                wayland_c.addIncludePath(dep.path("libdecor"));
+                wayland_c.addIncludePath(dep.path("wayland"));
+                wayland_c.addIncludePath(dep.path("wayland-protocols"));
+            }
+            if (b.lazyDependency("x11_headers", .{})) |dep| {
+                x11_c.addSystemIncludePath(dep.path("."));
+                wayland_c.addSystemIncludePath(dep.path("."));
+            }
+        }
     }
     if (want_sysaudio) {
         linkSysaudio(b, module);
+        if (target.result.os.tag == .linux) {
+            const alsa_c = addCImport(b, module, "alsa", .{});
+            const jack_c = addCImport(b, module, "jack", .{});
+            const pulseaudio_c = addCImport(b, module, "pulseaudio", .{});
+            const pipewire_c = addCImport(b, module, "pipewire", .{});
+            // TODO: Zig translate-c / Aro chokes on these so we must define them away
+            pipewire_c.defineCMacroRaw("_Static_assert(expr, msg)=((void)0)");
+            if (b.lazyDependency("linux_audio_headers", .{})) |dep| {
+                for ([_]*std.Build.Step.TranslateC{ alsa_c, jack_c, pulseaudio_c, pipewire_c }) |c| {
+                    c.addIncludePath(dep.path("."));
+                    c.addIncludePath(dep.path("alsa-lib"));
+                }
+            }
+        }
         if (target.result.os.tag == .linux) {
             module.addCSourceFile(.{
                 .file = b.path("src/sysaudio/pipewire/sysaudio.c"),
@@ -173,7 +210,7 @@ pub fn build(b: *std.Build) !void {
                 test_exe.root_module.addImport("mach", module);
 
                 const run_cmd = b.addRunArtifact(test_exe);
-                if (b.args) |args| run_cmd.addArgs(args);
+                run_cmd.addPassthruArgs();
 
                 sysaudio_test.run_step.dependOn(&run_cmd.step);
             }
@@ -181,6 +218,16 @@ pub fn build(b: *std.Build) !void {
     }
     if (want_sysgpu) {
         linkSysgpu(b, module);
+        if (target.result.os.tag == .linux or target.result.os.tag == .windows) {
+            const opengl_c = addCImport(b, module, "opengl", .{ .windows_gnu_workarounds = true });
+            if (b.lazyDependency("opengl_headers", .{})) |dep|
+                opengl_c.addSystemIncludePath(dep.path("."));
+        }
+        if (target.result.os.tag == .windows) {
+            const d3d12_c = addCImport(b, module, "d3d12", .{ .windows_gnu_workarounds = true });
+            if (b.lazyDependency("directx_headers", .{})) |dep|
+                d3d12_c.addSystemIncludePath(dep.path("include"));
+        }
         if (b.lazyDependency("vulkan_headers", .{})) |vulkan_headers| {
             if (b.lazyDependency("vulkan_zig", .{})) |vulkan_zig| {
                 const registry = vulkan_headers.path("registry/vk.xml");
@@ -199,6 +246,18 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             })) |dep| module.addImport("objc", dep.module("mach-objc"));
         }
+    }
+
+    buildExamples(
+        b,
+        optimize,
+        target,
+        module,
+        &examples,
+    );
+
+    if (want_mach and want_examples) {
+        for (examples) |example| b.getInstallStep().dependOn(example.install_step);
     }
 
     if (want_libs) {
@@ -264,7 +323,7 @@ pub fn build(b: *std.Build) !void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = target,
-                .optimize = .Debug,
+                .optimize = .debug,
             }),
         });
         //docs_obj.root_module.addOptions("build_options", build_options);
@@ -324,6 +383,7 @@ fn linkSysgpu(b: *std.Build, module: *std.Build.Module) void {
         module.linkSystemLibrary("d3d12", .{});
         module.linkSystemLibrary("d3dcompiler_47", .{});
         module.linkSystemLibrary("opengl32", .{});
+        module.linkSystemLibrary("gdi32", .{});
 
         if (b.lazyDependency("directx_headers", .{})) |dep|
             module.addSystemIncludePath(dep.path("include"));
@@ -403,6 +463,43 @@ fn linkSysaudio(b: *std.Build, module: *std.Build.Module) void {
     }
 }
 
+/// Translates the C header `src/c/{name}.h` and adds the result to `module` as the import
+/// `c_{name}`, replacing what used to be an `@cImport`. Include paths and other C options
+/// should be added to the returned step.
+fn addCImport(
+    b: *std.Build,
+    module: *std.Build.Module,
+    name: []const u8,
+    options: struct {
+        /// Apply workarounds for Zig translate-c failures with windows-gnu targets.
+        windows_gnu_workarounds: bool = false,
+    },
+) *std.Build.Step.TranslateC {
+    const target = module.resolved_target orelse @panic("module must have .target specified");
+    const optimize = module.optimize orelse @panic("module must have .optimize specified");
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path(b.fmt("src/c/{s}.h", .{name})),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (options.windows_gnu_workarounds) {
+        // TODO(translate-c): workaround for Zig translate-c failures on aarch64-windows-gnu and x86_64-windows-gnu
+        // release builds only:
+        if (target.result.abi == .gnu) translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
+
+        // TODO(translate-c): workaround for Zig translate-c failures on aarch64-windows-gnu release and debug builds:
+        // - aro's stddef.h defines wchar_t via __WCHAR_TYPE__ (unsigned int on aarch64), conflicting
+        //   with mingw's corecrt.h which typedefs it as unsigned short
+        // - mingw's winnt.h uses `register` storage class on a global variable for __mingw_current_teb
+        if (target.result.cpu.arch == .aarch64 and target.result.os.tag == .windows and target.result.abi == .gnu) {
+            translate_c.defineCMacro("__WCHAR_TYPE__", "unsigned short");
+            translate_c.defineCMacro("register", "");
+        }
+    }
+    module.addImport(b.fmt("c_{s}", .{name}), translate_c.createModule());
+    return translate_c;
+}
+
 const Dependency = enum {
     assets,
     freetype,
@@ -477,6 +574,7 @@ fn buildExamples(
                         .target = target,
                         .optimize = optimize,
                     })) |dep| app_mod.linkLibrary(dep.artifact("freetype"));
+                    if (mach_mod.import_table.get("c_freetype")) |c| app_mod.addImport("c_freetype", c);
                 },
                 .zigimg => {
                     if (b.lazyDependency("zigimg", .{
@@ -488,7 +586,7 @@ fn buildExamples(
         }
 
         const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
 
         const installArtifact = b.addInstallArtifact(exe, .{});
         example.install_step = &installArtifact.step;
@@ -503,10 +601,21 @@ fn buildEditor(
     target: std.Build.ResolvedTarget,
     editor_step: *std.Build.Step,
 ) void {
-    // Custom build step for producing build info (such as Mach and Zig version used.)
-    const version_step = BuildInfoStep.create(b);
+    // Generate build info (such as Mach and Zig version used.)
+    const build_info_gen = b.addExecutable(.{
+        .name = "build_info_gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("editor/build_info_gen.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const gen_cmd = b.addRunArtifact(build_info_gen);
+    gen_cmd.addFileArg(b.path("build.zig.zon"));
+    gen_cmd.addDirectoryArg(b.path("."));
+    // The git version can change without any tracked inputs changing.
+    gen_cmd.has_side_effects = true;
     const build_info_mod = b.createModule(.{
-        .root_source_file = version_step.getOutput(),
+        .root_source_file = gen_cmd.addOutputFileArg("build_info.zig"),
     });
 
     const editor_mod = b.createModule(.{
@@ -525,100 +634,14 @@ fn buildEditor(
     editor_step.dependOn(&install_editor.step);
 }
 
-/// Custom build step for producing build info (such as Mach and Zig version used.)
-///
-/// Generates a build_info.zig file with `mach_version` (git tag or commit SHA) and
-/// `mach_zig_version` string constants.
-const BuildInfoStep = struct {
-    step: std.Build.Step,
-    generated_file: std.Build.GeneratedFile,
-
-    fn create(b: *std.Build) *BuildInfoStep {
-        const bs = b.allocator.create(BuildInfoStep) catch @panic("OOM");
-        bs.* = .{
-            .step = .init(.{
-                .id = .custom,
-                .name = "generate build_info.zig",
-                .owner = b,
-                .makeFn = make,
-            }),
-            .generated_file = .{ .step = &bs.step },
-        };
-        return bs;
-    }
-
-    fn getOutput(bs: *BuildInfoStep) std.Build.LazyPath {
-        return .{ .generated = .{ .file = &bs.generated_file } };
-    }
-
-    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-        const b = step.owner;
-        const bs: *BuildInfoStep = @fieldParentPtr("step", step);
-
-        // Read the Mach Zig version from build.zig.zon.
-        const zon_bytes = b.build_root.handle.readFileAlloc(b.graph.io, "build.zig.zon", b.allocator, .limited(1 * 1024 * 1024)) catch |err|
-            return step.fail("unable to read build.zig.zon: {t}", .{err});
-        const mach_zig_version = parseMachZigVersion(zon_bytes) orelse
-            return step.fail("unable to find .mach_zig_version in build.zig.zon", .{});
-
-        // Run git: prefer exact-match tag, otherwise full commit SHA.
-        var code: u8 = 0;
-        const git_dir = b.build_root.path orelse ".";
-        const raw_version = b.runAllowFail(
-            &.{ "git", "-C", git_dir, "describe", "--tags", "--exact-match", "HEAD" },
-            &code,
-            .ignore,
-        ) catch b.runAllowFail(
-            &.{ "git", "-C", git_dir, "rev-parse", "HEAD" },
-            &code,
-            .ignore,
-        ) catch "unknown";
-        const mach_version = std.mem.trim(u8, raw_version, " \r\n\t");
-
-        const contents = try std.fmt.allocPrint(b.allocator,
-            \\pub const mach_version: []const u8 = "{s}";
-            \\pub const mach_zig_version: []const u8 = "{s}";
-            \\
-        , .{ mach_version, mach_zig_version });
-
-        // Write to a deterministic cache location, hashed by the file
-        // contents themselves.
-        const digest = std.Build.Cache.HashHelper.oneShot(contents);
-        const sub_path = b.pathJoin(&.{ "o", &digest, "build_info.zig" });
-        const cache_path = b.cache_root.join(b.allocator, &.{sub_path}) catch @panic("OOM");
-
-        b.cache_root.handle.createDirPath(b.graph.io, b.pathJoin(&.{ "o", &digest })) catch |err|
-            return step.fail("unable to create cache dir: {t}", .{err});
-        b.cache_root.handle.writeFile(b.graph.io, .{ .sub_path = sub_path, .data = contents }) catch |err|
-            return step.fail("unable to write {s}: {t}", .{ cache_path, err });
-
-        bs.generated_file.path = cache_path;
-    }
-
-    fn parseMachZigVersion(zon: []const u8) ?[]const u8 {
-        const key = ".mach_zig_version";
-        var idx: usize = 0;
-        while (std.mem.indexOfPos(u8, zon, idx, key)) |k| {
-            // Ensure preceding char is whitespace or start, to avoid matching .foo_mach_zig_version
-            const prev_ok = k == 0 or std.ascii.isWhitespace(zon[k - 1]) or zon[k - 1] == ',';
-            idx = k + key.len;
-            if (!prev_ok) continue;
-            const start_quote = std.mem.indexOfScalarPos(u8, zon, idx, '"') orelse return null;
-            const end_quote = std.mem.indexOfScalarPos(u8, zon, start_quote + 1, '"') orelse return null;
-            return zon[start_quote + 1 .. end_quote];
-        }
-        return null;
-    }
-};
-
 const SysAudioTest = struct {
     name: []const u8,
     run_step: *std.Build.Step = undefined,
 };
 
 comptime {
-    const supported_zig = std.SemanticVersion.parse("0.16.0-dev.3142+5ccfeb926") catch unreachable;
+    const supported_zig = std.SemanticVersion.parse("0.17.0") catch unreachable;
     if (builtin.zig_version.order(supported_zig) != .eq) {
-        @compileError(std.fmt.comptimePrint("unsupported Zig version ({}). Required Zig version 2026.4.10-mach: https://machengine.org/docs/zig-version/", .{builtin.zig_version}));
+        @compileError(std.fmt.comptimePrint("unsupported Zig version ({}). Required Zig version 0.17.0: https://machengine.org/docs/zig-version/", .{builtin.zig_version}));
     }
 }
