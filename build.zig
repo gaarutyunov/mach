@@ -412,6 +412,7 @@ fn linkCore(b: *std.Build, module: *std.Build.Module) void {
     } else if (target.result.os.tag.isDarwin()) {
         if (target.result.os.tag == .macos) {
             module.linkFramework("AppKit", .{});
+            module.linkFramework("CoreVideo", .{});
         } else {
             module.linkFramework("UIKit", .{});
         }

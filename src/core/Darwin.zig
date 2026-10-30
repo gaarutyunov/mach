@@ -507,6 +507,21 @@ const NativeState = struct {
     /// disableMouseCapture to restore the cursor to where the user left it, instead of leaving
     /// it stranded at the window center.
     pre_capture_cursor_pos: ?objc.core_graphics.Point = null,
+
+    /// Fallback vsync source used when CAMetalDisplayLink is unavailable (macOS < 14). Unlike
+    /// CAMetalDisplayLink it does not vend drawables: it only signals `ready_sem` on every vsync,
+    /// and the render thread acquires drawables via nextDrawable() as usual.
+    cv_display_link: ?CVDisplayLinkRef = null,
+
+    /// True while `cv_display_link` is running. Gates in-flight CVDisplayLink callbacks that race
+    /// with detach.
+    use_cv_display_link: bool = false,
+
+    /// Whether rendering for this window is currently paced by a display link (either kind).
+    fn hasDisplayLink(n: *NativeState) bool {
+        return @atomicLoad(bool, &n.surface.use_display_link, .acquire) or
+            @atomicLoad(bool, &n.use_cv_display_link, .acquire);
+    }
 };
 
 /// Enables mouse capture.
@@ -626,11 +641,43 @@ const RenderLoop = struct {
 
         // Start the display link.
         if (!n.view.call(.startDisplayLink, .{})) {
-            log.err("CAMetalDisplayLink unavailable (requires macOS 14+)", .{});
+            // CAMetalDisplayLink requires macOS 14+. Fall back to a CVDisplayLink that only paces
+            // the render thread, with drawables acquired via nextDrawable() and the layer's own
+            // displaySyncEnabled preventing tearing.
             @atomicStore(bool, &n.surface.use_display_link, false, .release);
             n.surface.layer.setDisplaySyncEnabled(true);
+            if (!startCVDisplayLink(n)) {
+                log.err("no display link available, rendering without vsync pacing", .{});
+            }
             return;
         }
+    }
+
+    /// Starts a CVDisplayLink that signals `ready_sem` on every vsync. Returns false if one could
+    /// not be created.
+    fn startCVDisplayLink(n: *NativeState) bool {
+        if (n.cv_display_link == null) {
+            var link: ?CVDisplayLinkRef = null;
+            if (CVDisplayLinkCreateWithActiveCGDisplays(&link) != kCVReturnSuccess) return false;
+            _ = CVDisplayLinkSetOutputCallback(link.?, &cvDisplayLinkCallback, n);
+            n.cv_display_link = link;
+        }
+        @atomicStore(bool, &n.use_cv_display_link, true, .release);
+        if (CVDisplayLinkStart(n.cv_display_link.?) != kCVReturnSuccess) {
+            @atomicStore(bool, &n.use_cv_display_link, false, .release);
+            return false;
+        }
+        return true;
+    }
+
+    /// Stops and releases the fallback CVDisplayLink, if any. CVDisplayLinkStop blocks until any
+    /// in-flight callback has returned, so `n` is safe to free afterwards.
+    fn stopCVDisplayLink(n: *NativeState) void {
+        @atomicStore(bool, &n.use_cv_display_link, false, .release);
+        const link = n.cv_display_link orelse return;
+        _ = CVDisplayLinkStop(link);
+        CVDisplayLinkRelease(link);
+        n.cv_display_link = null;
     }
 
     /// Stops the CAMetalDisplayLink for a window's view. Called when vsync is disabled or when a
@@ -638,6 +685,7 @@ const RenderLoop = struct {
     fn detachDisplayLink(n: *NativeState) void {
         // Stop the display link.
         n.view.call(.stopDisplayLink, .{});
+        stopCVDisplayLink(n);
 
         // Tell SwapChain.getCurrentTextureView to use nextDrawable again, and gate
         // `metalDisplayLink:needsUpdate:` from forwarding any in-flight vsync notification.
@@ -667,6 +715,7 @@ const RenderLoop = struct {
             while (windows.next()) |window_id| {
                 if (self.core.windows.get(window_id, .native)) |n| {
                     n.view.call(.stopDisplayLink, .{});
+                    stopCVDisplayLink(n);
                     _ = objc.system.dispatch_semaphore_signal(n.ready_sem);
                 }
             }
@@ -694,7 +743,7 @@ const RenderLoop = struct {
             // ANY window lacks a display link (vsync off, or not yet attached), skip the wait: that
             // window needs uncapped rendering, and display-link windows will naturally skip frames
             // when no drawable is available (getCurrentTextureView returns null). We check
-            // use_display_link (the actual hardware state) rather than vsync_mode (the desired
+            // hasDisplayLink (the actual hardware state) rather than vsync_mode (the desired
             // state that the main thread hasn't applied yet).
             {
                 var all_have_display_link = true;
@@ -706,7 +755,7 @@ const RenderLoop = struct {
                     var windows = self.core.windows.slice();
                     while (windows.next()) |window_id| {
                         const n = self.core.windows.get(window_id, .native) orelse continue;
-                        if (!@atomicLoad(bool, &n.surface.use_display_link, .acquire)) {
+                        if (!n.hasDisplayLink()) {
                             all_have_display_link = false;
                             break;
                         }
@@ -793,6 +842,33 @@ fn displayLinkWake(n: *NativeState, drawable: *objc.quartz_core.MetalDrawable) v
     _ = objc.system.dispatch_semaphore_signal(n.ready_sem);
 }
 
+// CVDisplayLink callback, invoked on a CoreVideo thread every vsync. Only used as a fallback
+// when CAMetalDisplayLink is unavailable (macOS < 14).
+fn cvDisplayLinkCallback(
+    _: CVDisplayLinkRef,
+    _: *const anyopaque, // in_now: *const CVTimeStamp
+    _: *const anyopaque, // in_output_time: *const CVTimeStamp
+    _: u64, // flags_in: CVOptionFlags
+    _: *u64, // flags_out: *CVOptionFlags
+    ctx: ?*anyopaque,
+) callconv(.c) i32 {
+    const n: *NativeState = @ptrCast(@alignCast(ctx.?));
+    if (!@atomicLoad(bool, &n.use_cv_display_link, .acquire)) return kCVReturnSuccess;
+
+    // Signal to the render thread that a vsync has occurred.
+    _ = objc.system.dispatch_semaphore_signal(n.ready_sem);
+    return kCVReturnSuccess;
+}
+
+const CVDisplayLinkRef = *opaque {};
+const CVDisplayLinkOutputCallback = *const fn (CVDisplayLinkRef, *const anyopaque, *const anyopaque, u64, *u64, ?*anyopaque) callconv(.c) i32;
+const kCVReturnSuccess: i32 = 0;
+extern "CoreVideo" fn CVDisplayLinkCreateWithActiveCGDisplays(link_out: *?CVDisplayLinkRef) i32;
+extern "CoreVideo" fn CVDisplayLinkSetOutputCallback(link: CVDisplayLinkRef, callback: CVDisplayLinkOutputCallback, user_info: ?*anyopaque) i32;
+extern "CoreVideo" fn CVDisplayLinkStart(link: CVDisplayLinkRef) i32;
+extern "CoreVideo" fn CVDisplayLinkStop(link: CVDisplayLinkRef) i32;
+extern "CoreVideo" fn CVDisplayLinkRelease(link: CVDisplayLinkRef) void;
+
 // TODO(core): port libdispatch and use it instead of doing this directly.
 extern "System" fn dispatch_async_f(queue: *anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
 extern "System" var _dispatch_main_q: anyopaque;
@@ -870,7 +946,7 @@ pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
     while (deleted_windows.next()) |window_id| {
         const n = core.windows.get(window_id, .native) orelse continue;
         objc.app_kit.Event.removeMonitor(n.key_up_monitor);
-        if (@atomicLoad(bool, &n.surface.use_display_link, .acquire)) {
+        if (n.hasDisplayLink()) {
             RenderLoop.detachDisplayLink(n);
         }
         // Signal the sem so the render thread (if blocked waiting on it) can unblock.
@@ -986,7 +1062,7 @@ pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
             // Only detach/attach the display link when transitioning between vsync-on and
             // vsync-off. Switching between vsync-on modes (e.g. .double → .triple) only
             // needs a swap chain recreation — the display link is already running.
-            const have_display_link = @atomicLoad(bool, &n.surface.use_display_link, .acquire);
+            const have_display_link = n.hasDisplayLink();
             if (want_vsync and !have_display_link) {
                 RenderLoop.attachDisplayLink(n);
             } else if (!want_vsync and have_display_link) {
