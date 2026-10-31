@@ -937,6 +937,13 @@ pub fn run(comptime on_each_update_fn: anytype, args_tuple: std.meta.ArgsTuple(@
 /// Called by Core.tick on the main thread each application tick. Creates new windows, applies
 /// changes (window title, size, vsync, etc.), and handles pending window destruction.
 pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
+    // Window frame changes to apply once the windows lock is released (see below.)
+    var pending_frames: std.ArrayList(struct {
+        window: *objc.app_kit.Window,
+        frame: objc.core_graphics.Rect,
+    }) = .empty;
+    defer pending_frames.deinit(core.allocator);
+
     core.windows.lock();
     var unlocked = false;
     defer if (!unlocked) core.windows.unlock();
@@ -993,16 +1000,16 @@ pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
             n.window.setTitle(string.initWithUTF8String(core_window.title));
         }
 
-        // Update window width/height.
+        // Update window width/height. setFrame synchronously triggers windowDidResize, whose
+        // handler takes the windows lock, so the resize is applied after we release it below.
         if (core.windows.updated(window_id, .width) or core.windows.updated(window_id, .height)) {
             var frame = native_window.frame();
             frame.size.width = @floatFromInt(core.windows.get(window_id, .width));
             frame.size.height = @floatFromInt(core.windows.get(window_id, .height));
-            native_window.setFrame_display_animate(
-                native_window.frameRectForContentRect(frame),
-                true,
-                true,
-            );
+            try pending_frames.append(core.allocator, .{
+                .window = native_window,
+                .frame = native_window.frameRectForContentRect(frame),
+            });
         }
 
         // Update cursor visibility. If the cursor is captured we keep it hidden regardless;
@@ -1087,6 +1094,10 @@ pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
     // Release the windows lock before stopping the render loop: rl.stop() acquires it itself.
     core.windows.unlock();
     unlocked = true;
+
+    // Apply window frame changes now that the windows lock is released, since setFrame
+    // synchronously invokes windowDidResize (handleResize) which acquires the lock itself.
+    for (pending_frames.items) |p| p.window.setFrame_display_animate(p.frame, true, true);
 
     // Consider mach.Core exiting/exited state.
     const state = core.state.load(.acquire);
