@@ -33,6 +33,7 @@ const BuiltPipeline = struct {
     texture4: ?*gpu.Texture,
     bind_group: *gpu.BindGroup,
     bind_group_layout: ?*gpu.BindGroupLayout,
+    user_bind_group_layout: ?*gpu.BindGroupLayout,
     uniforms: *gpu.Buffer,
 
     // Storage buffers
@@ -50,6 +51,7 @@ const BuiltPipeline = struct {
         if (p.texture4) |tex| tex.release();
         p.bind_group.release();
         if (p.bind_group_layout) |l| l.release();
+        if (p.user_bind_group_layout) |l| l.release();
         p.uniforms.release();
         p.transforms.release();
         p.uv_transforms.release();
@@ -147,6 +149,21 @@ const Pipelines = mach.Objects(.{ .track_fields = true }, struct {
 
     /// Override to enable custom pipeline layout.
     layout: ?*gpu.PipelineLayout = null,
+
+    /// Optional user bind group layout, bound at `@group(1)`. This lets a custom `.shader` receive
+    /// additional data (time, tints, effect parameters, extra textures, etc.) without replacing
+    /// Sprite's own `@group(0)` bindings (uniforms, sprite storage buffers, sampler, textures).
+    ///
+    /// Changing it causes the pipeline to be rebuilt. The pipeline takes a reference to it.
+    /// If a custom `.layout` is provided, it must include this layout at index 1.
+    user_bind_group_layout: ?*gpu.BindGroupLayout = null,
+
+    /// Bind group matching `.user_bind_group_layout`, set at `@group(1)` whenever this pipeline
+    /// is drawn. Must be set if `.user_bind_group_layout` is set.
+    ///
+    /// Changing it does not cause a pipeline rebuild, so it may be swapped freely. The caller is
+    /// responsible for keeping it alive while the pipeline may render with it.
+    user_bind_group: ?*gpu.BindGroup = null,
 
     /// Number of sprites this pipeline will render.
     /// Read-only, updated as part of Sprite.snapshot
@@ -325,6 +342,7 @@ pub fn render(sprite: *Sprite, core: *mach.Core) !void {
         _ = sprite.render_pipelines.updated(pipeline_id, .num_sprites);
         _ = sprite.render_pipelines.updated(pipeline_id, .built_index);
         _ = sprite.render_pipelines.updated(pipeline_id, .render_list);
+        _ = sprite.render_pipelines.updated(pipeline_id, .user_bind_group);
 
         // A pipeline rebuild is required if the slot hasn't been built yet, or if any
         // pipeline fields (texture, shader, blend state, etc.) have been updated.
@@ -375,6 +393,7 @@ fn rebuildPipeline(
     if (pipeline.bind_group_layout) |v| v.reference();
     if (pipeline.bind_group) |v| v.reference();
     if (pipeline.layout) |v| v.reference();
+    if (pipeline.user_bind_group_layout) |v| v.reference(); // released by BuiltPipeline.deinit
 
     const window = core.windows.getValue(pipeline.window.?);
     const device = window.device;
@@ -485,10 +504,15 @@ fn rebuildPipeline(
         .targets = &.{color_target},
     });
 
-    const bind_group_layouts = [_]*gpu.BindGroupLayout{bind_group_layout};
+    // Sprite's own bindings live at @group(0); the optional user bind group lives at @group(1).
+    const bind_group_layouts = [_]*gpu.BindGroupLayout{
+        bind_group_layout,
+        pipeline.user_bind_group_layout orelse bind_group_layout,
+    };
+    const num_bind_group_layouts: usize = if (pipeline.user_bind_group_layout != null) 2 else 1;
     const pipeline_layout = pipeline.layout orelse device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
         .label = label,
-        .bind_group_layouts = &bind_group_layouts,
+        .bind_group_layouts = bind_group_layouts[0..num_bind_group_layouts],
     }));
     defer pipeline_layout.release();
     const render_pipeline = device.createRenderPipeline(&gpu.RenderPipeline.Descriptor{
@@ -510,6 +534,7 @@ fn rebuildPipeline(
         .texture4 = pipeline.texture4,
         .bind_group = bind_group,
         .bind_group_layout = if (owns_bind_group_layout) bind_group_layout else null,
+        .user_bind_group_layout = pipeline.user_bind_group_layout,
         .uniforms = uniforms,
         .transforms = transforms,
         .uv_transforms = uv_transforms,
@@ -693,5 +718,10 @@ fn renderPipeline(
     render_pass.setPipeline(built.render);
     // TODO(sprite): can we remove unused dynamic offsets?
     render_pass.setBindGroup(0, built.bind_group, &.{});
+    if (built.user_bind_group_layout != null) {
+        // A pipeline whose layout has a @group(1) cannot be drawn without a @group(1) bind group.
+        const user_bind_group = pipeline.user_bind_group orelse return;
+        render_pass.setBindGroup(1, user_bind_group, &.{});
+    }
     render_pass.draw(total_vertices, 1, 0, 0);
 }
