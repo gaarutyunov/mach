@@ -405,6 +405,43 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
             return fromStorage(data.get(unpacked.index));
         }
 
+        /// Returns an iterator over a single field of every live object, in the same order that
+        /// `slice()` yields their IDs. Excludes any objects which have been freed or marked for
+        /// deletion.
+        pub fn sliceField(objs: *@This(), comptime field_name: std.meta.FieldEnum(T)) SliceField(field_name) {
+            // Sync any cascaded deletions that may have occurred prior to this so our
+            // pending_delete bits are up to date.
+            objs.internal.graph.sync(objs.internal.allocator) catch {};
+
+            return .{ .index = 0, .objs = objs };
+        }
+
+        pub fn SliceField(comptime field_name: std.meta.FieldEnum(T)) type {
+            return struct {
+                index: Index,
+                objs: *Objects(options, T),
+
+                pub fn next(s: *@This()) ?@FieldType(T, @tagName(field_name)) {
+                    const freed = &s.objs.internal.freed;
+                    const pending_delete = &s.objs.internal.pending_delete;
+                    const num_objects = s.objs.internal.generation.items.len;
+
+                    while (true) {
+                        if (s.index == num_objects) {
+                            s.index = 0;
+                            return null;
+                        }
+                        defer s.index += 1;
+
+                        if (!freed.isSet(s.index) and !pending_delete.isSet(s.index)) {
+                            // Re-fetched each call: new() may reallocate the column mid-iteration.
+                            return s.objs.internal.data.items(field_name)[s.index];
+                        }
+                    }
+                }
+            };
+        }
+
         /// Marks an object for deletion. The object is flagged for deletion, it remains alive and
         /// readable until someone, usually the owning module that knows how to cleanup its
         /// resources, invokes `free()` on it.
@@ -1317,4 +1354,49 @@ test "Many fields, Many modules" {
     try modules.init(allocator, io);
     modules.deinit(allocator);
     aa.deinit();
+}
+
+test "Objects.sliceField" {
+    const test_module = struct {
+        pub const mach_module = .test_module;
+        things: Objects(.{}, struct { a: u32, b: f32 }),
+    };
+
+    //TODO: swap to testing allocator once remainder of deinit implemented
+    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer aa.deinit();
+    const allocator = aa.allocator();
+
+    const io = std.Options.debug_io;
+    var modules = Modules(.{test_module}){
+        .mods = undefined,
+        .graph = undefined,
+        .io = io,
+    };
+    try modules.init(allocator, io);
+    defer modules.deinit(allocator);
+
+    const things = &modules.mods.test_module.things;
+    _ = try things.new(.{ .a = 1, .b = 1.5 });
+    const freed = try things.new(.{ .a = 2, .b = 2.5 });
+    const deleted = try things.new(.{ .a = 3, .b = 3.5 });
+    _ = try things.new(.{ .a = 4, .b = 4.5 });
+    things.free(freed);
+    things.delete(deleted);
+
+    var as = things.sliceField(.a);
+    try std.testing.expectEqual(@as(?u32, 1), as.next());
+    try std.testing.expectEqual(@as(?u32, 4), as.next());
+    try std.testing.expectEqual(@as(?u32, null), as.next());
+
+    var bs = things.sliceField(.b);
+    try std.testing.expectEqual(@as(?f32, 1.5), bs.next());
+    try std.testing.expectEqual(@as(?f32, 4.5), bs.next());
+    try std.testing.expectEqual(@as(?f32, null), bs.next());
+
+    // Order matches slice()
+    var ids = things.slice();
+    var values = things.sliceField(.a);
+    while (ids.next()) |id| try std.testing.expectEqual(@as(?u32, things.get(id, .a)), values.next());
+    try std.testing.expectEqual(@as(?u32, null), values.next());
 }
