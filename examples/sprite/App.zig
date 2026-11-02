@@ -60,8 +60,9 @@ pub fn init(
     app_mod: mach.Mod(App),
     core_mod: mach.Mod(mach.Core),
     io: std.Io,
-    allocator: std.mem.Allocator,
+    ctx: mach.Context,
 ) !void {
+    const allocator = ctx.allocator;
     // You should use mach.Timer in general, but here we call std.Io.Timestamp.now() to show that
     // you can always get an 'io' parameter in any module function - it's automatically injected
     // for you.

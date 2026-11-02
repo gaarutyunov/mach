@@ -164,7 +164,9 @@ fn initAudioContext(allocator: std.mem.Allocator) sysaudio.Context.InitError!sys
     return sysaudio.Context.init(null, allocator, .{});
 }
 
-pub fn init(audio: *Audio, audio_mod: mach.Mod(Audio), io: std.Io, allocator: std.mem.Allocator) !void {
+pub fn init(audio: *Audio, audio_mod: mach.Mod(Audio), context: mach.Context) !void {
+    const allocator = context.allocator;
+    const io = context.io;
     const ctx = try initAudioContext(allocator);
     try ctx.refresh();
 

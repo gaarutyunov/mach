@@ -70,7 +70,6 @@ pub fn init(
     app_mod: mach.Mod(App),
     core_mod: mach.Mod(mach.Core),
     io: std.Io,
-    allocator: std.mem.Allocator,
 ) !void {
     core.on_exit = app_mod.id.deinit;
 
@@ -92,6 +91,7 @@ fn setupPipeline(
     app: *App,
     text: *gfx.Text,
     core: *mach.Core,
+    allocator: std.mem.Allocator,
 ) !void {
     // Create a text rendering pipeline
     app.pipeline_id = try text.pipelines.new(.{
@@ -132,8 +132,9 @@ pub fn appTick(
     core: *mach.Core,
     app: *App,
     text: *gfx.Text,
-    allocator: std.mem.Allocator,
+    ctx: mach.Context,
 ) !void {
+    const allocator = ctx.allocator;
     const label = @tagName(mach_module) ++ ".tick";
     _ = label;
 
@@ -226,9 +227,10 @@ pub fn render(
     app: *App,
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
+    ctx: mach.Context,
 ) !void {
     if (app.pipeline_id == null) {
-        try setupPipeline(app, text, core);
+        try setupPipeline(app, text, core, ctx.allocator);
         return;
     }
 

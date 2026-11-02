@@ -851,6 +851,35 @@ pub const ModuleFunctionID = u16;
 /// Unique identifier for a function within a module, including those only known at runtime.
 pub const FunctionID = struct { module_id: ModuleID, fn_id: ModuleFunctionID };
 
+/// Per-module context given to systems which declare a `mach.Context` parameter:
+///
+/// ```
+/// pub fn init(app: *App, ctx: mach.Context) !void {
+///     app.items = try std.ArrayList(Item).initCapacity(ctx.allocator, 64);
+/// }
+/// ```
+pub const Context = struct {
+    /// This module's allocator: its pool if it has a budget (`InitOptions.budgets`), its override
+    /// (`InitOptions.allocators`), or else the global allocator passed to `Modules.init`.
+    allocator: std.mem.Allocator,
+
+    io: std.Io,
+
+    /// This module's memory pool, if it was given a budget in `InitOptions.budgets`.
+    pool: ?*PoolAllocator,
+
+    /// The name of the module whose system is running, e.g. "mach_gfx_sprite".
+    module_name: []const u8,
+
+    _modules: *anyopaque,
+    _report_memory: *const fn (modules: *anyopaque) void,
+
+    /// Logs usage and high-water mark of every module's memory pool.
+    pub fn reportMemory(ctx: Context) void {
+        ctx._report_memory(ctx._modules);
+    }
+};
+
 pub fn Mod(comptime M: type) type {
     return struct {
         pub const IsMachMod = void;
@@ -1002,9 +1031,9 @@ pub fn Modules(module_lists: anytype) type {
             /// .allocators = .{ .mach_gfx_sprite = sprite_pool.allocator() },
             /// ```
             ///
-            /// A module's allocator backs its `mach.Objects` lists and is what its systems receive
-            /// when they declare a `std.mem.Allocator` parameter. Modules left `null` use the
-            /// global allocator passed to `init()`.
+            /// A module's allocator backs its `mach.Objects` lists and is `ctx.allocator` in the
+            /// `mach.Context` its systems receive. Modules left `null` use the global allocator
+            /// passed to `init()`.
             allocators: ModuleAllocatorOptions(modules) = .{},
 
             /// Per-module memory budgets in bytes, by module name, e.g.:
@@ -1201,9 +1230,8 @@ pub fn Modules(module_lists: anytype) type {
                             @field(args, arg_name) = m.modules.io;
                             continue :outer;
                         }
-                        if (arg_type == std.mem.Allocator) {
-                            // This module's allocator (its override, or the global allocator).
-                            @field(args, arg_name) = @field(m.modules.allocators, @tagName(module_name));
+                        if (arg_type == Context) {
+                            @field(args, arg_name) = m.modules.context(module_name);
                             continue :outer;
                         }
                         if (@typeInfo(arg_type) == .@"struct" and @hasDecl(arg_type, "IsMachMod")) {
@@ -1239,6 +1267,25 @@ pub fn Modules(module_lists: anytype) type {
 
         pub fn get(m: *@This(), module_tag_or_type: anytype) Module(module_tag_or_type) {
             return .{ .mods = &m.mods, .modules = m };
+        }
+
+        /// Returns the `mach.Context` for the given module, as given to its systems.
+        pub fn context(m: *@This(), module_name: ModuleName) Context {
+            switch (module_name) {
+                inline else => |name| return .{
+                    .allocator = @field(m.allocators, @tagName(name)),
+                    .io = m.io,
+                    .pool = if (@field(m.pools, @tagName(name))) |*pool| pool else null,
+                    .module_name = @tagName(name),
+                    ._modules = m,
+                    ._report_memory = (struct {
+                        fn reportMemory(modules_ptr: *anyopaque) void {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            m2.reportMemory();
+                        }
+                    }).reportMemory,
+                },
+            }
         }
 
         /// Returns the allocator for the given module (its override, or the global allocator).
@@ -1496,8 +1543,8 @@ test "Per-module allocators" {
         pub const mach_systems = .{.init};
         things: Objects(.{}, struct { a: u32 }),
         seen: std.mem.Allocator,
-        pub fn init(m: *@This(), allocator: std.mem.Allocator) void {
-            m.seen = allocator;
+        pub fn init(m: *@This(), ctx: Context) void {
+            m.seen = ctx.allocator;
         }
     };
     const global = struct {
@@ -1505,8 +1552,8 @@ test "Per-module allocators" {
         pub const mach_systems = .{.init};
         things: Objects(.{}, struct { a: u32 }),
         seen: std.mem.Allocator,
-        pub fn init(m: *@This(), allocator: std.mem.Allocator) void {
-            m.seen = allocator;
+        pub fn init(m: *@This(), ctx: Context) void {
+            m.seen = ctx.allocator;
         }
     };
 
@@ -1568,6 +1615,12 @@ test "Per-module budgets" {
     try std.testing.expectEqual(@as(*anyopaque, pool), modules.allocatorFor(.pooled).ptr);
     try std.testing.expectEqual(pool.buffer.len, 1024 * 1024);
     try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
+
+    // Systems' context exposes the module's pool.
+    const ctx = modules.context(.pooled);
+    try std.testing.expectEqual(pool, ctx.pool.?);
+    try std.testing.expectEqualStrings("pooled", ctx.module_name);
+    try std.testing.expect(modules.context(.global).pool == null);
 
     // Objects lists allocate from the pool, and are limited by its budget.
     _ = try modules.mods.pooled.things.new(.{ .a = 1 });

@@ -68,8 +68,9 @@ pub fn init(
     app_mod: mach.Mod(App),
     core_mod: mach.Mod(mach.Core),
     io: std.Io,
-    allocator: std.mem.Allocator,
+    ctx: mach.Context,
 ) !void {
+    const allocator = ctx.allocator;
     core.on_exit = app_mod.id.deinit;
 
     const window = try core.windows.new(.{
