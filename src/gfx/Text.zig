@@ -272,10 +272,7 @@ render_segments: ?[][]Segment = null,
 // Temporary buffer used during updatePipelineBuffers, retained to avoid re-allocation.
 cp_transforms: std.ArrayList(gpu.Mat4x4) = .empty,
 
-pub fn init(text: *Text) !void {
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
-
+pub fn init(text: *Text, allocator: std.mem.Allocator) !void {
     text.* = .{
         .allocator = allocator,
         .styles = text.styles,

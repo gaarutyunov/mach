@@ -334,6 +334,22 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
             });
         }
 
+        /// Preallocates storage for at least `new_capacity` objects (live or freed), so that
+        /// `new()` and `free()` do not allocate until that many slots are in use.
+        pub fn ensureTotalCapacity(objs: *@This(), new_capacity: usize) std.mem.Allocator.Error!void {
+            const allocator = objs.internal.allocator;
+            const data = &objs.internal.data;
+
+            try data.ensureTotalCapacity(allocator, new_capacity);
+            try objs.internal.freed.resize(allocator, data.capacity, false);
+            try objs.internal.pending_delete.resize(allocator, data.capacity, false);
+            try objs.internal.generation.ensureTotalCapacity(allocator, data.capacity);
+            try objs.internal.recycling_bin.ensureTotalCapacity(allocator, data.capacity);
+            if (objs.internal.updated) |*updated_fields| {
+                try updated_fields.resize(allocator, data.capacity * @typeInfo(T).@"struct".field_names.len, true);
+            }
+        }
+
         /// Sets all fields of the given object to the given value.
         ///
         /// Unlike setAll(), this method does not respect any mach.Objects tracking
@@ -944,6 +960,13 @@ pub fn Modules(module_lists: anytype) type {
         mods: ModulesByName(modules),
         io: std.Io,
 
+        /// The global allocator passed to `init()`. Used by the object graph, and by every module
+        /// which has no allocator override in `InitOptions.allocators`.
+        allocator: std.mem.Allocator = undefined,
+
+        /// The resolved allocator for each module, by module name. Use `allocatorFor()`.
+        allocators: ModuleAllocators(modules) = undefined,
+
         module_names: StringTable = .{},
         object_names: StringTable = .{},
         name_ids: std.MultiArrayList(struct {
@@ -952,12 +975,33 @@ pub fn Modules(module_lists: anytype) type {
         }) = .{},
         graph: Graph,
 
+        pub const InitOptions = struct {
+            /// Per-module allocator overrides, by module name, e.g.:
+            ///
+            /// ```
+            /// .allocators = .{ .mach_gfx_sprite = sprite_pool.allocator() },
+            /// ```
+            ///
+            /// A module's allocator backs its `mach.Objects` lists and is what its systems receive
+            /// when they declare a `std.mem.Allocator` parameter. Modules left `null` use the
+            /// global allocator passed to `init()`.
+            allocators: ModuleAllocatorOptions(modules) = .{},
+        };
+
         pub fn init(m: *@This(), allocator: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Thread.SpawnError)!void {
+            return m.initOptions(allocator, io, .{});
+        }
+
+        pub fn initOptions(m: *@This(), allocator: std.mem.Allocator, io: std.Io, options: InitOptions) (std.mem.Allocator.Error || std.Thread.SpawnError)!void {
             m.* = .{
                 .mods = undefined,
                 .graph = undefined,
                 .io = io,
+                .allocator = allocator,
             };
+            inline for (@typeInfo(@TypeOf(m.allocators)).@"struct".field_names) |name| {
+                @field(m.allocators, name) = @field(options.allocators, name) orelse allocator;
+            }
             try initGraph(&m.graph, allocator, io, .global);
 
             // TODO(object): errdefer release allocations made in this loop
@@ -979,7 +1023,7 @@ pub fn Modules(module_lists: anytype) type {
                         });
 
                         @field(mod, mod_field_name).internal = .{
-                            .allocator = allocator,
+                            .allocator = @field(m.allocators, field_name),
                             .io = io,
                             .type_id = @intCast(object_type_id),
                             .graph = &m.graph,
@@ -1071,6 +1115,11 @@ pub fn Modules(module_lists: anytype) type {
                             @field(args, arg_name) = m.modules.io;
                             continue :outer;
                         }
+                        if (arg_type == std.mem.Allocator) {
+                            // This module's allocator (its override, or the global allocator).
+                            @field(args, arg_name) = @field(m.modules.allocators, @tagName(module_name));
+                            continue :outer;
+                        }
                         if (@typeInfo(arg_type) == .@"struct" and @hasDecl(arg_type, "IsMachMod")) {
                             const M = arg_type.Module;
                             var mv: Mod(M) = .{
@@ -1104,6 +1153,11 @@ pub fn Modules(module_lists: anytype) type {
 
         pub fn get(m: *@This(), module_tag_or_type: anytype) Module(module_tag_or_type) {
             return .{ .mods = &m.mods, .modules = m };
+        }
+
+        /// Returns the allocator for the given module (its override, or the global allocator).
+        pub fn allocatorFor(m: *@This(), module_tag_or_type: anytype) std.mem.Allocator {
+            return @field(m.allocators, @tagName(Module(module_tag_or_type).mod_name));
         }
 
         pub fn callDynamic(m: *@This(), f: FunctionID) void {
@@ -1207,6 +1261,34 @@ fn ModuleTypesByName(comptime modules: anytype) type {
         field_attrs = field_attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{.{
             .default_value_ptr = @ptrCast(&M),
             .@"comptime" = true,
+            .@"align" = null,
+        }};
+    }
+    return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?std.mem.Allocator = null`
+/// field per module name.
+fn ModuleAllocatorOptions(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?std.mem.Allocator, &@as(?std.mem.Allocator, null));
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `std.mem.Allocator` field per
+/// module name.
+fn ModuleAllocators(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, std.mem.Allocator, null);
+}
+
+fn ModuleFieldsOf(comptime modules: anytype, comptime T: type, comptime default: ?*const T) type {
+    var field_names: []const []const u8 = &.{};
+    var field_types: []const type = &.{};
+    var field_attrs: []const std.builtin.Type.Struct.FieldAttributes = &.{};
+    for (modules) |M| {
+        field_names = field_names ++ [_][]const u8{@tagName(M.mach_module)};
+        field_types = field_types ++ [_]type{T};
+        field_attrs = field_attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{.{
+            .default_value_ptr = if (default) |d| @ptrCast(d) else null,
+            .@"comptime" = false,
             .@"align" = null,
         }};
     }
@@ -1317,4 +1399,63 @@ test "Many fields, Many modules" {
     try modules.init(allocator, io);
     modules.deinit(allocator);
     aa.deinit();
+}
+
+test "Per-module allocators" {
+    const pooled = struct {
+        pub const mach_module = .pooled;
+        pub const mach_systems = .{.init};
+        things: Objects(.{}, struct { a: u32 }),
+        seen: std.mem.Allocator,
+        pub fn init(m: *@This(), allocator: std.mem.Allocator) void {
+            m.seen = allocator;
+        }
+    };
+    const global = struct {
+        pub const mach_module = .global;
+        pub const mach_systems = .{.init};
+        things: Objects(.{}, struct { a: u32 }),
+        seen: std.mem.Allocator,
+        pub fn init(m: *@This(), allocator: std.mem.Allocator) void {
+            m.seen = allocator;
+        }
+    };
+
+    //TODO: swap to testing allocator once remainder of deinit implemented
+    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer aa.deinit();
+    const allocator = aa.allocator();
+
+    var pool = std.testing.FailingAllocator.init(allocator, .{});
+    const pool_allocator = pool.allocator();
+
+    const io = std.Options.debug_io;
+    var modules: Modules(.{ pooled, global }) = undefined;
+    try modules.initOptions(allocator, io, .{ .allocators = .{ .pooled = pool_allocator } });
+    defer modules.deinit(allocator);
+
+    // Overrides are resolved, and Objects lists use their module's allocator.
+    try std.testing.expectEqual(pool_allocator.ptr, modules.allocatorFor(.pooled).ptr);
+    try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
+    try std.testing.expectEqual(pool_allocator.ptr, modules.mods.pooled.things.internal.allocator.ptr);
+    try std.testing.expectEqual(allocator.ptr, modules.mods.global.things.internal.allocator.ptr);
+
+    // Systems receive their module's allocator.
+    modules.get(.pooled).run(.init);
+    modules.get(.global).run(.init);
+    try std.testing.expectEqual(pool_allocator.ptr, modules.mods.pooled.seen.ptr);
+    try std.testing.expectEqual(allocator.ptr, modules.mods.global.seen.ptr);
+
+    // After preallocating, new() and free() do not allocate until capacity is exceeded.
+    const things = &modules.mods.pooled.things;
+    try things.ensureTotalCapacity(16);
+    pool.fail_index = pool.alloc_index;
+    const capacity = things.internal.data.capacity;
+    try std.testing.expect(capacity >= 16);
+    var ids: [64]ObjectID = undefined;
+    for (ids[0..capacity], 0..) |*id, i| id.* = try things.new(.{ .a = @intCast(i) });
+    for (ids[0..8]) |id| things.free(id);
+    for (ids[0..8]) |*id| id.* = try things.new(.{ .a = 0 });
+    // Growing past the reserved capacity hits the allocator again.
+    try std.testing.expectError(error.OutOfMemory, things.new(.{ .a = 0 }));
 }
