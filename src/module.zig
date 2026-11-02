@@ -3,6 +3,7 @@ const mach = @import("main.zig");
 const Core = @import("Core.zig");
 const StringTable = @import("StringTable.zig");
 const Graph = @import("graph.zig").Graph;
+const PoolAllocator = @import("PoolAllocator.zig");
 
 /// A handle to a spawned thread.
 pub const Thread = struct {
@@ -980,6 +981,12 @@ pub fn Modules(module_lists: anytype) type {
         /// The resolved allocator for each module, by module name. Use `allocatorFor()`.
         allocators: ModuleAllocators(modules) = undefined,
 
+        /// Each module's memory pool, if it was given a budget in `InitOptions.budgets`.
+        pools: ModulePools(modules) = .{},
+
+        /// The block reserved up front for all pools, split according to the budgets.
+        pool_block: []u8 = &.{},
+
         module_names: StringTable = .{},
         object_names: StringTable = .{},
         name_ids: std.MultiArrayList(struct {
@@ -999,6 +1006,21 @@ pub fn Modules(module_lists: anytype) type {
             /// when they declare a `std.mem.Allocator` parameter. Modules left `null` use the
             /// global allocator passed to `init()`.
             allocators: ModuleAllocatorOptions(modules) = .{},
+
+            /// Per-module memory budgets in bytes, by module name, e.g.:
+            ///
+            /// ```
+            /// .budgets = .{ .app = 32 * mib, .mach_audio = 128 * mib },
+            /// ```
+            ///
+            /// One block covering all budgets is reserved up front from the OS (pages are only
+            /// committed as they are first used, so unused budget costs address space, not RAM).
+            /// Each listed module gets its own `mach.PoolAllocator` over its slice of the block,
+            /// and allocating past the budget fails with `error.OutOfMemory`. Use
+            /// `reportMemory()` to log usage and high-water marks for sizing budgets.
+            ///
+            /// A module can't have both a budget and an allocator override.
+            budgets: ModuleBudgets(modules) = .{},
         };
 
         pub fn init(m: *@This(), allocator: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Thread.SpawnError)!void {
@@ -1012,8 +1034,12 @@ pub fn Modules(module_lists: anytype) type {
                 .io = io,
                 .allocator = allocator,
             };
+            try m.initPools(io, options);
             inline for (@typeInfo(@TypeOf(m.allocators)).@"struct".field_names) |name| {
-                @field(m.allocators, name) = @field(options.allocators, name) orelse allocator;
+                @field(m.allocators, name) = if (@field(m.pools, name)) |*pool|
+                    pool.allocator()
+                else
+                    @field(options.allocators, name) orelse allocator;
             }
             try initGraph(&m.graph, allocator, io, .global);
 
@@ -1056,8 +1082,39 @@ pub fn Modules(module_lists: anytype) type {
             }
         }
 
+        fn initPools(m: *@This(), io: std.Io, options: InitOptions) std.mem.Allocator.Error!void {
+            const names = @typeInfo(@TypeOf(m.pools)).@"struct".field_names;
+            var total: usize = 0;
+            inline for (names) |name| {
+                if (@field(options.budgets, name)) |budget| {
+                    if (@field(options.allocators, name) != null) {
+                        @panic("mach: module ." ++ name ++ " has both a budget and an allocator override");
+                    }
+                    total += budget;
+                }
+            }
+            if (total == 0) return;
+
+            m.pool_block = try std.heap.page_allocator.alloc(u8, total);
+            var offset: usize = 0;
+            inline for (names) |name| {
+                if (@field(options.budgets, name)) |budget| {
+                    @field(m.pools, name) = PoolAllocator.init(name, m.pool_block[offset..][0..budget], io);
+                    offset += budget;
+                }
+            }
+        }
+
+        /// Logs usage and high-water mark of every module's memory pool (see
+        /// `InitOptions.budgets`).
+        pub fn reportMemory(m: *@This()) void {
+            inline for (@typeInfo(@TypeOf(m.pools)).@"struct".field_names) |name| {
+                if (@field(m.pools, name)) |*pool| pool.report();
+            }
+        }
+
         /// Frees memory owned by the module system: every module's `mach.Objects` lists, the object
-        /// graph, and internal name tables.
+        /// graph, internal name tables, and memory pools.
         ///
         /// This does not run any module's `deinit` system; resources a module allocated itself must
         /// be released by that module (typically via its own `.deinit` system) beforehand.
@@ -1075,6 +1132,7 @@ pub fn Modules(module_lists: anytype) type {
             m.name_ids.deinit(allocator);
             m.module_names.deinit(allocator);
             m.object_names.deinit(allocator);
+            if (m.pool_block.len > 0) std.heap.page_allocator.free(m.pool_block);
         }
 
         pub fn Module(module_tag_or_type: anytype) type {
@@ -1307,6 +1365,18 @@ fn ModuleAllocators(comptime modules: anytype) type {
     return ModuleFieldsOf(modules, std.mem.Allocator, null);
 }
 
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?usize = null` field per module
+/// name.
+fn ModuleBudgets(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?usize, &@as(?usize, null));
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?PoolAllocator = null` field per
+/// module name.
+fn ModulePools(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?PoolAllocator, &@as(?PoolAllocator, null));
+}
+
 fn ModuleFieldsOf(comptime modules: anytype, comptime T: type, comptime default: ?*const T) type {
     var field_names: []const []const u8 = &.{};
     var field_types: []const type = &.{};
@@ -1474,4 +1544,34 @@ test "Per-module allocators" {
     for (ids[0..8]) |*id| id.* = try things.new(.{ .a = 0 });
     // Growing past the reserved capacity hits the allocator again.
     try std.testing.expectError(error.OutOfMemory, things.new(.{ .a = 0 }));
+}
+
+test "Per-module budgets" {
+    const pooled = struct {
+        pub const mach_module = .pooled;
+        things: Objects(.{}, struct { a: u32 }),
+    };
+    const global = struct {
+        pub const mach_module = .global;
+        things: Objects(.{}, struct { a: u32 }),
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var modules: Modules(.{ pooled, global }) = undefined;
+    try modules.initOptions(allocator, io, .{ .budgets = .{ .pooled = 1024 * 1024 } });
+    defer modules.deinit(allocator);
+
+    // The budgeted module gets a pool; the other uses the global allocator.
+    const pool = &modules.pools.pooled.?;
+    try std.testing.expect(modules.pools.global == null);
+    try std.testing.expectEqual(@as(*anyopaque, pool), modules.allocatorFor(.pooled).ptr);
+    try std.testing.expectEqual(pool.buffer.len, 1024 * 1024);
+    try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
+
+    // Objects lists allocate from the pool, and are limited by its budget.
+    _ = try modules.mods.pooled.things.new(.{ .a = 1 });
+    try std.testing.expect(pool.used > 0);
+    pool.exhausted = true; // silence the expected out-of-memory warning
+    try std.testing.expectError(error.OutOfMemory, modules.mods.pooled.things.ensureTotalCapacity(1024 * 1024));
 }

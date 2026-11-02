@@ -9,17 +9,13 @@
 //! Nothing is returned to the OS, and allocating past the budget fails with `error.OutOfMemory`
 //! instead of growing. Size the budget from `report()`'s high-water mark.
 //!
-//! Typically one block is reserved up front and split into a pool per module, which is then given
-//! to that module via `Modules.initOptions`:
+//! Usually you don't create these directly: give modules budgets via `Modules.initOptions` and
+//! Mach creates a pool per module from one block reserved up front:
 //!
 //! ```
-//! const block = try std.heap.page_allocator.alloc(u8, 48 * mib);
-//! var sprite_pool = mach.PoolAllocator.init("sprite", block[0 .. 16 * mib], io);
-//! var audio_pool = mach.PoolAllocator.init("audio", block[16 * mib ..], io);
-//! try mods.initOptions(gpa, io, .{ .allocators = .{
-//!     .mach_gfx_sprite = sprite_pool.allocator(),
-//!     .mach_audio = audio_pool.allocator(),
-//! } });
+//! try mods.initOptions(gpa, io, .{ .budgets = .{ .app = 32 * mib, .mach_audio = 128 * mib } });
+//! // ... later, e.g. on exit: log each pool's usage and high-water mark.
+//! mods.reportMemory();
 //! ```
 const PoolAllocator = @This();
 
@@ -241,6 +237,7 @@ test "small allocations reuse freed blocks of the same class" {
     try std.testing.expect(a.resize(z, 128));
     try std.testing.expect(!a.resize(z, 129));
 
+    pool.exhausted = true; // silence the expected out-of-memory warning
     try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 8192));
     a.free(z);
     a.free(y);
@@ -256,6 +253,7 @@ test "large allocations coalesce and are reused across sizes" {
 
     const x = try a.alloc(u8, 3 * mib);
     const y = try a.alloc(u8, 3 * mib);
+    pool.exhausted = true; // silence the expected out-of-memory warning
     try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 3 * mib));
 
     // Freeing two adjacent blocks yields one extent big enough for a larger allocation.
