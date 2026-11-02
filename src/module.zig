@@ -334,6 +334,19 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
             });
         }
 
+        /// Frees all memory owned by this list. Called by `Modules.deinit()`; object IDs from this
+        /// list are invalid afterwards.
+        pub fn deinit(objs: *@This()) void {
+            const allocator = objs.internal.allocator;
+            objs.internal.data.deinit(allocator);
+            objs.internal.freed.deinit(allocator);
+            objs.internal.pending_delete.deinit(allocator);
+            objs.internal.generation.deinit(allocator);
+            objs.internal.recycling_bin.deinit(allocator);
+            if (objs.internal.updated) |*updated_fields| updated_fields.deinit(allocator);
+            objs.internal.tags.deinit(allocator);
+        }
+
         /// Preallocates storage for at least `new_capacity` objects (live or freed), so that
         /// `new()` and `free()` do not allocate until that many slots are in use.
         pub fn ensureTotalCapacity(objs: *@This(), new_capacity: usize) std.mem.Allocator.Error!void {
@@ -1043,10 +1056,25 @@ pub fn Modules(module_lists: anytype) type {
             }
         }
 
+        /// Frees memory owned by the module system: every module's `mach.Objects` lists, the object
+        /// graph, and internal name tables.
+        ///
+        /// This does not run any module's `deinit` system; resources a module allocated itself must
+        /// be released by that module (typically via its own `.deinit` system) beforehand.
         pub fn deinit(m: *@This(), allocator: std.mem.Allocator) void {
+            inline for (@typeInfo(@TypeOf(m.mods)).@"struct".field_names) |field_name| {
+                const mod = &@field(m.mods, field_name);
+                const mod_info = @typeInfo(@TypeOf(mod.*)).@"struct";
+                inline for (mod_info.field_names, mod_info.field_types) |mod_field_name, mod_field_type| {
+                    if (@typeInfo(mod_field_type) == .@"struct" and @hasDecl(mod_field_type, "IsMachObjects")) {
+                        @field(mod, mod_field_name).deinit();
+                    }
+                }
+            }
             m.graph.deinit(allocator);
             m.name_ids.deinit(allocator);
-            // TODO: remainder of deinit
+            m.module_names.deinit(allocator);
+            m.object_names.deinit(allocator);
         }
 
         pub fn Module(module_tag_or_type: anytype) type {
@@ -1320,9 +1348,7 @@ test "Long field name" {
         another_field: Objects(.{}, struct {}),
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     const io = std.Options.debug_io;
     var modules = Modules(.{test_module}){
@@ -1332,7 +1358,6 @@ test "Long field name" {
     };
     try modules.init(allocator, io);
     modules.deinit(allocator);
-    aa.deinit();
 }
 
 test "Many fields, same module" {
@@ -1350,9 +1375,7 @@ test "Many fields, same module" {
         field9: Objects(.{}, struct {}),
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     const io = std.Options.debug_io;
     var modules = Modules(.{test_module}){
@@ -1362,7 +1385,6 @@ test "Many fields, same module" {
     };
     try modules.init(allocator, io);
     modules.deinit(allocator);
-    aa.deinit();
 }
 
 test "Many fields, Many modules" {
@@ -1386,9 +1408,7 @@ test "Many fields, Many modules" {
         field9: Objects(.{}, struct {}),
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     const io = std.Options.debug_io;
     var modules = Modules(.{ test_module0, test_module1, test_module2 }){
@@ -1398,7 +1418,6 @@ test "Many fields, Many modules" {
     };
     try modules.init(allocator, io);
     modules.deinit(allocator);
-    aa.deinit();
 }
 
 test "Per-module allocators" {
@@ -1421,10 +1440,7 @@ test "Per-module allocators" {
         }
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer aa.deinit();
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     var pool = std.testing.FailingAllocator.init(allocator, .{});
     const pool_allocator = pool.allocator();
