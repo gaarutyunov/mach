@@ -24,6 +24,7 @@ pub const gpu = if (build_options.want_sysgpu) @import("sysgpu/main.zig").sysgpu
 const module = @import("module.zig");
 pub const FunctionID = module.FunctionID;
 pub const Graph = @import("graph.zig").Graph;
+pub const PoolAllocator = @import("PoolAllocator.zig");
 pub const Mod = module.Mod;
 pub const ModuleID = module.ModuleID;
 pub const Modules = module.Modules;
@@ -90,6 +91,7 @@ test {
     _ = time;
     _ = @import("mpsc.zig");
     _ = @import("graph.zig");
+    _ = PoolAllocator;
 
     std.testing.refAllDecls(math);
 }
