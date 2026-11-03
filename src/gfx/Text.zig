@@ -847,6 +847,9 @@ fn updatePipelineBuffers(
         var origin_x: f32 = 0.0;
         var origin_y: f32 = 0.0;
         for (t.segments) |segment| {
+            // Nothing to draw, and the shaper crashes on empty input.
+            if (segment.text.len == 0) continue;
+
             // Load the font
             // TODO(text): allow specifying a custom font
             // TODO(text): keep fonts around for reuse later

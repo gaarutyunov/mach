@@ -4,6 +4,8 @@ pub const Atlas = @import("atlas/Atlas.zig");
 // Mach modules
 pub const Sprite = @import("Sprite.zig");
 pub const Text = @import("Text.zig");
+/// Opt-in developer overlay (frame timing, per-module memory), not part of `modules`.
+pub const DevOverlay = @import("DevOverlay.zig");
 
 /// All graphics modules
 pub const modules = .{ Sprite, Text };
@@ -25,6 +27,7 @@ test {
     std.testing.refAllDecls(Sprite);
     std.testing.refAllDecls(Atlas);
     std.testing.refAllDecls(Text);
+    std.testing.refAllDecls(DevOverlay);
     std.testing.refAllDecls(Font);
     std.testing.refAllDecls(TextRun);
     std.testing.refAllDecls(Glyph);
