@@ -26,6 +26,8 @@ pub const Context = module.Context;
 pub const FunctionID = module.FunctionID;
 pub const Graph = @import("graph.zig").Graph;
 pub const PoolAllocator = @import("PoolAllocator.zig");
+/// Tracy profiler bindings (zig-tracy). Every call is a no-op unless built with `-Dtracy`.
+pub const tracy = @import("tracy");
 pub const Mod = module.Mod;
 pub const ModuleID = module.ModuleID;
 pub const Modules = module.Modules;

@@ -414,6 +414,7 @@ pub fn renderFrame(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
 
     // Frame rate counter.
     core.frame.tick();
+    mach.tracy.frameMark();
 }
 
 pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {

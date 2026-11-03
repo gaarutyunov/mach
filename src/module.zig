@@ -4,6 +4,8 @@ const Core = @import("Core.zig");
 const StringTable = @import("StringTable.zig");
 const Graph = @import("graph.zig").Graph;
 const PoolAllocator = @import("PoolAllocator.zig");
+const tracy = @import("tracy");
+const build_options = @import("build-options");
 
 /// A handle to a spawned thread.
 pub const Thread = struct {
@@ -21,18 +23,19 @@ pub fn startThread(
     core_mod: Mod(Core),
     comptime kind: anytype,
 ) error{ThreadSpawnFailed}!Thread {
-    // TODO(thread): use kind for measured preallocations, thread naming, etc.
-    _ = kind;
+    // TODO(thread): use kind for measured preallocations, etc.
+    const run = struct {
+        fn run(c: *Core, f: FunctionID, m: Mod(Core)) void {
+            tracy.setThreadName(@tagName(kind));
+            while (c.state.load(.acquire) == .running) {
+                m.run(f);
+            }
+        }
+    }.run;
     return .{
-        .thread = std.Thread.spawn(.{}, runThread, .{ core, on_tick, core_mod }) catch
+        .thread = std.Thread.spawn(.{}, run, .{ core, on_tick, core_mod }) catch
             return error.ThreadSpawnFailed,
     };
-}
-
-fn runThread(core: *Core, on_tick: FunctionID, core_mod: Mod(Core)) void {
-    while (core.state.load(.acquire) == .running) {
-        core_mod.run(on_tick);
-    }
 }
 
 /// Initialize a graph with default preallocations for the given kind.
@@ -893,11 +896,24 @@ pub const FunctionID = struct { module_id: ModuleID, fn_id: ModuleFunctionID };
 /// ```
 /// pub fn init(app: *App, ctx: mach.Context) !void {
 ///     app.items = try std.ArrayList(Item).initCapacity(ctx.allocator, 64);
+///     ctx.info("reserved {d} items", .{app.items.capacity});
 /// }
 /// ```
+///
+/// Logging through the context uses the module name as the `std.log` scope (so it can be
+/// filtered per module with `std_options.log_scope_levels`) and prefixes the running system:
+///
+/// ```
+/// info(app): [init] reserved 64 items
+/// ```
+///
+/// When built with `-Dtracy`, every system run is a Tracy zone named `module.system`, each
+/// module's allocator is tracked as a named Tracy memory pool, and context log messages are
+/// also sent to Tracy (colored by level).
 pub const Context = struct {
     /// This module's allocator: its pool if it has a budget (`InitOptions.budgets`), its override
     /// (`InitOptions.allocators`), or else the global allocator passed to `Modules.init`.
+    /// With `-Dtracy`, wrapped in a `tracy.TracingAllocator` named after the module.
     allocator: std.mem.Allocator,
 
     io: std.Io,
@@ -908,14 +924,82 @@ pub const Context = struct {
     /// The name of the module whose system is running, e.g. "mach_gfx_sprite".
     module_name: []const u8,
 
+    /// The name of the system being run, e.g. "init". Empty for a context obtained outside of a
+    /// system via `Modules.context()`.
+    system_name: []const u8 = "",
+
     _modules: *anyopaque,
     _report_memory: *const fn (modules: *anyopaque) void,
+    _log: *const fn (level: std.log.Level, system_name: []const u8, msg: []const u8) void,
+    _log_enabled: *const fn (level: std.log.Level) bool,
 
     /// Logs usage and high-water mark of every module's memory pool.
     pub fn reportMemory(ctx: Context) void {
         ctx._report_memory(ctx._modules);
     }
+
+    /// Messages longer than this are truncated.
+    pub const max_log_len = 1024;
+
+    /// Logs a message scoped to this module and prefixed with the running system's name.
+    pub fn log(ctx: Context, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
+        if (!ctx._log_enabled(level)) return;
+        var buf: [max_log_len]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print(format, args) catch {};
+        ctx._log(level, ctx.system_name, w.buffered());
+    }
+
+    pub fn err(ctx: Context, comptime format: []const u8, args: anytype) void {
+        ctx.log(.err, format, args);
+    }
+
+    pub fn warn(ctx: Context, comptime format: []const u8, args: anytype) void {
+        ctx.log(.warn, format, args);
+    }
+
+    pub fn info(ctx: Context, comptime format: []const u8, args: anytype) void {
+        ctx.log(.info, format, args);
+    }
+
+    pub fn debug(ctx: Context, comptime format: []const u8, args: anytype) void {
+        ctx.log(.debug, format, args);
+    }
 };
+
+/// Returns the `Context._log` / `Context._log_enabled` implementations for a module, whose
+/// `mach_module` enum literal is used as the `std.log` scope.
+fn ContextLog(comptime scope: @EnumLiteral()) type {
+    return struct {
+        fn enabled(level: std.log.Level) bool {
+            // Tracy receives every message regardless of std.log filtering.
+            if (build_options.tracy) return true;
+            return switch (level) {
+                inline else => |l| std.log.logEnabled(l, scope),
+            };
+        }
+
+        fn log(level: std.log.Level, system_name: []const u8, msg: []const u8) void {
+            switch (level) {
+                inline else => |l| {
+                    if (comptime std.log.logEnabled(l, scope)) {
+                        if (system_name.len == 0) {
+                            std.options.logFn(l, scope, "{s}", .{msg});
+                        } else {
+                            std.options.logFn(l, scope, "[{s}] {s}", .{ system_name, msg });
+                        }
+                    }
+                    tracy.printColor("{s}.{s}: {s}", .{ @tagName(scope), system_name, msg }, switch (l) {
+                        .err => 0xff4040,
+                        .warn => 0xffc040,
+                        .info => 0xffffff,
+                        .debug => 0x909090,
+                    });
+                },
+            }
+        }
+    };
+}
 
 pub fn Mod(comptime M: type) type {
     return struct {
@@ -1050,6 +1134,9 @@ pub fn Modules(module_lists: anytype) type {
         /// Each module's memory pool, if it was given a budget in `InitOptions.budgets`.
         pools: ModulePools(modules) = .{},
 
+        /// With `-Dtracy`, each module's allocator wrapped to report to Tracy as a named pool.
+        tracing_allocators: ModuleTracingAllocators(modules) = undefined,
+
         /// The block reserved up front for all pools, split according to the budgets.
         pool_block: []u8 = &.{},
 
@@ -1102,10 +1189,15 @@ pub fn Modules(module_lists: anytype) type {
             };
             try m.initPools(io, options);
             inline for (@typeInfo(@TypeOf(m.allocators)).@"struct".field_names) |name| {
-                @field(m.allocators, name) = if (@field(m.pools, name)) |*pool|
+                const base = if (@field(m.pools, name)) |*pool|
                     pool.allocator()
                 else
                     @field(options.allocators, name) orelse allocator;
+                @field(m.allocators, name) = if (build_options.tracy) blk: {
+                    const tracing = &@field(m.tracing_allocators, name);
+                    tracing.* = .initNamed(std.fmt.comptimePrint("{s}", .{name}), base);
+                    break :blk tracing.allocator();
+                } else base;
             }
             try initGraph(&m.graph, allocator, io, .global);
 
@@ -1229,6 +1321,8 @@ pub fn Modules(module_lists: anytype) type {
                     comptime fn_name: ModuleFunctionName(module),
                 ) void {
                     const debug_name = @tagName(module_name) ++ "." ++ @tagName(fn_name);
+                    const zone = tracy.initZone(@src(), .{ .name = debug_name });
+                    defer zone.deinit();
                     if (!@hasField(module, @tagName(fn_name)) and !@hasDecl(module, @tagName(fn_name))) {
                         @compileError("Module ." ++ @tagName(module_name) ++ " declares mach_systems entry ." ++ @tagName(fn_name) ++ " but no pub fn or schedule with that name exists.");
                     }
@@ -1268,7 +1362,9 @@ pub fn Modules(module_lists: anytype) type {
                             continue :outer;
                         }
                         if (arg_type == Context) {
-                            @field(args, arg_name) = m.modules.context(module_name);
+                            var ctx = m.modules.context(module_name);
+                            ctx.system_name = @tagName(fn_name);
+                            @field(args, arg_name) = ctx;
                             continue :outer;
                         }
                         if (@typeInfo(arg_type) == .@"struct" and @hasDecl(arg_type, "IsMachMod")) {
@@ -1315,6 +1411,8 @@ pub fn Modules(module_lists: anytype) type {
                     .pool = if (@field(m.pools, @tagName(name))) |*pool| pool else null,
                     .module_name = @tagName(name),
                     ._modules = m,
+                    ._log = ContextLog(@field(module_types_by_name, @tagName(name)).mach_module).log,
+                    ._log_enabled = ContextLog(@field(module_types_by_name, @tagName(name)).mach_module).enabled,
                     ._report_memory = (struct {
                         fn reportMemory(modules_ptr: *anyopaque) void {
                             const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
@@ -1461,6 +1559,10 @@ fn ModulePools(comptime modules: anytype) type {
     return ModuleFieldsOf(modules, ?PoolAllocator, &@as(?PoolAllocator, null));
 }
 
+fn ModuleTracingAllocators(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, if (build_options.tracy) tracy.TracingAllocator else void, null);
+}
+
 fn ModuleFieldsOf(comptime modules: anytype, comptime T: type, comptime default: ?*const T) type {
     var field_names: []const []const u8 = &.{};
     var field_types: []const type = &.{};
@@ -1574,6 +1676,13 @@ test "Many fields, Many modules" {
     modules.deinit(allocator);
 }
 
+/// Returns the allocator a module's allocator wraps when built with `-Dtracy`.
+fn testBaseAllocator(a: std.mem.Allocator) std.mem.Allocator {
+    if (!build_options.tracy) return a;
+    const tracing: *tracy.TracingAllocator = @ptrCast(@alignCast(a.ptr));
+    return tracing.parent_allocator;
+}
+
 test "Per-module allocators" {
     const pooled = struct {
         pub const mach_module = .pooled;
@@ -1605,16 +1714,16 @@ test "Per-module allocators" {
     defer modules.deinit(allocator);
 
     // Overrides are resolved, and Objects lists use their module's allocator.
-    try std.testing.expectEqual(pool_allocator.ptr, modules.allocatorFor(.pooled).ptr);
-    try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
-    try std.testing.expectEqual(pool_allocator.ptr, modules.mods.pooled.things.internal.allocator.ptr);
-    try std.testing.expectEqual(allocator.ptr, modules.mods.global.things.internal.allocator.ptr);
+    try std.testing.expectEqual(pool_allocator.ptr, testBaseAllocator(modules.allocatorFor(.pooled)).ptr);
+    try std.testing.expectEqual(allocator.ptr, testBaseAllocator(modules.allocatorFor(.global)).ptr);
+    try std.testing.expectEqual(pool_allocator.ptr, testBaseAllocator(modules.mods.pooled.things.internal.allocator).ptr);
+    try std.testing.expectEqual(allocator.ptr, testBaseAllocator(modules.mods.global.things.internal.allocator).ptr);
 
     // Systems receive their module's allocator.
     modules.get(.pooled).run(.init);
     modules.get(.global).run(.init);
-    try std.testing.expectEqual(pool_allocator.ptr, modules.mods.pooled.seen.ptr);
-    try std.testing.expectEqual(allocator.ptr, modules.mods.global.seen.ptr);
+    try std.testing.expectEqual(pool_allocator.ptr, testBaseAllocator(modules.mods.pooled.seen).ptr);
+    try std.testing.expectEqual(allocator.ptr, testBaseAllocator(modules.mods.global.seen).ptr);
 
     // After preallocating, new() and free() do not allocate until capacity is exceeded.
     const things = &modules.mods.pooled.things;
@@ -1628,6 +1737,34 @@ test "Per-module allocators" {
     for (ids[0..8]) |*id| id.* = try things.new(.{ .a = 0 });
     // Growing past the reserved capacity hits the allocator again.
     try std.testing.expectError(error.OutOfMemory, things.new(.{ .a = 0 }));
+}
+
+test "Context logging" {
+    const logger = struct {
+        pub const mach_module = .logger;
+        pub const mach_systems = .{.init};
+        system_name: []const u8,
+        pub fn init(m: *@This(), ctx: Context) void {
+            m.system_name = ctx.system_name;
+            ctx.info("hello {d}", .{42});
+            const long: [Context.max_log_len + 16]u8 = @splat('x');
+            ctx.debug("{s}", .{&long}); // truncated, not an error
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var modules: Modules(.{logger}) = undefined;
+    try modules.init(allocator, io);
+    defer modules.deinit(allocator);
+
+    modules.get(.logger).run(.init);
+    try std.testing.expectEqualStrings("init", modules.mods.logger.system_name);
+
+    const ctx = modules.context(.logger);
+    try std.testing.expectEqualStrings("logger", ctx.module_name);
+    try std.testing.expectEqualStrings("", ctx.system_name);
+    ctx.info("outside a system", .{});
 }
 
 test "Per-module budgets" {
@@ -1649,9 +1786,9 @@ test "Per-module budgets" {
     // The budgeted module gets a pool; the other uses the global allocator.
     const pool = &modules.pools.pooled.?;
     try std.testing.expect(modules.pools.global == null);
-    try std.testing.expectEqual(@as(*anyopaque, pool), modules.allocatorFor(.pooled).ptr);
+    try std.testing.expectEqual(@as(*anyopaque, pool), testBaseAllocator(modules.allocatorFor(.pooled)).ptr);
     try std.testing.expectEqual(pool.buffer.len, 1024 * 1024);
-    try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
+    try std.testing.expectEqual(allocator.ptr, testBaseAllocator(modules.allocatorFor(.global)).ptr);
 
     // Systems' context exposes the module's pool.
     const ctx = modules.context(.pooled);

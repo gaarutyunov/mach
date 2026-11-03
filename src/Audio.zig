@@ -174,7 +174,7 @@ pub fn init(audio: *Audio, audio_mod: mach.Mod(Audio), context: mach.Context) !v
     // TODO(audio): enable selecting non-default devices
     const device = ctx.defaultDevice(.playback) orelse return error.NoDeviceFound;
     var player = try ctx.createPlayer(device, writeFn, .{ .user_data = audio, .sample_rate = 48000 });
-    log.info("opened audio device: channels={} sample_rate={} format={s}", .{ player.channels().len, player.sampleRate(), @tagName(player.format()) });
+    context.info("opened audio device: channels={} sample_rate={} format={s}", .{ player.channels().len, player.sampleRate(), @tagName(player.format()) });
 
     // TODO(env): upgrade to https://codeberg.org/ziglang/zig/pulls/30644 by properly passing
     // env around

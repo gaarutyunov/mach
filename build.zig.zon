@@ -46,6 +46,12 @@
             .hash = "N-V-__8AAFJgJABLNrdmvVVv7_dxFGpR1QHnHYYudPC31bNS",
             .lazy = true,
         },
+        .zig_tracy = .{
+            // TODO: mirror to pkg.hexops.org
+            .url = "git+https://github.com/gaarutyunov/zig-tracy#d989d78835f467fe62664aa1f8cd6140a1bab778",
+            .hash = "zig_tracy-0.0.4-5-cp3Fd3AADyAaiC04PZC5JuTYy57l96HQ1nlv0VW88b",
+            .lazy = true,
+        },
         .vulkan_zig = .{
             // TODO: mirror to pkg.hexops.org
             .url = "git+https://github.com/Snektron/vulkan-zig#91a3537868952be63763db2b0725bcf9cf7f0d93",
