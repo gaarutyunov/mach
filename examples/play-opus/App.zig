@@ -61,10 +61,9 @@ pub fn init(
     audio: *mach.Audio,
     app: *App,
     app_mod: mach.Mod(App),
+    ctx: mach.Context,
 ) !void {
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
-
+    const allocator = ctx.allocator;
     core.on_exit = app_mod.id.deinit;
 
     const window = try core.windows.new(.{
@@ -112,10 +111,8 @@ pub fn init(
     std.debug.print("[arrow down] decrease volume 10%\n", .{});
 }
 
-pub fn deinitApp(app: *App) void {
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
-
+pub fn deinitApp(app: *App, ctx: mach.Context) void {
+    const allocator = ctx.allocator;
     app.app_thread.join();
     allocator.free(app.sfx.samples);
 }

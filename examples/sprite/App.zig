@@ -60,7 +60,9 @@ pub fn init(
     app_mod: mach.Mod(App),
     core_mod: mach.Mod(mach.Core),
     io: std.Io,
+    ctx: mach.Context,
 ) !void {
+    const allocator = ctx.allocator;
     // You should use mach.Timer in general, but here we call std.Io.Timestamp.now() to show that
     // you can always get an 'io' parameter in any module function - it's automatically injected
     // for you.
@@ -73,9 +75,6 @@ pub fn init(
         .title = "gfx.Sprite",
         .on_render = app_mod.id.render,
     });
-
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
 
     app.* = .{
         .allocator = allocator,

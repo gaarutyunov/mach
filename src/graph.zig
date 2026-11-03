@@ -232,6 +232,7 @@ pub const Graph = struct {
             allocator.destroy(list);
         }
         graph.result_lists.available.deinit(allocator);
+        graph.pending_delete_pools.deinit(allocator);
         graph.id_to_node.map.deinit(allocator);
         graph.nodes.deinit(allocator);
         graph.queue.deinit(allocator);

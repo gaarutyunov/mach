@@ -204,10 +204,8 @@ cp_transforms: std.ArrayList(gpu.Mat4x4) = .empty,
 cp_uv_transforms: std.ArrayList(gpu.Mat4x4) = .empty,
 cp_sizes: std.ArrayList(gpu.Vec2) = .empty,
 
-pub fn init(sprite: *Sprite) !void {
-    // TODO(allocator): find a better way to get an allocator here
-    const allocator = std.heap.c_allocator;
-
+pub fn init(sprite: *Sprite, ctx: mach.Context) !void {
+    const allocator = ctx.allocator;
     sprite.* = .{
         .allocator = allocator,
         .objects = sprite.objects,

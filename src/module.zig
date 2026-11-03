@@ -3,6 +3,7 @@ const mach = @import("main.zig");
 const Core = @import("Core.zig");
 const StringTable = @import("StringTable.zig");
 const Graph = @import("graph.zig").Graph;
+const PoolAllocator = @import("PoolAllocator.zig");
 
 /// A handle to a spawned thread.
 pub const Thread = struct {
@@ -332,6 +333,35 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
                 .generation = 0,
                 .index = @intCast(index),
             });
+        }
+
+        /// Frees all memory owned by this list. Called by `Modules.deinit()`; object IDs from this
+        /// list are invalid afterwards.
+        pub fn deinit(objs: *@This()) void {
+            const allocator = objs.internal.allocator;
+            objs.internal.data.deinit(allocator);
+            objs.internal.freed.deinit(allocator);
+            objs.internal.pending_delete.deinit(allocator);
+            objs.internal.generation.deinit(allocator);
+            objs.internal.recycling_bin.deinit(allocator);
+            if (objs.internal.updated) |*updated_fields| updated_fields.deinit(allocator);
+            objs.internal.tags.deinit(allocator);
+        }
+
+        /// Preallocates storage for at least `new_capacity` objects (live or freed), so that
+        /// `new()` and `free()` do not allocate until that many slots are in use.
+        pub fn ensureTotalCapacity(objs: *@This(), new_capacity: usize) std.mem.Allocator.Error!void {
+            const allocator = objs.internal.allocator;
+            const data = &objs.internal.data;
+
+            try data.ensureTotalCapacity(allocator, new_capacity);
+            try objs.internal.freed.resize(allocator, data.capacity, false);
+            try objs.internal.pending_delete.resize(allocator, data.capacity, false);
+            try objs.internal.generation.ensureTotalCapacity(allocator, data.capacity);
+            try objs.internal.recycling_bin.ensureTotalCapacity(allocator, data.capacity);
+            if (objs.internal.updated) |*updated_fields| {
+                try updated_fields.resize(allocator, data.capacity * @typeInfo(T).@"struct".field_names.len, true);
+            }
         }
 
         /// Sets all fields of the given object to the given value.
@@ -858,6 +888,35 @@ pub const ModuleFunctionID = u16;
 /// Unique identifier for a function within a module, including those only known at runtime.
 pub const FunctionID = struct { module_id: ModuleID, fn_id: ModuleFunctionID };
 
+/// Per-module context given to systems which declare a `mach.Context` parameter:
+///
+/// ```
+/// pub fn init(app: *App, ctx: mach.Context) !void {
+///     app.items = try std.ArrayList(Item).initCapacity(ctx.allocator, 64);
+/// }
+/// ```
+pub const Context = struct {
+    /// This module's allocator: its pool if it has a budget (`InitOptions.budgets`), its override
+    /// (`InitOptions.allocators`), or else the global allocator passed to `Modules.init`.
+    allocator: std.mem.Allocator,
+
+    io: std.Io,
+
+    /// This module's memory pool, if it was given a budget in `InitOptions.budgets`.
+    pool: ?*PoolAllocator,
+
+    /// The name of the module whose system is running, e.g. "mach_gfx_sprite".
+    module_name: []const u8,
+
+    _modules: *anyopaque,
+    _report_memory: *const fn (modules: *anyopaque) void,
+
+    /// Logs usage and high-water mark of every module's memory pool.
+    pub fn reportMemory(ctx: Context) void {
+        ctx._report_memory(ctx._modules);
+    }
+};
+
 pub fn Mod(comptime M: type) type {
     return struct {
         pub const IsMachMod = void;
@@ -981,6 +1040,19 @@ pub fn Modules(module_lists: anytype) type {
         mods: ModulesByName(modules),
         io: std.Io,
 
+        /// The global allocator passed to `init()`. Used by the object graph, and by every module
+        /// which has no allocator override in `InitOptions.allocators`.
+        allocator: std.mem.Allocator = undefined,
+
+        /// The resolved allocator for each module, by module name. Use `allocatorFor()`.
+        allocators: ModuleAllocators(modules) = undefined,
+
+        /// Each module's memory pool, if it was given a budget in `InitOptions.budgets`.
+        pools: ModulePools(modules) = .{},
+
+        /// The block reserved up front for all pools, split according to the budgets.
+        pool_block: []u8 = &.{},
+
         module_names: StringTable = .{},
         object_names: StringTable = .{},
         name_ids: std.MultiArrayList(struct {
@@ -989,12 +1061,52 @@ pub fn Modules(module_lists: anytype) type {
         }) = .{},
         graph: Graph,
 
+        pub const InitOptions = struct {
+            /// Per-module allocator overrides, by module name, e.g.:
+            ///
+            /// ```
+            /// .allocators = .{ .mach_gfx_sprite = sprite_pool.allocator() },
+            /// ```
+            ///
+            /// A module's allocator backs its `mach.Objects` lists and is `ctx.allocator` in the
+            /// `mach.Context` its systems receive. Modules left `null` use the global allocator
+            /// passed to `init()`.
+            allocators: ModuleAllocatorOptions(modules) = .{},
+
+            /// Per-module memory budgets in bytes, by module name, e.g.:
+            ///
+            /// ```
+            /// .budgets = .{ .app = 32 * mib, .mach_audio = 128 * mib },
+            /// ```
+            ///
+            /// One block covering all budgets is reserved up front from the OS (pages are only
+            /// committed as they are first used, so unused budget costs address space, not RAM).
+            /// Each listed module gets its own `mach.PoolAllocator` over its slice of the block,
+            /// and allocating past the budget fails with `error.OutOfMemory`. Use
+            /// `reportMemory()` to log usage and high-water marks for sizing budgets.
+            ///
+            /// A module can't have both a budget and an allocator override.
+            budgets: ModuleBudgets(modules) = .{},
+        };
+
         pub fn init(m: *@This(), allocator: std.mem.Allocator, io: std.Io) (std.mem.Allocator.Error || std.Thread.SpawnError)!void {
+            return m.initOptions(allocator, io, .{});
+        }
+
+        pub fn initOptions(m: *@This(), allocator: std.mem.Allocator, io: std.Io, options: InitOptions) (std.mem.Allocator.Error || std.Thread.SpawnError)!void {
             m.* = .{
                 .mods = undefined,
                 .graph = undefined,
                 .io = io,
+                .allocator = allocator,
             };
+            try m.initPools(io, options);
+            inline for (@typeInfo(@TypeOf(m.allocators)).@"struct".field_names) |name| {
+                @field(m.allocators, name) = if (@field(m.pools, name)) |*pool|
+                    pool.allocator()
+                else
+                    @field(options.allocators, name) orelse allocator;
+            }
             try initGraph(&m.graph, allocator, io, .global);
 
             // TODO(object): errdefer release allocations made in this loop
@@ -1016,7 +1128,7 @@ pub fn Modules(module_lists: anytype) type {
                         });
 
                         @field(mod, mod_field_name).internal = .{
-                            .allocator = allocator,
+                            .allocator = @field(m.allocators, field_name),
                             .io = io,
                             .type_id = @intCast(object_type_id),
                             .graph = &m.graph,
@@ -1036,10 +1148,57 @@ pub fn Modules(module_lists: anytype) type {
             }
         }
 
+        fn initPools(m: *@This(), io: std.Io, options: InitOptions) std.mem.Allocator.Error!void {
+            const names = @typeInfo(@TypeOf(m.pools)).@"struct".field_names;
+            var total: usize = 0;
+            inline for (names) |name| {
+                if (@field(options.budgets, name)) |budget| {
+                    if (@field(options.allocators, name) != null) {
+                        @panic("mach: module ." ++ name ++ " has both a budget and an allocator override");
+                    }
+                    total += budget;
+                }
+            }
+            if (total == 0) return;
+
+            m.pool_block = try std.heap.page_allocator.alloc(u8, total);
+            var offset: usize = 0;
+            inline for (names) |name| {
+                if (@field(options.budgets, name)) |budget| {
+                    @field(m.pools, name) = PoolAllocator.init(name, m.pool_block[offset..][0..budget], io);
+                    offset += budget;
+                }
+            }
+        }
+
+        /// Logs usage and high-water mark of every module's memory pool (see
+        /// `InitOptions.budgets`).
+        pub fn reportMemory(m: *@This()) void {
+            inline for (@typeInfo(@TypeOf(m.pools)).@"struct".field_names) |name| {
+                if (@field(m.pools, name)) |*pool| pool.report();
+            }
+        }
+
+        /// Frees memory owned by the module system: every module's `mach.Objects` lists, the object
+        /// graph, internal name tables, and memory pools.
+        ///
+        /// This does not run any module's `deinit` system; resources a module allocated itself must
+        /// be released by that module (typically via its own `.deinit` system) beforehand.
         pub fn deinit(m: *@This(), allocator: std.mem.Allocator) void {
+            inline for (@typeInfo(@TypeOf(m.mods)).@"struct".field_names) |field_name| {
+                const mod = &@field(m.mods, field_name);
+                const mod_info = @typeInfo(@TypeOf(mod.*)).@"struct";
+                inline for (mod_info.field_names, mod_info.field_types) |mod_field_name, mod_field_type| {
+                    if (@typeInfo(mod_field_type) == .@"struct" and @hasDecl(mod_field_type, "IsMachObjects")) {
+                        @field(mod, mod_field_name).deinit();
+                    }
+                }
+            }
             m.graph.deinit(allocator);
             m.name_ids.deinit(allocator);
-            // TODO: remainder of deinit
+            m.module_names.deinit(allocator);
+            m.object_names.deinit(allocator);
+            if (m.pool_block.len > 0) std.heap.page_allocator.free(m.pool_block);
         }
 
         pub fn Module(module_tag_or_type: anytype) type {
@@ -1108,6 +1267,10 @@ pub fn Modules(module_lists: anytype) type {
                             @field(args, arg_name) = m.modules.io;
                             continue :outer;
                         }
+                        if (arg_type == Context) {
+                            @field(args, arg_name) = m.modules.context(module_name);
+                            continue :outer;
+                        }
                         if (@typeInfo(arg_type) == .@"struct" and @hasDecl(arg_type, "IsMachMod")) {
                             const M = arg_type.Module;
                             var mv: Mod(M) = .{
@@ -1141,6 +1304,30 @@ pub fn Modules(module_lists: anytype) type {
 
         pub fn get(m: *@This(), module_tag_or_type: anytype) Module(module_tag_or_type) {
             return .{ .mods = &m.mods, .modules = m };
+        }
+
+        /// Returns the `mach.Context` for the given module, as given to its systems.
+        pub fn context(m: *@This(), module_name: ModuleName) Context {
+            switch (module_name) {
+                inline else => |name| return .{
+                    .allocator = @field(m.allocators, @tagName(name)),
+                    .io = m.io,
+                    .pool = if (@field(m.pools, @tagName(name))) |*pool| pool else null,
+                    .module_name = @tagName(name),
+                    ._modules = m,
+                    ._report_memory = (struct {
+                        fn reportMemory(modules_ptr: *anyopaque) void {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            m2.reportMemory();
+                        }
+                    }).reportMemory,
+                },
+            }
+        }
+
+        /// Returns the allocator for the given module (its override, or the global allocator).
+        pub fn allocatorFor(m: *@This(), module_tag_or_type: anytype) std.mem.Allocator {
+            return @field(m.allocators, @tagName(Module(module_tag_or_type).mod_name));
         }
 
         pub fn callDynamic(m: *@This(), f: FunctionID) void {
@@ -1250,6 +1437,46 @@ fn ModuleTypesByName(comptime modules: anytype) type {
     return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
 }
 
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?std.mem.Allocator = null`
+/// field per module name.
+fn ModuleAllocatorOptions(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?std.mem.Allocator, &@as(?std.mem.Allocator, null));
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `std.mem.Allocator` field per
+/// module name.
+fn ModuleAllocators(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, std.mem.Allocator, null);
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?usize = null` field per module
+/// name.
+fn ModuleBudgets(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?usize, &@as(?usize, null));
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?PoolAllocator = null` field per
+/// module name.
+fn ModulePools(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?PoolAllocator, &@as(?PoolAllocator, null));
+}
+
+fn ModuleFieldsOf(comptime modules: anytype, comptime T: type, comptime default: ?*const T) type {
+    var field_names: []const []const u8 = &.{};
+    var field_types: []const type = &.{};
+    var field_attrs: []const std.builtin.Type.Struct.FieldAttributes = &.{};
+    for (modules) |M| {
+        field_names = field_names ++ [_][]const u8{@tagName(M.mach_module)};
+        field_types = field_types ++ [_]type{T};
+        field_attrs = field_attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{.{
+            .default_value_ptr = if (default) |d| @ptrCast(d) else null,
+            .@"comptime" = false,
+            .@"align" = null,
+        }};
+    }
+    return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
+}
+
 /// Given .{Foo, Bar, Baz} Mach modules, returns .{.foo: Foo = undefined, .bar: Bar = undefined, .baz: Baz = undefined}
 /// with field names corresponding to each module's `pub const mach_module = .foo;` name, and each Foo type.
 fn ModulesByName(comptime modules: anytype) type {
@@ -1275,9 +1502,7 @@ test "Long field name" {
         another_field: Objects(.{}, struct {}),
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     const io = std.Options.debug_io;
     var modules = Modules(.{test_module}){
@@ -1287,7 +1512,6 @@ test "Long field name" {
     };
     try modules.init(allocator, io);
     modules.deinit(allocator);
-    aa.deinit();
 }
 
 test "Many fields, same module" {
@@ -1305,9 +1529,7 @@ test "Many fields, same module" {
         field9: Objects(.{}, struct {}),
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     const io = std.Options.debug_io;
     var modules = Modules(.{test_module}){
@@ -1317,7 +1539,6 @@ test "Many fields, same module" {
     };
     try modules.init(allocator, io);
     modules.deinit(allocator);
-    aa.deinit();
 }
 
 test "Many fields, Many modules" {
@@ -1341,9 +1562,7 @@ test "Many fields, Many modules" {
         field9: Objects(.{}, struct {}),
     };
 
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = aa.allocator();
+    const allocator = std.testing.allocator;
 
     const io = std.Options.debug_io;
     var modules = Modules(.{ test_module0, test_module1, test_module2 }){
@@ -1353,7 +1572,98 @@ test "Many fields, Many modules" {
     };
     try modules.init(allocator, io);
     modules.deinit(allocator);
-    aa.deinit();
+}
+
+test "Per-module allocators" {
+    const pooled = struct {
+        pub const mach_module = .pooled;
+        pub const mach_systems = .{.init};
+        things: Objects(.{}, struct { a: u32 }),
+        seen: std.mem.Allocator,
+        pub fn init(m: *@This(), ctx: Context) void {
+            m.seen = ctx.allocator;
+        }
+    };
+    const global = struct {
+        pub const mach_module = .global;
+        pub const mach_systems = .{.init};
+        things: Objects(.{}, struct { a: u32 }),
+        seen: std.mem.Allocator,
+        pub fn init(m: *@This(), ctx: Context) void {
+            m.seen = ctx.allocator;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var pool = std.testing.FailingAllocator.init(allocator, .{});
+    const pool_allocator = pool.allocator();
+
+    const io = std.Options.debug_io;
+    var modules: Modules(.{ pooled, global }) = undefined;
+    try modules.initOptions(allocator, io, .{ .allocators = .{ .pooled = pool_allocator } });
+    defer modules.deinit(allocator);
+
+    // Overrides are resolved, and Objects lists use their module's allocator.
+    try std.testing.expectEqual(pool_allocator.ptr, modules.allocatorFor(.pooled).ptr);
+    try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
+    try std.testing.expectEqual(pool_allocator.ptr, modules.mods.pooled.things.internal.allocator.ptr);
+    try std.testing.expectEqual(allocator.ptr, modules.mods.global.things.internal.allocator.ptr);
+
+    // Systems receive their module's allocator.
+    modules.get(.pooled).run(.init);
+    modules.get(.global).run(.init);
+    try std.testing.expectEqual(pool_allocator.ptr, modules.mods.pooled.seen.ptr);
+    try std.testing.expectEqual(allocator.ptr, modules.mods.global.seen.ptr);
+
+    // After preallocating, new() and free() do not allocate until capacity is exceeded.
+    const things = &modules.mods.pooled.things;
+    try things.ensureTotalCapacity(16);
+    pool.fail_index = pool.alloc_index;
+    const capacity = things.internal.data.capacity;
+    try std.testing.expect(capacity >= 16);
+    var ids: [64]ObjectID = undefined;
+    for (ids[0..capacity], 0..) |*id, i| id.* = try things.new(.{ .a = @intCast(i) });
+    for (ids[0..8]) |id| things.free(id);
+    for (ids[0..8]) |*id| id.* = try things.new(.{ .a = 0 });
+    // Growing past the reserved capacity hits the allocator again.
+    try std.testing.expectError(error.OutOfMemory, things.new(.{ .a = 0 }));
+}
+
+test "Per-module budgets" {
+    const pooled = struct {
+        pub const mach_module = .pooled;
+        things: Objects(.{}, struct { a: u32 }),
+    };
+    const global = struct {
+        pub const mach_module = .global;
+        things: Objects(.{}, struct { a: u32 }),
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var modules: Modules(.{ pooled, global }) = undefined;
+    try modules.initOptions(allocator, io, .{ .budgets = .{ .pooled = 1024 * 1024 } });
+    defer modules.deinit(allocator);
+
+    // The budgeted module gets a pool; the other uses the global allocator.
+    const pool = &modules.pools.pooled.?;
+    try std.testing.expect(modules.pools.global == null);
+    try std.testing.expectEqual(@as(*anyopaque, pool), modules.allocatorFor(.pooled).ptr);
+    try std.testing.expectEqual(pool.buffer.len, 1024 * 1024);
+    try std.testing.expectEqual(allocator.ptr, modules.allocatorFor(.global).ptr);
+
+    // Systems' context exposes the module's pool.
+    const ctx = modules.context(.pooled);
+    try std.testing.expectEqual(pool, ctx.pool.?);
+    try std.testing.expectEqualStrings("pooled", ctx.module_name);
+    try std.testing.expect(modules.context(.global).pool == null);
+
+    // Objects lists allocate from the pool, and are limited by its budget.
+    _ = try modules.mods.pooled.things.new(.{ .a = 1 });
+    try std.testing.expect(pool.used > 0);
+    pool.exhausted = true; // silence the expected out-of-memory warning
+    try std.testing.expectError(error.OutOfMemory, modules.mods.pooled.things.ensureTotalCapacity(1024 * 1024));
 }
 
 test "Objects.sliceField" {
