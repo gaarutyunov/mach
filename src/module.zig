@@ -930,12 +930,19 @@ pub const Context = struct {
 
     _modules: *anyopaque,
     _report_memory: *const fn (modules: *anyopaque) void,
+    _memory_stats: *const fn (modules: *anyopaque, out: []ModuleMemory) []ModuleMemory,
     _log: *const fn (level: std.log.Level, system_name: []const u8, msg: []const u8) void,
     _log_enabled: *const fn (level: std.log.Level) bool,
 
     /// Logs usage and high-water mark of every module's memory pool.
     pub fn reportMemory(ctx: Context) void {
         ctx._report_memory(ctx._modules);
+    }
+
+    /// Fills `out` with a memory snapshot of every module (up to `out.len` of them) and returns
+    /// the filled part. Cheap enough to call every frame, e.g. for an on-screen dev overlay.
+    pub fn memoryStats(ctx: Context, out: []ModuleMemory) []ModuleMemory {
+        return ctx._memory_stats(ctx._modules, out);
     }
 
     /// Messages longer than this are truncated.
@@ -966,6 +973,23 @@ pub const Context = struct {
         ctx.log(.debug, format, args);
     }
 };
+
+/// A module's memory usage, see `Context.memoryStats`.
+pub const ModuleMemory = struct {
+    /// The module's name, e.g. "mach_gfx_sprite".
+    name: []const u8,
+    /// Usage of the module's pool, or null if it has no budget (`InitOptions.budgets`) and so
+    /// allocates from an override or the global allocator.
+    pool: ?PoolAllocator.Stats,
+};
+
+/// Name of the Tracy plot of a module's pool usage. A type, so the name has one address: Tracy
+/// identifies plots by pointer.
+fn MemoryPlot(comptime module_name: []const u8) type {
+    return struct {
+        const name: [:0]const u8 = std.fmt.comptimePrint("mem {s}", .{module_name});
+    };
+}
 
 /// Returns the `Context._log` / `Context._log_enabled` implementations for a module, whose
 /// `mach_module` enum literal is used as the `std.log` scope.
@@ -1259,6 +1283,7 @@ pub fn Modules(module_lists: anytype) type {
                 if (@field(options.budgets, name)) |budget| {
                     @field(m.pools, name) = PoolAllocator.init(name, m.pool_block[offset..][0..budget], io);
                     offset += budget;
+                    tracy.plotConfig(MemoryPlot(name).name, .{ .plot_type = .Memory, .step = 1, .fill = 1, .color = 0 });
                 }
             }
         }
@@ -1268,6 +1293,29 @@ pub fn Modules(module_lists: anytype) type {
         pub fn reportMemory(m: *@This()) void {
             inline for (@typeInfo(@TypeOf(m.pools)).@"struct".field_names) |name| {
                 if (@field(m.pools, name)) |*pool| pool.report();
+            }
+        }
+
+        /// Fills `out` with a memory snapshot of every module (up to `out.len` of them) and
+        /// returns the filled part.
+        pub fn memoryStats(m: *@This(), out: []ModuleMemory) []ModuleMemory {
+            var n: usize = 0;
+            inline for (@typeInfo(@TypeOf(m.pools)).@"struct".field_names) |name| {
+                if (n == out.len) return out;
+                out[n] = .{
+                    .name = name,
+                    .pool = if (@field(m.pools, name)) |*pool| pool.stats() else null,
+                };
+                n += 1;
+            }
+            return out[0..n];
+        }
+
+        /// With `-Dtracy`, plots the module's pool usage (called after each of its systems runs).
+        fn plotMemory(m: *@This(), comptime name: []const u8) void {
+            if (!build_options.tracy) return;
+            if (@field(m.pools, name)) |*pool| {
+                tracy.plot(i64, MemoryPlot(name).name, @intCast(pool.stats().used));
             }
         }
 
@@ -1323,6 +1371,7 @@ pub fn Modules(module_lists: anytype) type {
                     const debug_name = @tagName(module_name) ++ "." ++ @tagName(fn_name);
                     const zone = tracy.initZone(@src(), .{ .name = debug_name });
                     defer zone.deinit();
+                    defer m.modules.plotMemory(@tagName(module_name));
                     if (!@hasField(module, @tagName(fn_name)) and !@hasDecl(module, @tagName(fn_name))) {
                         @compileError("Module ." ++ @tagName(module_name) ++ " declares mach_systems entry ." ++ @tagName(fn_name) ++ " but no pub fn or schedule with that name exists.");
                     }
@@ -1419,6 +1468,12 @@ pub fn Modules(module_lists: anytype) type {
                             m2.reportMemory();
                         }
                     }).reportMemory,
+                    ._memory_stats = (struct {
+                        fn memoryStats(modules_ptr: *anyopaque, out: []ModuleMemory) []ModuleMemory {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            return m2.memoryStats(out);
+                        }
+                    }).memoryStats,
                 },
             }
         }
@@ -1801,6 +1856,21 @@ test "Per-module budgets" {
     try std.testing.expect(pool.used > 0);
     pool.exhausted = true; // silence the expected out-of-memory warning
     try std.testing.expectError(error.OutOfMemory, modules.mods.pooled.things.ensureTotalCapacity(1024 * 1024));
+
+    // memoryStats reports every module, with pool stats for budgeted ones.
+    var buf: [4]ModuleMemory = undefined;
+    const stats = ctx.memoryStats(&buf);
+    try std.testing.expectEqual(2, stats.len);
+    try std.testing.expectEqualStrings("pooled", stats[0].name);
+    const ps = stats[0].pool.?;
+    try std.testing.expectEqual(pool.used, ps.used);
+    try std.testing.expectEqual(1024 * 1024, ps.budget);
+    try std.testing.expect(ps.num_allocs > 0);
+    try std.testing.expectEqual(1, ps.num_failed);
+    try std.testing.expect(ps.touched >= ps.used);
+    try std.testing.expectEqualStrings("global", stats[1].name);
+    try std.testing.expect(stats[1].pool == null);
+    try std.testing.expectEqual(1, ctx.memoryStats(buf[0..1]).len);
 }
 
 test "Objects.sliceField" {

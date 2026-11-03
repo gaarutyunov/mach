@@ -23,6 +23,7 @@ pub const gpu = if (build_options.want_sysgpu) @import("sysgpu/main.zig").sysgpu
 
 const module = @import("module.zig");
 pub const Context = module.Context;
+pub const ModuleMemory = module.ModuleMemory;
 pub const FunctionID = module.FunctionID;
 pub const Graph = @import("graph.zig").Graph;
 pub const PoolAllocator = @import("PoolAllocator.zig");

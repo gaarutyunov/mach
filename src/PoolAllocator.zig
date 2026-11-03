@@ -43,6 +43,11 @@ num_free_extents: usize = 0,
 used: usize = 0,
 /// Peak value of `used`.
 high_water: usize = 0,
+/// Number of successful allocations and frees so far.
+num_allocs: u64 = 0,
+num_frees: u64 = 0,
+/// Number of allocations that failed for lack of space.
+num_failed: u64 = 0,
 /// Set once the first allocation fails, so we only log it once.
 exhausted: bool = false,
 
@@ -67,6 +72,37 @@ pub fn allocator(pool: *PoolAllocator) Allocator {
         .remap = remap,
         .free = free,
     } };
+}
+
+/// A snapshot of a pool's usage, see `stats()`.
+pub const Stats = struct {
+    /// Bytes currently allocated (including rounding).
+    used: usize,
+    /// Peak value of `used`.
+    high_water: usize,
+    /// Size of the pool.
+    budget: usize,
+    /// Bytes of the pool ever handed out (and so possibly committed by the OS), including blocks
+    /// since freed and alignment padding. `used` can't exceed this; budget beyond it is unused.
+    touched: usize,
+    num_allocs: u64,
+    num_frees: u64,
+    num_failed: u64,
+};
+
+/// Returns a snapshot of the pool's usage.
+pub fn stats(pool: *PoolAllocator) Stats {
+    pool.mutex.lockUncancelable(pool.io);
+    defer pool.mutex.unlock(pool.io);
+    return .{
+        .used = pool.used,
+        .high_water = pool.high_water,
+        .budget = pool.buffer.len,
+        .touched = pool.bottom + (pool.buffer.len - pool.top),
+        .num_allocs = pool.num_allocs,
+        .num_frees = pool.num_frees,
+        .num_failed = pool.num_failed,
+    };
 }
 
 /// Logs current usage, high-water mark and budget.
@@ -94,16 +130,19 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     const pool: *PoolAllocator = @ptrCast(@alignCast(ctx));
     // Blocks are aligned to min(size, large_granularity).
     if (alignment.toByteUnits() > large_granularity) return null;
-    if (len > pool.buffer.len) return pool.outOfMemory(len);
-    const size = blockSize(len, alignment);
 
     pool.mutex.lockUncancelable(pool.io);
     defer pool.mutex.unlock(pool.io);
+
+    // Checked before blockSize, which would overflow rounding up a huge len.
+    if (len > pool.buffer.len) return pool.outOfMemory(len);
+    const size = blockSize(len, alignment);
 
     const offset = (if (size <= large_granularity) pool.allocSmall(size) else pool.allocLarge(size)) orelse
         return pool.outOfMemory(size);
     pool.used += size;
     pool.high_water = @max(pool.high_water, pool.used);
+    pool.num_allocs += 1;
     return pool.buffer.ptr + offset;
 }
 
@@ -140,6 +179,7 @@ fn allocLarge(pool: *PoolAllocator, size: usize) ?usize {
 }
 
 fn outOfMemory(pool: *PoolAllocator, size: usize) ?[*]u8 {
+    pool.num_failed += 1;
     if (!pool.exhausted) {
         pool.exhausted = true;
         log.warn("{s}: out of memory allocating {Bi:.1} (used {Bi:.1} of {Bi:.1} budget)", .{
@@ -170,6 +210,7 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
     defer pool.mutex.unlock(pool.io);
 
     pool.used -= size;
+    pool.num_frees += 1;
     if (size <= large_granularity) {
         const index = classIndex(size);
         const node: *FreeNode = @ptrCast(@alignCast(memory.ptr));
