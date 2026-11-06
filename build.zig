@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
     const sysgpu_backend = b.option(SysgpuBackend, "sysgpu_backend", "sysgpu API backend") orelse .default;
+    const tracy_enable = b.option(bool, "tracy", "Enable Tracy profiling (system zones, per-module memory, logs)") orelse false;
+    const metrics_enable = b.option(bool, "metrics", "Calculate metrics (mach.dvx.metrics), shown by the dev overlay") orelse false;
 
     const build_examples = b.option(bool, "examples", "build/install examples specifically");
     const build_libs = b.option(bool, "libs", "build/install libraries specifically");
@@ -68,6 +70,8 @@ pub fn build(b: *std.Build) !void {
     build_options.addOption(bool, "want_sysaudio", want_sysaudio);
     build_options.addOption(bool, "want_sysgpu", want_sysgpu);
     build_options.addOption(SysgpuBackend, "sysgpu_backend", sysgpu_backend);
+    build_options.addOption(bool, "tracy", tracy_enable);
+    build_options.addOption(bool, "metrics", metrics_enable);
 
     var examples = [_]Example{
         .{ .name = "core-custom-entrypoint", .deps = &.{} },
@@ -111,6 +115,12 @@ pub fn build(b: *std.Build) !void {
         .target = target,
     });
     module.addImport("build-options", build_options.createModule());
+    // Always imported: with tracy disabled every call compiles to a no-op and nothing is linked.
+    if (b.lazyDependency("zig_tracy", .{
+        .target = target,
+        .optimize = optimize,
+        .tracy_enable = tracy_enable,
+    })) |dep| module.addImport("tracy", dep.module("tracy"));
 
     if (want_mach) {
         if (target.result.cpu.arch != .wasm32) {

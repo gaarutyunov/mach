@@ -196,6 +196,17 @@ pub fn Pool(comptime Node: type) type {
             }
         }
 
+        /// Returns every node to the free list without freeing any memory. Nodes still acquired
+        /// must no longer be used. Concurrent calls to acquire() or release() are not safe.
+        pub fn releaseAll(pool: *@This()) void {
+            pool.head = null;
+            for (pool.cleanup.items) |chunk| {
+                for (chunk[0 .. pool.chunk_size - 1], chunk[1..pool.chunk_size]) |*node, *next| node.next = next;
+                chunk[pool.chunk_size - 1].next = pool.head;
+                pool.head = &chunk[0];
+            }
+        }
+
         /// Deinit all memory held by the pool
         pub fn deinit(pool: *@This(), allocator: std.mem.Allocator) void {
             for (pool.cleanup.items) |chunk| {
@@ -490,6 +501,26 @@ test "Pool.copyFrom" {
     try dst.copyFrom(&src, allocator);
 
     try std.testing.expectEqual(src.stats().nodes, dst.stats().nodes);
+}
+
+test "Pool.releaseAll" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    var pool = try Pool(Queue(u32).Node).init(allocator, io, 4);
+    defer pool.deinit(allocator);
+
+    // Acquire enough to allocate a second chunk.
+    for (0..6) |_| _ = try pool.acquire(allocator);
+    try std.testing.expectEqual(2, pool.stats().chunks);
+
+    pool.releaseAll();
+    try std.testing.expectEqual(8, pool.stats().nodes);
+
+    // Everything can be acquired again without allocating.
+    for (0..8) |_| _ = try pool.acquire(allocator);
+    try std.testing.expectEqual(0, pool.stats().nodes);
+    try std.testing.expectEqual(2, pool.stats().chunks);
 }
 
 test "Queue.copyFrom" {

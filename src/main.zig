@@ -12,6 +12,7 @@ pub const is_debug = builtin.mode == .debug;
 pub const Core = if (build_options.want_core) @import("Core.zig") else struct {};
 
 pub const gfx = if (build_options.want_mach) @import("gfx/main.zig") else struct {};
+pub const dvx = if (build_options.want_mach) @import("dvx/main.zig") else struct {};
 pub const Audio = if (build_options.want_sysaudio) @import("Audio.zig") else struct {};
 pub const math = @import("math/main.zig");
 pub const testing = @import("testing.zig");
@@ -23,9 +24,14 @@ pub const gpu = if (build_options.want_sysgpu) @import("sysgpu/main.zig").sysgpu
 
 const module = @import("module.zig");
 pub const Context = module.Context;
+pub const ModuleMemory = module.ModuleMemory;
 pub const FunctionID = module.FunctionID;
 pub const Graph = @import("graph.zig").Graph;
 pub const PoolAllocator = @import("PoolAllocator.zig");
+/// Tracy profiler bindings (zig-tracy). Every call is a no-op unless built with `-Dtracy`.
+pub const tracy = @import("tracy");
+/// Whether Mach was built with `-Dtracy`.
+pub const tracy_enabled = build_options.tracy;
 pub const Mod = module.Mod;
 pub const ModuleID = module.ModuleID;
 pub const Modules = module.Modules;
@@ -86,6 +92,7 @@ test {
     _ = sysaudio;
     _ = sysgpu;
     _ = gfx;
+    _ = dvx;
     _ = Audio;
     _ = math;
     _ = testing;

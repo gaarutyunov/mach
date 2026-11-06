@@ -4,6 +4,7 @@ const assets = @import("assets");
 const mach = @import("mach");
 const gpu = mach.gpu;
 const gfx = mach.gfx;
+const dvx = mach.dvx;
 const math = mach.math;
 
 const vec2 = math.vec2;
@@ -19,6 +20,7 @@ pub const Modules = mach.Modules(.{
     mach.Core,
     mach.gfx.Sprite,
     mach.gfx.Text,
+    mach.dvx.DevOverlay,
     mach.Audio,
     App,
 });
@@ -43,6 +45,7 @@ pub const main = mach.schedule(.{
     .{ mach.Audio, .init },
     .{ gfx.Text, .init },
     .{ gfx.Sprite, .init },
+    .{ dvx.DevOverlay, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
@@ -84,6 +87,7 @@ window_meta: mach.Objects(.{}, struct {
 pub fn init(
     core: *mach.Core,
     audio: *mach.Audio,
+    overlay: *dvx.DevOverlay,
     app: *App,
     app_mod: mach.Mod(App),
     core_mod: mach.Mod(mach.Core),
@@ -111,6 +115,9 @@ pub fn init(
         .spawn_timer = mach.time.Timer.start(io),
         .rand = std.Random.DefaultPrng.init(1337),
     };
+
+    // Ctrl+Alt+Shift+D shows the dev overlay on the main window.
+    overlay.attach(window);
 
     // Tag the main window with its metadata
     const main_window_meta = try app.window_meta.new(.{ .window_id = window, .window_num = 1 });
@@ -199,9 +206,11 @@ pub const tick = mach.schedule(.{
     .{ mach.Audio, .cleanup },
     .{ gfx.Sprite, .cleanup },
     .{ gfx.Text, .cleanup },
+    .{ dvx.DevOverlay, .update },
     .{ mach.Core, .snapshotStart },
     .{ gfx.Sprite, .snapshot },
     .{ gfx.Text, .snapshot },
+    .{ dvx.DevOverlay, .snapshot },
     .{ mach.Core, .snapshotEnd },
 });
 
@@ -212,11 +221,13 @@ pub fn appTick(
     sprite: *gfx.Sprite,
     text: *gfx.Text,
     audio: *mach.Audio,
+    overlay: *dvx.DevOverlay,
 ) !void {
     var iter = core.events(.default);
     while (iter.next()) |event| {
         switch (event) {
             .key_press => |ev| {
+                if (overlay.handleKey(ev)) continue;
                 switch (ev.key) {
                     .space => {
                         // Space bar pressed: make sprites go faster
@@ -455,6 +466,7 @@ pub fn render(
     sprite_mod: mach.Mod(gfx.Sprite),
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
+    overlay: *dvx.DevOverlay,
 ) !void {
     if (!app.has_setup_shared) {
         try setupShared(core, app, sprite, text);
@@ -510,10 +522,22 @@ pub fn render(
     text_mod.call(.render);
 
     render_pass.end();
+    render_pass.release();
+
+    // Null out this window's pipelines (the pass is gone), then draw the dev overlay on top.
+    if (core.windows.getTag(core.window, App, .window_meta)) |window_meta_id| {
+        if (app.window_meta.get(window_meta_id, .sprite_pipeline_id)) |sprite_pipeline_id| {
+            sprite.pipelines.set(sprite_pipeline_id, .render_pass, null);
+        }
+        if (app.window_meta.get(window_meta_id, .text_pipeline_id)) |text_pipeline_id| {
+            text.pipelines.set(text_pipeline_id, .render_pass, null);
+        }
+    }
+    overlay.render(core, encoder, back_buffer_view, sprite, sprite_mod, text, text_mod);
+
     var command = encoder.finish(&.{ .label = label });
     window.queue.submit(&[_]*gpu.CommandBuffer{command});
     command.release();
-    render_pass.release();
 }
 
 // TODO(sprite): don't require users to copy / write this helper themselves
