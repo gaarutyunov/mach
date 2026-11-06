@@ -40,8 +40,12 @@ top: usize,
 free_extents: [max_free_extents]Extent = undefined,
 num_free_extents: usize = 0,
 
-/// Usage of the pool, readable from any thread without taking `mutex`.
-metrics: Metrics,
+/// Usage of the pool, counted in rounded block sizes so that it compares to the budget. Readable
+/// from any thread without taking `mutex`.
+metrics: dvx_metrics.AllocatorMetrics = .{},
+/// Bytes of the pool ever handed out (and so possibly committed by the OS), including blocks since
+/// freed and alignment padding. `metrics.used_bytes` can't exceed this; budget beyond it is unused.
+touched_bytes: dvx_metrics.Gauge = .{},
 /// Set once the first allocation fails, so we only log it once.
 exhausted: bool = false,
 
@@ -61,7 +65,6 @@ pub fn init(name: []const u8, buffer: []u8, io: std.Io) PoolAllocator {
         .buffer = buffer,
         .io = io,
         .top = buffer.len,
-        .metrics = .{ .budget_bytes = .init(@intCast(buffer.len)) },
     };
 }
 
@@ -74,28 +77,9 @@ pub fn allocator(pool: *PoolAllocator) Allocator {
     } };
 }
 
-/// A pool's usage, see `mach.dvx.metrics`.
-pub const Metrics = struct {
-    /// Bytes currently allocated (including rounding).
-    used_bytes: dvx_metrics.Gauge = .{},
-    /// Peak value of `used_bytes`.
-    peak_bytes: dvx_metrics.Gauge = .{},
-    /// Size of the pool.
-    budget_bytes: dvx_metrics.Gauge,
-    /// Bytes of the pool ever handed out (and so possibly committed by the OS), including blocks
-    /// since freed and alignment padding. `used_bytes` can't exceed this; budget beyond it is
-    /// unused.
-    touched_bytes: dvx_metrics.Gauge = .{},
-    /// Number of successful allocations and frees so far.
-    allocs_total: dvx_metrics.Counter = .{},
-    frees_total: dvx_metrics.Counter = .{},
-    /// Number of allocations that failed for lack of space.
-    failed_allocs_total: dvx_metrics.Counter = .{},
-};
-
-/// Updates `metrics.touched_bytes` after `bottom` or `top` may have moved.
+/// Updates `touched_bytes` after `bottom` or `top` may have moved.
 fn updateTouched(pool: *PoolAllocator) void {
-    pool.metrics.touched_bytes.set(@intCast(pool.bottom + (pool.buffer.len - pool.top)));
+    pool.touched_bytes.set(@intCast(pool.bottom + (pool.buffer.len - pool.top)));
 }
 
 /// Logs current usage, high-water mark and budget. Usage needs `-Dmetrics`.

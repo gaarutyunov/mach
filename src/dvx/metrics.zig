@@ -190,23 +190,25 @@ pub fn Histogram(comptime bounds: []const u64) type {
     };
 }
 
+/// What an allocator has done. Bytes are as the allocator accounts for them: requested sizes for a
+/// `MeteredAllocator`, rounded block sizes for a `PoolAllocator`.
+pub const AllocatorMetrics = struct {
+    /// Bytes currently allocated.
+    used_bytes: Gauge = .{},
+    /// Peak value of `used_bytes`.
+    peak_bytes: Gauge = .{},
+    /// Number of successful allocations and frees so far.
+    allocs_total: Counter = .{},
+    frees_total: Counter = .{},
+    /// Number of allocations that failed.
+    failed_allocs_total: Counter = .{},
+};
+
 /// Wraps an allocator, recording what goes through it. Only allocations made through the wrapper
 /// are counted. Must not be moved once `allocator()` has been called.
 pub const MeteredAllocator = struct {
     parent: std.mem.Allocator,
-    metrics: Metrics = .{},
-
-    pub const Metrics = struct {
-        /// Bytes currently allocated, as requested by callers.
-        used_bytes: Gauge = .{},
-        /// Peak value of `used_bytes`.
-        peak_bytes: Gauge = .{},
-        /// Number of successful allocations and frees so far.
-        allocs_total: Counter = .{},
-        frees_total: Counter = .{},
-        /// Number of allocations the parent allocator failed.
-        failed_allocs_total: Counter = .{},
-    };
+    metrics: AllocatorMetrics = .{},
 
     pub const vtable: std.mem.Allocator.VTable = .{
         .alloc = alloc,

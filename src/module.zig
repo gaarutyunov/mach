@@ -976,17 +976,19 @@ pub const Context = struct {
     }
 };
 
-/// A module's memory usage, see `Context.memoryStats`. All zero or null without `-Dmetrics`.
+/// A module's memory usage, see `Context.memoryStats`. Usage reads as zero without `-Dmetrics`.
 pub const ModuleMemory = struct {
     /// The module's name, e.g. "mach_gfx_sprite".
     name: []const u8,
-    /// Usage of the module's pool, or null if it has no budget (`InitOptions.budgets`).
-    pool: ?*const PoolAllocator.Metrics,
-    /// What the module allocated from its override or the global allocator, or null if it has a
-    /// budget or metrics are disabled. Allocations made by others from the same allocator aren't
-    /// included.
-    metered: ?*const MeteredAllocator.Metrics,
+    /// What the module allocated: from its pool, or from its override or the global allocator.
+    /// In the latter case, allocations made by others from the same allocator aren't included.
+    usage: *const dvx_metrics.AllocatorMetrics,
+    /// The module's pool, or null if it has no budget (`InitOptions.budgets`).
+    pool: ?*const PoolAllocator,
 };
+
+/// The usage of a module that isn't metered, because metrics are disabled.
+const no_usage: dvx_metrics.AllocatorMetrics = .{};
 
 /// Name of the Tracy plot of a module's pool usage. A type, so the name has one address: Tracy
 /// identifies plots by pointer.
@@ -1315,8 +1317,13 @@ pub fn Modules(module_lists: anytype) type {
                 if (n == out.len) return out;
                 out[n] = .{
                     .name = name,
-                    .pool = if (@field(m.pools, name)) |*pool| &pool.metrics else null,
-                    .metered = if (@field(m.metered_allocators, name)) |*metered| &metered.metrics else null,
+                    .usage = if (@field(m.pools, name)) |*pool|
+                        &pool.metrics
+                    else if (@field(m.metered_allocators, name)) |*metered|
+                        &metered.metrics
+                    else
+                        &no_usage,
+                    .pool = if (@field(m.pools, name)) |*pool| pool else null,
                 };
                 n += 1;
             }
@@ -1885,27 +1892,24 @@ test "Per-module budgets" {
     const stats = ctx.memoryStats(&buf);
     try std.testing.expectEqual(2, stats.len);
     try std.testing.expectEqualStrings("pooled", stats[0].name);
-    const ps = stats[0].pool.?;
-    try std.testing.expectEqual(&pool.metrics, ps);
+    try std.testing.expectEqual(@as(?*const PoolAllocator, pool), stats[0].pool);
+    try std.testing.expectEqual(&pool.metrics, stats[0].usage);
     if (dvx_metrics.enabled) {
-        try std.testing.expectEqual(1024 * 1024, ps.budget_bytes.load());
-        try std.testing.expect(ps.allocs_total.load() > 0);
-        try std.testing.expectEqual(1, ps.failed_allocs_total.load());
-        try std.testing.expect(ps.touched_bytes.load() >= ps.used_bytes.load());
+        const usage = stats[0].usage;
+        try std.testing.expect(usage.allocs_total.load() > 0);
+        try std.testing.expectEqual(1, usage.failed_allocs_total.load());
+        try std.testing.expect(pool.touched_bytes.load() >= usage.used_bytes.load());
     }
-    try std.testing.expect(stats[0].metered == null);
     try std.testing.expectEqualStrings("global", stats[1].name);
     try std.testing.expect(stats[1].pool == null);
 
     // Modules without a budget are metered instead.
     if (dvx_metrics.enabled) {
-        const metered = stats[1].metered.?;
-        const used_before = metered.used_bytes.load();
+        const usage = stats[1].usage;
+        const used_before = usage.used_bytes.load();
         _ = try modules.mods.global.things.new(.{ .a = 1 });
-        try std.testing.expect(metered.used_bytes.load() > used_before);
-        try std.testing.expect(metered.allocs_total.load() > 0);
-    } else {
-        try std.testing.expect(stats[1].metered == null);
+        try std.testing.expect(usage.used_bytes.load() > used_before);
+        try std.testing.expect(usage.allocs_total.load() > 0);
     }
     try std.testing.expectEqual(1, ctx.memoryStats(buf[0..1]).len);
 }

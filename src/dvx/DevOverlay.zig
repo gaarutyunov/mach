@@ -177,7 +177,8 @@ pub fn update(
     overlay.addLine(overlay.style_dim, "memory: used / peak / budget, touched, allocs/s -> suggested budget", .{});
     var stats_buf: [max_modules]mach.ModuleMemory = undefined;
     for (ctx.memoryStats(&stats_buf), 0..) |m, i| {
-        const allocs = if (m.pool) |pool| pool.allocs_total.load() else m.metered.?.allocs_total.load();
+        const usage = m.usage;
+        const allocs = usage.allocs_total.load();
         const allocs_per_sec: f64 = if (overlay.rates_valid and elapsed > 0)
             @as(f64, @floatFromInt(allocs -% overlay.prev_allocs[i])) / elapsed
         else
@@ -185,25 +186,24 @@ pub fn update(
         overlay.prev_allocs[i] = allocs;
 
         const pool = m.pool orelse {
-            const metered = m.metered.?;
             overlay.addLine(overlay.style_normal, "{s}: {Bi:.1} / {Bi:.1} / no budget, {d:.0}/s", .{
                 m.name,
-                metered.used_bytes.loadUsize(),
-                metered.peak_bytes.loadUsize(),
+                usage.used_bytes.loadUsize(),
+                usage.peak_bytes.loadUsize(),
                 allocs_per_sec,
             });
             continue;
         };
 
         // Warn when the peak gets close to the budget, or allocations have failed.
-        const budget = pool.budget_bytes.loadUsize();
-        const peak = pool.peak_bytes.loadUsize();
-        const failed = pool.failed_allocs_total.load();
+        const budget = pool.buffer.len;
+        const peak = usage.peak_bytes.loadUsize();
+        const failed = usage.failed_allocs_total.load();
         const peak_pct = if (budget == 0) 0 else peak * 100 / budget;
         const style = if (failed > 0 or peak_pct >= 90) overlay.style_warn else overlay.style_normal;
         overlay.addLine(style, "{s}: {Bi:.1} / {Bi:.1} / {Bi:.1} ({d}%), {Bi:.1}, {d:.0}/s -> {Bi:.0}{s}", .{
             m.name,
-            pool.used_bytes.loadUsize(),
+            usage.used_bytes.loadUsize(),
             peak,
             budget,
             peak_pct,
