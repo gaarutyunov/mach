@@ -22,6 +22,7 @@ const PoolAllocator = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
+const dvx_metrics = @import("dvx/metrics.zig");
 
 name: []const u8,
 buffer: []u8,
@@ -39,15 +40,8 @@ top: usize,
 free_extents: [max_free_extents]Extent = undefined,
 num_free_extents: usize = 0,
 
-/// Bytes currently allocated (including rounding).
-used: usize = 0,
-/// Peak value of `used`.
-high_water: usize = 0,
-/// Number of successful allocations and frees so far.
-num_allocs: u64 = 0,
-num_frees: u64 = 0,
-/// Number of allocations that failed for lack of space.
-num_failed: u64 = 0,
+/// Usage of the pool, readable from any thread without taking `mutex`.
+metrics: Metrics,
 /// Set once the first allocation fails, so we only log it once.
 exhausted: bool = false,
 
@@ -62,7 +56,13 @@ const Extent = struct { offset: usize, len: usize };
 const log = std.log.scoped(.mach_pool_allocator);
 
 pub fn init(name: []const u8, buffer: []u8, io: std.Io) PoolAllocator {
-    return .{ .name = name, .buffer = buffer, .io = io, .top = buffer.len };
+    return .{
+        .name = name,
+        .buffer = buffer,
+        .io = io,
+        .top = buffer.len,
+        .metrics = .{ .budget_bytes = .init(@intCast(buffer.len)) },
+    };
 }
 
 pub fn allocator(pool: *PoolAllocator) Allocator {
@@ -74,43 +74,34 @@ pub fn allocator(pool: *PoolAllocator) Allocator {
     } };
 }
 
-/// A snapshot of a pool's usage, see `stats()`.
-pub const Stats = struct {
+/// A pool's usage, see `mach.dvx.metrics`.
+pub const Metrics = struct {
     /// Bytes currently allocated (including rounding).
-    used: usize,
-    /// Peak value of `used`.
-    high_water: usize,
+    used_bytes: dvx_metrics.Gauge = .{},
+    /// Peak value of `used_bytes`.
+    peak_bytes: dvx_metrics.Gauge = .{},
     /// Size of the pool.
-    budget: usize,
+    budget_bytes: dvx_metrics.Gauge,
     /// Bytes of the pool ever handed out (and so possibly committed by the OS), including blocks
-    /// since freed and alignment padding. `used` can't exceed this; budget beyond it is unused.
-    touched: usize,
-    num_allocs: u64,
-    num_frees: u64,
-    num_failed: u64,
+    /// since freed and alignment padding. `used_bytes` can't exceed this; budget beyond it is
+    /// unused.
+    touched_bytes: dvx_metrics.Gauge = .{},
+    /// Number of successful allocations and frees so far.
+    allocs_total: dvx_metrics.Counter = .{},
+    frees_total: dvx_metrics.Counter = .{},
+    /// Number of allocations that failed for lack of space.
+    failed_allocs_total: dvx_metrics.Counter = .{},
 };
 
-/// Returns a snapshot of the pool's usage.
-pub fn stats(pool: *PoolAllocator) Stats {
-    pool.mutex.lockUncancelable(pool.io);
-    defer pool.mutex.unlock(pool.io);
-    return .{
-        .used = pool.used,
-        .high_water = pool.high_water,
-        .budget = pool.buffer.len,
-        .touched = pool.bottom + (pool.buffer.len - pool.top),
-        .num_allocs = pool.num_allocs,
-        .num_frees = pool.num_frees,
-        .num_failed = pool.num_failed,
-    };
+/// Updates `metrics.touched_bytes` after `bottom` or `top` may have moved.
+fn updateTouched(pool: *PoolAllocator) void {
+    pool.metrics.touched_bytes.set(@intCast(pool.bottom + (pool.buffer.len - pool.top)));
 }
 
 /// Logs current usage, high-water mark and budget.
 pub fn report(pool: *PoolAllocator) void {
-    pool.mutex.lockUncancelable(pool.io);
-    defer pool.mutex.unlock(pool.io);
     log.info("{s}: used {Bi:.1}, high-water {Bi:.1} of {Bi:.1} budget", .{
-        pool.name, pool.used, pool.high_water, pool.buffer.len,
+        pool.name, pool.metrics.used_bytes.loadUsize(), pool.metrics.peak_bytes.loadUsize(), pool.buffer.len,
     });
 }
 
@@ -140,9 +131,10 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
 
     const offset = (if (size <= large_granularity) pool.allocSmall(size) else pool.allocLarge(size)) orelse
         return pool.outOfMemory(size);
-    pool.used += size;
-    pool.high_water = @max(pool.high_water, pool.used);
-    pool.num_allocs += 1;
+    pool.metrics.used_bytes.add(@intCast(size));
+    pool.metrics.peak_bytes.setMax(pool.metrics.used_bytes.load());
+    pool.metrics.allocs_total.inc();
+    pool.updateTouched();
     return pool.buffer.ptr + offset;
 }
 
@@ -179,11 +171,11 @@ fn allocLarge(pool: *PoolAllocator, size: usize) ?usize {
 }
 
 fn outOfMemory(pool: *PoolAllocator, size: usize) ?[*]u8 {
-    pool.num_failed += 1;
+    pool.metrics.failed_allocs_total.inc();
     if (!pool.exhausted) {
         pool.exhausted = true;
         log.warn("{s}: out of memory allocating {Bi:.1} (used {Bi:.1} of {Bi:.1} budget)", .{
-            pool.name, size, pool.used, pool.buffer.len,
+            pool.name, size, pool.metrics.used_bytes.loadUsize(), pool.buffer.len,
         });
     }
     return null;
@@ -209,8 +201,8 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
     pool.mutex.lockUncancelable(pool.io);
     defer pool.mutex.unlock(pool.io);
 
-    pool.used -= size;
-    pool.num_frees += 1;
+    pool.metrics.used_bytes.sub(@intCast(size));
+    pool.metrics.frees_total.inc();
     if (size <= large_granularity) {
         const index = classIndex(size);
         const node: *FreeNode = @ptrCast(@alignCast(memory.ptr));
@@ -218,6 +210,7 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
         pool.free_lists[index] = node;
     } else {
         pool.freeLarge(.{ .offset = offset, .len = size });
+        pool.updateTouched();
     }
 }
 
@@ -267,12 +260,12 @@ test "small allocations reuse freed blocks of the same class" {
 
     const x = try a.alloc(u8, 100); // 128-byte class
     const y = try a.alloc(u64, 3); // 32-byte class
-    try std.testing.expectEqual(@as(usize, 160), pool.used);
+    try std.testing.expectEqual(@as(usize, 160), pool.metrics.used_bytes.loadUsize());
 
     a.free(x);
     const z = try a.alloc(u8, 120); // same class, reuses x's block
     try std.testing.expectEqual(x.ptr, z.ptr);
-    try std.testing.expectEqual(@as(usize, 160), pool.high_water);
+    try std.testing.expectEqual(@as(usize, 160), pool.metrics.peak_bytes.loadUsize());
 
     // Growing within the size class happens in place.
     try std.testing.expect(a.resize(z, 128));
@@ -282,7 +275,7 @@ test "small allocations reuse freed blocks of the same class" {
     try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 8192));
     a.free(z);
     a.free(y);
-    try std.testing.expectEqual(@as(usize, 0), pool.used);
+    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
 }
 
 test "large allocations coalesce and are reused across sizes" {
@@ -300,12 +293,12 @@ test "large allocations coalesce and are reused across sizes" {
     // Freeing two adjacent blocks yields one extent big enough for a larger allocation.
     a.free(x);
     a.free(y);
-    try std.testing.expectEqual(@as(usize, 0), pool.used);
+    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
     const z = try a.alloc(u8, 6 * mib);
     const small = try a.alloc(u8, 100);
     a.free(small);
     a.free(z);
-    try std.testing.expectEqual(@as(usize, 0), pool.used);
+    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
     try std.testing.expectEqual(@as(usize, 0), pool.num_free_extents);
 
     // Out-of-order frees in the middle coalesce too.
@@ -317,7 +310,7 @@ test "large allocations coalesce and are reused across sizes" {
     a.free(r); // r is lowest (top of region), so q+r return to the region
     try std.testing.expectEqual(@as(usize, 0), pool.num_free_extents);
     a.free(p);
-    try std.testing.expectEqual(@as(usize, 0), pool.used);
+    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
 }
 
 test "std.heap.testAllocator conformance" {

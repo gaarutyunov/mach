@@ -75,9 +75,10 @@ gpu_ready: std.atomic.Value(bool) = .init(false),
 
 refresh_timer: time.Timer,
 refresh_now: bool = true,
-/// Whether `prev_allocs` holds counts from the previous refresh, so allocation rates are valid.
+/// Whether the `prev_` fields hold values from the previous refresh, so windows and rates are valid.
 rates_valid: bool = false,
 prev_allocs: [max_modules]u64 = @splat(0),
+prev_frame_time: mach.Core.FrameTimeHistogram.Snapshot = .{},
 
 /// A line of app-specific info, see `setAppInfo`.
 app_info_buf: [max_line_len]u8 = undefined,
@@ -147,10 +148,13 @@ pub fn update(
     overlay.addLine(overlay.style_dim, "dev overlay (ctrl+alt+shift+d)   tracy: {s}", .{
         if (!mach.tracy_enabled) "off (build with -Dtracy)" else if (mach.tracy.isConnected()) "connected" else "waiting for profiler",
     });
-    const fps = core.frame.rate;
-    overlay.addLine(overlay.style_normal, "frame {d} fps ({d:.2} ms)   input {d} hz", .{
-        fps,
-        if (fps == 0) 0 else 1000.0 / @as(f32, @floatFromInt(fps)),
+    const frame_time = core.metrics.frame_time_ns.snapshot();
+    const frames = if (overlay.rates_valid) frame_time.since(overlay.prev_frame_time) else frame_time;
+    overlay.prev_frame_time = frame_time;
+    overlay.addLine(overlay.style_normal, "frame {d:.0} fps   p50 <={d:.1} ms   p99 <={d:.1} ms   input {d} hz", .{
+        if (frames.sum == 0) 0 else @as(f64, @floatFromInt(frames.count())) * time.ns_per_s / @as(f64, @floatFromInt(frames.sum)),
+        nsToMs(frames.quantile(0.5) orelse 0),
+        nsToMs(frames.quantile(0.99) orelse 0),
         core.input.rate,
     });
     overlay.addLine(overlay.style_normal, "objects: {d} sprites, {d} texts", .{
@@ -167,25 +171,29 @@ pub fn update(
             overlay.addLine(overlay.style_dim, "{s}: global allocator (no budget)", .{m.name});
             continue;
         };
+        const allocs = pool.allocs_total.load();
         const allocs_per_sec: f64 = if (overlay.rates_valid and elapsed > 0)
-            @as(f64, @floatFromInt(pool.num_allocs -% overlay.prev_allocs[i])) / elapsed
+            @as(f64, @floatFromInt(allocs -% overlay.prev_allocs[i])) / elapsed
         else
             0;
-        overlay.prev_allocs[i] = pool.num_allocs;
+        overlay.prev_allocs[i] = allocs;
 
         // Warn when the peak gets close to the budget, or allocations have failed.
-        const peak_pct = if (pool.budget == 0) 0 else pool.high_water * 100 / pool.budget;
-        const style = if (pool.num_failed > 0 or peak_pct >= 90) overlay.style_warn else overlay.style_normal;
+        const budget = pool.budget_bytes.loadUsize();
+        const peak = pool.peak_bytes.loadUsize();
+        const failed = pool.failed_allocs_total.load();
+        const peak_pct = if (budget == 0) 0 else peak * 100 / budget;
+        const style = if (failed > 0 or peak_pct >= 90) overlay.style_warn else overlay.style_normal;
         overlay.addLine(style, "{s}: {Bi:.1} / {Bi:.1} / {Bi:.1} ({d}%), {Bi:.1}, {d:.0}/s -> {Bi:.0}{s}", .{
             m.name,
-            pool.used,
-            pool.high_water,
-            pool.budget,
+            pool.used_bytes.loadUsize(),
+            peak,
+            budget,
             peak_pct,
-            pool.touched,
+            pool.touched_bytes.loadUsize(),
             allocs_per_sec,
-            suggestedBudget(pool.high_water),
-            if (pool.num_failed > 0) "  OUT OF MEMORY" else "",
+            suggestedBudget(peak),
+            if (failed > 0) "  OUT OF MEMORY" else "",
         });
     }
     overlay.rates_valid = true;
@@ -347,6 +355,10 @@ fn applyLines(overlay: *DevOverlay, core: *mach.Core, sprite: *gfx.Sprite, text:
     sprite.objects.set(overlay.bg_sprite_id, .transform, Mat4x4.translate(vec3(margin, -margin - panel.y(), 0)));
     // The text origin is the first line's baseline.
     text.objects.set(overlay.text_id, .transform, Mat4x4.translate(vec3(margin + padding, -margin - padding - font_size * 0.8, 0)));
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
 }
 
 /// Peak usage plus 25% headroom, rounded up to a whole MiB.

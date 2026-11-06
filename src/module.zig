@@ -940,7 +940,7 @@ pub const Context = struct {
     }
 
     /// Fills `out` with a memory snapshot of every module (up to `out.len` of them) and returns
-    /// the filled part. Cheap enough to call every frame, e.g. for an on-screen dev overlay.
+    /// the filled part. Lock-free, so it can be called from any thread, e.g. every frame.
     pub fn memoryStats(ctx: Context, out: []ModuleMemory) []ModuleMemory {
         return ctx._memory_stats(ctx._modules, out);
     }
@@ -980,7 +980,7 @@ pub const ModuleMemory = struct {
     name: []const u8,
     /// Usage of the module's pool, or null if it has no budget (`InitOptions.budgets`) and so
     /// allocates from an override or the global allocator.
-    pool: ?PoolAllocator.Stats,
+    pool: ?*const PoolAllocator.Metrics,
 };
 
 /// Name of the Tracy plot of a module's pool usage. A type, so the name has one address: Tracy
@@ -1304,7 +1304,7 @@ pub fn Modules(module_lists: anytype) type {
                 if (n == out.len) return out;
                 out[n] = .{
                     .name = name,
-                    .pool = if (@field(m.pools, name)) |*pool| pool.stats() else null,
+                    .pool = if (@field(m.pools, name)) |*pool| &pool.metrics else null,
                 };
                 n += 1;
             }
@@ -1315,7 +1315,7 @@ pub fn Modules(module_lists: anytype) type {
         fn plotMemory(m: *@This(), comptime name: []const u8) void {
             if (!build_options.tracy) return;
             if (@field(m.pools, name)) |*pool| {
-                tracy.plot(i64, MemoryPlot(name).name, @intCast(pool.stats().used));
+                tracy.plot(i64, MemoryPlot(name).name, pool.metrics.used_bytes.load());
             }
         }
 
@@ -1853,21 +1853,21 @@ test "Per-module budgets" {
 
     // Objects lists allocate from the pool, and are limited by its budget.
     _ = try modules.mods.pooled.things.new(.{ .a = 1 });
-    try std.testing.expect(pool.used > 0);
+    try std.testing.expect(pool.metrics.used_bytes.load() > 0);
     pool.exhausted = true; // silence the expected out-of-memory warning
     try std.testing.expectError(error.OutOfMemory, modules.mods.pooled.things.ensureTotalCapacity(1024 * 1024));
 
-    // memoryStats reports every module, with pool stats for budgeted ones.
+    // memoryStats reports every module, with pool metrics for budgeted ones.
     var buf: [4]ModuleMemory = undefined;
     const stats = ctx.memoryStats(&buf);
     try std.testing.expectEqual(2, stats.len);
     try std.testing.expectEqualStrings("pooled", stats[0].name);
     const ps = stats[0].pool.?;
-    try std.testing.expectEqual(pool.used, ps.used);
-    try std.testing.expectEqual(1024 * 1024, ps.budget);
-    try std.testing.expect(ps.num_allocs > 0);
-    try std.testing.expectEqual(1, ps.num_failed);
-    try std.testing.expect(ps.touched >= ps.used);
+    try std.testing.expectEqual(&pool.metrics, ps);
+    try std.testing.expectEqual(1024 * 1024, ps.budget_bytes.load());
+    try std.testing.expect(ps.allocs_total.load() > 0);
+    try std.testing.expectEqual(1, ps.failed_allocs_total.load());
+    try std.testing.expect(ps.touched_bytes.load() >= ps.used_bytes.load());
     try std.testing.expectEqualStrings("global", stats[1].name);
     try std.testing.expect(stats[1].pool == null);
     try std.testing.expectEqual(1, ctx.memoryStats(buf[0..1]).len);

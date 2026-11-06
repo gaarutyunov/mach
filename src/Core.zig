@@ -46,6 +46,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const mach = @import("main.zig");
+const dvx_metrics = @import("dvx/metrics.zig");
 const gpu = mach.gpu;
 const log = std.log.scoped(.mach);
 
@@ -204,6 +205,11 @@ state: std.atomic.Value(State) = .init(.running),
 frame: mach.time.Frequency,
 input: mach.time.Frequency,
 
+/// Engine metrics, readable from any thread.
+metrics: Metrics = .{},
+/// Measures `metrics.frame_time_ns`, used only on the render thread.
+frame_timer: mach.time.Timer = undefined,
+
 /// Mutex protecting the render snapshot itself (e.g. render_graph or snapshotted objects.)
 /// The app thread holds this between snapshotStart and snapshotEnd, and the render thread
 /// holds this during the whole render to prevent the app thread from getting ahead duplicate
@@ -226,6 +232,17 @@ iter_events: std.ArrayList(Event) = .empty,
 input_state: InputState,
 oom: std.atomic.Value(bool) = .init(false),
 render_graph: mach.Graph,
+
+const ms: u64 = 1_000_000;
+
+/// Time between presented frames in nanoseconds.
+pub const FrameTimeHistogram = dvx_metrics.Histogram(&.{
+    1 * ms, 2 * ms, 4 * ms, 7 * ms, 9 * ms, 12 * ms, 17 * ms, 21 * ms, 26 * ms, 34 * ms, 50 * ms, 100 * ms, 250 * ms,
+});
+
+pub const Metrics = struct {
+    frame_time_ns: FrameTimeHistogram = .{},
+};
 
 pub const State = enum(u8) {
     running,
@@ -261,6 +278,7 @@ pub fn init(core: *Core, ctx: mach.Context) !void {
     try mach.initGraph(&core.render_graph, allocator, io, .render);
 
     core.frame.start(io);
+    core.frame_timer = .start(io);
     core.input.start(io);
 }
 
@@ -414,6 +432,7 @@ pub fn renderFrame(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
 
     // Frame rate counter.
     core.frame.tick();
+    core.metrics.frame_time_ns.observe(core.frame_timer.lapPrecise());
     mach.tracy.frameMark();
 }
 
