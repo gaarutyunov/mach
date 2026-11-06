@@ -597,8 +597,8 @@ pub const Graph = struct {
     /// Snapshots the current graph state into dst. Called by the processing thread
     /// so no concurrent mutations are possible.
     fn copyInto(src: *Graph, dst: *Graph, allocator: std.mem.Allocator) !void {
-        // copy nodes
-        try dst.nodes.copyFrom(&src.nodes, allocator);
+        // Every dst node is rebuilt below, so all of the previous snapshot's nodes are free again.
+        dst.nodes.releaseAll();
 
         // copy id_to_node
         try dst.id_to_node.map.ensureTotalCapacity(allocator, src.id_to_node.map.capacity());
@@ -912,4 +912,32 @@ test "graph - copyFrom" {
     }
     try testing.expectEqual((try dst.getParent(allocator, 2)).?, 1);
     try testing.expectEqual((try dst.getParent(allocator, 4)).?, 2);
+}
+
+test "graph - repeated copyFrom does not grow the destination" {
+    const allocator = testing.allocator;
+    const io = std.Options.debug_io;
+    var src: Graph = undefined;
+    try src.init(allocator, io, .{ .queue_size = 32, .nodes_size = 32, .num_result_lists = 8, .result_list_size = 8 });
+    defer src.deinit(allocator);
+    var dst: Graph = undefined;
+    try dst.init(allocator, io, .{ .queue_size = 32, .nodes_size = 32, .num_result_lists = 8, .result_list_size = 8 });
+    defer dst.deinit(allocator);
+
+    // More live nodes than src has free, as in a large scene.
+    const parent = 1_000_000;
+    const num_children = 1000;
+    for (1..num_children + 1) |child| try src.addChild(allocator, parent, child);
+    try src.sync(allocator);
+    try testing.expect(src.id_to_node.map.count() > src.nodes.stats().nodes);
+
+    try dst.copyFrom(&src, allocator);
+    const chunks = dst.nodes.stats().chunks;
+    for (0..100) |_| try dst.copyFrom(&src, allocator);
+    try testing.expectEqual(chunks, dst.nodes.stats().chunks);
+
+    // The snapshot is still complete.
+    const results = try dst.getChildren(allocator, parent);
+    defer results.deinit();
+    try testing.expectEqual(num_children, results.items.len);
 }
