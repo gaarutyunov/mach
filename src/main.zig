@@ -12,6 +12,7 @@ pub const is_debug = builtin.mode == .debug;
 pub const Core = if (build_options.want_core) @import("Core.zig") else struct {};
 
 pub const gfx = if (build_options.want_mach) @import("gfx/main.zig") else struct {};
+pub const dvx = if (build_options.want_mach) @import("dvx/main.zig") else struct {};
 pub const Audio = if (build_options.want_sysaudio) @import("Audio.zig") else struct {};
 pub const math = @import("math/main.zig");
 pub const testing = @import("testing.zig");
@@ -91,6 +92,7 @@ test {
     _ = sysaudio;
     _ = sysgpu;
     _ = gfx;
+    _ = dvx;
     _ = Audio;
     _ = math;
     _ = testing;

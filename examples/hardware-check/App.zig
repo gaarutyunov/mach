@@ -4,6 +4,7 @@ const assets = @import("assets");
 const mach = @import("mach");
 const gpu = mach.gpu;
 const gfx = mach.gfx;
+const dvx = mach.dvx;
 const math = mach.math;
 
 const vec2 = math.vec2;
@@ -19,7 +20,7 @@ pub const Modules = mach.Modules(.{
     mach.Core,
     mach.gfx.Sprite,
     mach.gfx.Text,
-    mach.gfx.DevOverlay,
+    mach.dvx.DevOverlay,
     mach.Audio,
     App,
 });
@@ -44,7 +45,7 @@ pub const main = mach.schedule(.{
     .{ mach.Audio, .init },
     .{ gfx.Text, .init },
     .{ gfx.Sprite, .init },
-    .{ gfx.DevOverlay, .init },
+    .{ dvx.DevOverlay, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
@@ -86,7 +87,7 @@ window_meta: mach.Objects(.{}, struct {
 pub fn init(
     core: *mach.Core,
     audio: *mach.Audio,
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
     app: *App,
     app_mod: mach.Mod(App),
     core_mod: mach.Mod(mach.Core),
@@ -205,11 +206,11 @@ pub const tick = mach.schedule(.{
     .{ mach.Audio, .cleanup },
     .{ gfx.Sprite, .cleanup },
     .{ gfx.Text, .cleanup },
-    .{ gfx.DevOverlay, .update },
+    .{ dvx.DevOverlay, .update },
     .{ mach.Core, .snapshotStart },
     .{ gfx.Sprite, .snapshot },
     .{ gfx.Text, .snapshot },
-    .{ gfx.DevOverlay, .snapshot },
+    .{ dvx.DevOverlay, .snapshot },
     .{ mach.Core, .snapshotEnd },
 });
 
@@ -220,7 +221,7 @@ pub fn appTick(
     sprite: *gfx.Sprite,
     text: *gfx.Text,
     audio: *mach.Audio,
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
 ) !void {
     var iter = core.events(.default);
     while (iter.next()) |event| {
@@ -465,7 +466,7 @@ pub fn render(
     sprite_mod: mach.Mod(gfx.Sprite),
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
-    overlay: *gfx.DevOverlay,
+    overlay: *dvx.DevOverlay,
 ) !void {
     if (!app.has_setup_shared) {
         try setupShared(core, app, sprite, text);

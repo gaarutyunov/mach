@@ -5,11 +5,11 @@
 //! Toggle with Ctrl+Alt+Shift+D (the same chord as YouTube's "Stats for nerds"), or set
 //! `MACH_DEV_OVERLAY=1` to show it from startup.
 //!
-//! Usage from the app (register `mach.gfx.DevOverlay` in your `mach.Modules`):
-//! * schedule `.{ gfx.DevOverlay, .init }` before the app's init, then call `attach()` with the
+//! Usage from the app (register `mach.dvx.DevOverlay` in your `mach.Modules`):
+//! * schedule `.{ dvx.DevOverlay, .init }` before the app's init, then call `attach()` with the
 //!   window
 //! * forward key presses to `handleKey()`, ignoring those it consumed
-//! * schedule `.{ gfx.DevOverlay, .update }` each tick and `.{ gfx.DevOverlay, .snapshot }` in the
+//! * schedule `.{ dvx.DevOverlay, .update }` each tick and `.{ dvx.DevOverlay, .snapshot }` in the
 //!   render snapshot (between `Core.snapshotStart` and `Core.snapshotEnd`)
 //! * optionally, show app-specific info (scene, entity counts, ...) with `setAppInfo()`
 //! * call `render()` from the render callback, after the frame has been drawn
@@ -28,7 +28,7 @@ const Mat4x4 = math.Mat4x4;
 
 const DevOverlay = @This();
 
-pub const mach_module = .mach_gfx_dev_overlay;
+pub const mach_module = .mach_dvx_dev_overlay;
 
 pub const mach_systems = .{ .init, .update, .snapshot };
 
