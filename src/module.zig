@@ -4,6 +4,7 @@ const Core = @import("Core.zig");
 const StringTable = @import("StringTable.zig");
 const Graph = @import("graph.zig").Graph;
 const PoolAllocator = @import("PoolAllocator.zig");
+const MeteredAllocator = @import("dvx/metrics.zig").MeteredAllocator;
 const tracy = @import("tracy");
 const build_options = @import("build-options");
 
@@ -978,9 +979,11 @@ pub const Context = struct {
 pub const ModuleMemory = struct {
     /// The module's name, e.g. "mach_gfx_sprite".
     name: []const u8,
-    /// Usage of the module's pool, or null if it has no budget (`InitOptions.budgets`) and so
-    /// allocates from an override or the global allocator.
+    /// Usage of the module's pool, or null if it has no budget (`InitOptions.budgets`).
     pool: ?*const PoolAllocator.Metrics,
+    /// What the module allocated from its override or the global allocator, or null if it has a
+    /// budget. Allocations made by others from the same allocator aren't included.
+    metered: ?*const MeteredAllocator.Metrics,
 };
 
 /// Name of the Tracy plot of a module's pool usage. A type, so the name has one address: Tracy
@@ -1158,6 +1161,9 @@ pub fn Modules(module_lists: anytype) type {
         /// Each module's memory pool, if it was given a budget in `InitOptions.budgets`.
         pools: ModulePools(modules) = .{},
 
+        /// Wraps the allocator of each module without a pool, to record its usage.
+        metered_allocators: ModuleMeteredAllocators(modules) = .{},
+
         /// With `-Dtracy`, each module's allocator wrapped to report to Tracy as a named pool.
         tracing_allocators: ModuleTracingAllocators(modules) = undefined,
 
@@ -1213,10 +1219,11 @@ pub fn Modules(module_lists: anytype) type {
             };
             try m.initPools(io, options);
             inline for (@typeInfo(@TypeOf(m.allocators)).@"struct".field_names) |name| {
-                const base = if (@field(m.pools, name)) |*pool|
-                    pool.allocator()
-                else
-                    @field(options.allocators, name) orelse allocator;
+                const base = if (@field(m.pools, name)) |*pool| pool.allocator() else blk: {
+                    const metered = &@field(m.metered_allocators, name);
+                    metered.* = .{ .parent = @field(options.allocators, name) orelse allocator };
+                    break :blk metered.*.?.allocator();
+                };
                 @field(m.allocators, name) = if (build_options.tracy) blk: {
                     const tracing = &@field(m.tracing_allocators, name);
                     tracing.* = .initNamed(std.fmt.comptimePrint("{s}", .{name}), base);
@@ -1305,6 +1312,7 @@ pub fn Modules(module_lists: anytype) type {
                 out[n] = .{
                     .name = name,
                     .pool = if (@field(m.pools, name)) |*pool| &pool.metrics else null,
+                    .metered = if (@field(m.metered_allocators, name)) |*metered| &metered.metrics else null,
                 };
                 n += 1;
             }
@@ -1614,6 +1622,12 @@ fn ModulePools(comptime modules: anytype) type {
     return ModuleFieldsOf(modules, ?PoolAllocator, &@as(?PoolAllocator, null));
 }
 
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one `?MeteredAllocator = null` field
+/// per module name.
+fn ModuleMeteredAllocators(comptime modules: anytype) type {
+    return ModuleFieldsOf(modules, ?MeteredAllocator, &@as(?MeteredAllocator, null));
+}
+
 fn ModuleTracingAllocators(comptime modules: anytype) type {
     return ModuleFieldsOf(modules, if (build_options.tracy) tracy.TracingAllocator else void, null);
 }
@@ -1731,11 +1745,15 @@ test "Many fields, Many modules" {
     modules.deinit(allocator);
 }
 
-/// Returns the allocator a module's allocator wraps when built with `-Dtracy`.
+/// Returns the allocator a module's allocator wraps, without the Tracy and metrics wrappers.
 fn testBaseAllocator(a: std.mem.Allocator) std.mem.Allocator {
-    if (!build_options.tracy) return a;
-    const tracing: *tracy.TracingAllocator = @ptrCast(@alignCast(a.ptr));
-    return tracing.parent_allocator;
+    const untraced = if (build_options.tracy) blk: {
+        const tracing: *tracy.TracingAllocator = @ptrCast(@alignCast(a.ptr));
+        break :blk tracing.parent_allocator;
+    } else a;
+    if (untraced.vtable != &MeteredAllocator.vtable) return untraced;
+    const metered: *MeteredAllocator = @ptrCast(@alignCast(untraced.ptr));
+    return metered.parent;
 }
 
 test "Per-module allocators" {
@@ -1868,8 +1886,16 @@ test "Per-module budgets" {
     try std.testing.expect(ps.allocs_total.load() > 0);
     try std.testing.expectEqual(1, ps.failed_allocs_total.load());
     try std.testing.expect(ps.touched_bytes.load() >= ps.used_bytes.load());
+    try std.testing.expect(stats[0].metered == null);
     try std.testing.expectEqualStrings("global", stats[1].name);
     try std.testing.expect(stats[1].pool == null);
+
+    // Modules without a budget are metered instead.
+    const metered = stats[1].metered.?;
+    const used_before = metered.used_bytes.load();
+    _ = try modules.mods.global.things.new(.{ .a = 1 });
+    try std.testing.expect(metered.used_bytes.load() > used_before);
+    try std.testing.expect(metered.allocs_total.load() > 0);
     try std.testing.expectEqual(1, ctx.memoryStats(buf[0..1]).len);
 }
 

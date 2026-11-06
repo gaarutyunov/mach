@@ -167,6 +167,75 @@ pub fn Histogram(comptime bounds: []const u64) type {
     };
 }
 
+/// Wraps an allocator, recording what goes through it. Only allocations made through the wrapper
+/// are counted. Must not be moved once `allocator()` has been called.
+pub const MeteredAllocator = struct {
+    parent: std.mem.Allocator,
+    metrics: Metrics = .{},
+
+    pub const Metrics = struct {
+        /// Bytes currently allocated, as requested by callers.
+        used_bytes: Gauge = .{},
+        /// Peak value of `used_bytes`.
+        peak_bytes: Gauge = .{},
+        /// Number of successful allocations and frees so far.
+        allocs_total: Counter = .{},
+        frees_total: Counter = .{},
+        /// Number of allocations the parent allocator failed.
+        failed_allocs_total: Counter = .{},
+    };
+
+    pub const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    pub fn allocator(m: *MeteredAllocator) std.mem.Allocator {
+        return .{ .ptr = m, .vtable = &vtable };
+    }
+
+    /// Records a change in size. Raises the peak from this thread's own result, so concurrent
+    /// updates can't make it miss a value.
+    fn addUsed(m: *MeteredAllocator, delta: i64) void {
+        const used = m.metrics.used_bytes.value.fetchAdd(delta, .monotonic) + delta;
+        m.metrics.peak_bytes.setMax(used);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const m: *MeteredAllocator = @ptrCast(@alignCast(ctx));
+        const result = m.parent.rawAlloc(len, alignment, ra) orelse {
+            m.metrics.failed_allocs_total.inc();
+            return null;
+        };
+        m.addUsed(@intCast(len));
+        m.metrics.allocs_total.inc();
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const m: *MeteredAllocator = @ptrCast(@alignCast(ctx));
+        if (!m.parent.rawResize(memory, alignment, new_len, ra)) return false;
+        m.addUsed(@as(i64, @intCast(new_len)) - @as(i64, @intCast(memory.len)));
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const m: *MeteredAllocator = @ptrCast(@alignCast(ctx));
+        const result = m.parent.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        m.addUsed(@as(i64, @intCast(new_len)) - @as(i64, @intCast(memory.len)));
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const m: *MeteredAllocator = @ptrCast(@alignCast(ctx));
+        m.parent.rawFree(memory, alignment, ra);
+        m.metrics.used_bytes.sub(@intCast(memory.len));
+        m.metrics.frees_total.inc();
+    }
+};
+
 /// Writes every metric in `set`, a pointer to a struct whose fields are all metrics, in the
 /// Prometheus text format. Each metric is named `prefix` followed by its field's name, so together
 /// they must form valid and unique Prometheus metric names.
@@ -265,6 +334,37 @@ test "write uses the Prometheus text format" {
         \\app_time_ns_count 3
         \\
     , w.buffered());
+}
+
+test "MeteredAllocator records usage" {
+    var metered: MeteredAllocator = .{ .parent = std.testing.allocator };
+    const a = metered.allocator();
+
+    const x = try a.alloc(u8, 100);
+    const y = try a.alloc(u8, 50);
+    try std.testing.expectEqual(150, metered.metrics.used_bytes.load());
+    a.free(x);
+    try std.testing.expectEqual(50, metered.metrics.used_bytes.load());
+    try std.testing.expectEqual(150, metered.metrics.peak_bytes.load());
+    try std.testing.expectEqual(2, metered.metrics.allocs_total.load());
+    try std.testing.expectEqual(1, metered.metrics.frees_total.load());
+    a.free(y);
+    try std.testing.expectEqual(0, metered.metrics.used_bytes.load());
+
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    var metered_failing: MeteredAllocator = .{ .parent = failing.allocator() };
+    try std.testing.expectError(error.OutOfMemory, metered_failing.allocator().alloc(u8, 1));
+    try std.testing.expectEqual(1, metered_failing.metrics.failed_allocs_total.load());
+    try std.testing.expectEqual(0, metered_failing.metrics.used_bytes.load());
+}
+
+test "MeteredAllocator conformance" {
+    var metered: MeteredAllocator = .{ .parent = std.testing.allocator };
+    try std.heap.testAllocator(metered.allocator());
+    try std.heap.testAllocatorAligned(metered.allocator());
+    try std.heap.testAllocatorLargeAlignment(metered.allocator());
+    try std.heap.testAllocatorAlignedShrink(metered.allocator());
+    try std.testing.expectEqual(0, metered.metrics.used_bytes.load());
 }
 
 test "concurrent updates are not lost" {

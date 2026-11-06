@@ -167,16 +167,23 @@ pub fn update(
     overlay.addLine(overlay.style_dim, "memory: used / peak / budget, touched, allocs/s -> suggested budget", .{});
     var stats_buf: [max_modules]mach.ModuleMemory = undefined;
     for (ctx.memoryStats(&stats_buf), 0..) |m, i| {
-        const pool = m.pool orelse {
-            overlay.addLine(overlay.style_dim, "{s}: global allocator (no budget)", .{m.name});
-            continue;
-        };
-        const allocs = pool.allocs_total.load();
+        const allocs = if (m.pool) |pool| pool.allocs_total.load() else m.metered.?.allocs_total.load();
         const allocs_per_sec: f64 = if (overlay.rates_valid and elapsed > 0)
             @as(f64, @floatFromInt(allocs -% overlay.prev_allocs[i])) / elapsed
         else
             0;
         overlay.prev_allocs[i] = allocs;
+
+        const pool = m.pool orelse {
+            const metered = m.metered.?;
+            overlay.addLine(overlay.style_normal, "{s}: {Bi:.1} / {Bi:.1} / no budget, {d:.0}/s", .{
+                m.name,
+                metered.used_bytes.loadUsize(),
+                metered.peak_bytes.loadUsize(),
+                allocs_per_sec,
+            });
+            continue;
+        };
 
         // Warn when the peak gets close to the budget, or allocations have failed.
         const budget = pool.budget_bytes.loadUsize();
