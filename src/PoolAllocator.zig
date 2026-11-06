@@ -7,7 +7,7 @@
 //!   e.g. a freed music track can be reused by a differently sized one.
 //!
 //! Nothing is returned to the OS, and allocating past the budget fails with `error.OutOfMemory`
-//! instead of growing. Size the budget from `report()`'s high-water mark.
+//! instead of growing. Size the budget from `report()`'s high-water mark, which needs `-Dmetrics`.
 //!
 //! Usually you don't create these directly: give modules budgets via `Modules.initOptions` and
 //! Mach creates a pool per module from one block reserved up front:
@@ -98,8 +98,12 @@ fn updateTouched(pool: *PoolAllocator) void {
     pool.metrics.touched_bytes.set(@intCast(pool.bottom + (pool.buffer.len - pool.top)));
 }
 
-/// Logs current usage, high-water mark and budget.
+/// Logs current usage, high-water mark and budget. Usage needs `-Dmetrics`.
 pub fn report(pool: *PoolAllocator) void {
+    if (!dvx_metrics.enabled) {
+        log.info("{s}: {Bi:.1} budget (build with -Dmetrics for usage)", .{ pool.name, pool.buffer.len });
+        return;
+    }
     log.info("{s}: used {Bi:.1}, high-water {Bi:.1} of {Bi:.1} budget", .{
         pool.name, pool.metrics.used_bytes.loadUsize(), pool.metrics.peak_bytes.loadUsize(), pool.buffer.len,
     });
@@ -174,9 +178,7 @@ fn outOfMemory(pool: *PoolAllocator, size: usize) ?[*]u8 {
     pool.metrics.failed_allocs_total.inc();
     if (!pool.exhausted) {
         pool.exhausted = true;
-        log.warn("{s}: out of memory allocating {Bi:.1} (used {Bi:.1} of {Bi:.1} budget)", .{
-            pool.name, size, pool.metrics.used_bytes.loadUsize(), pool.buffer.len,
-        });
+        log.warn("{s}: out of memory allocating {Bi:.1} ({Bi:.1} budget)", .{ pool.name, size, pool.buffer.len });
     }
     return null;
 }
@@ -253,6 +255,11 @@ fn removeExtent(pool: *PoolAllocator, i: usize) void {
     pool.num_free_extents -= 1;
 }
 
+/// Checks `used_bytes`, which is only calculated with `-Dmetrics`.
+fn expectUsed(pool: *const PoolAllocator, expected: usize) !void {
+    if (dvx_metrics.enabled) try std.testing.expectEqual(expected, pool.metrics.used_bytes.loadUsize());
+}
+
 test "small allocations reuse freed blocks of the same class" {
     var buffer: [4096]u8 align(16) = undefined;
     var pool = PoolAllocator.init("test", &buffer, std.testing.io);
@@ -260,12 +267,12 @@ test "small allocations reuse freed blocks of the same class" {
 
     const x = try a.alloc(u8, 100); // 128-byte class
     const y = try a.alloc(u64, 3); // 32-byte class
-    try std.testing.expectEqual(@as(usize, 160), pool.metrics.used_bytes.loadUsize());
+    try expectUsed(&pool, 160);
 
     a.free(x);
     const z = try a.alloc(u8, 120); // same class, reuses x's block
     try std.testing.expectEqual(x.ptr, z.ptr);
-    try std.testing.expectEqual(@as(usize, 160), pool.metrics.peak_bytes.loadUsize());
+    if (dvx_metrics.enabled) try std.testing.expectEqual(@as(usize, 160), pool.metrics.peak_bytes.loadUsize());
 
     // Growing within the size class happens in place.
     try std.testing.expect(a.resize(z, 128));
@@ -275,7 +282,7 @@ test "small allocations reuse freed blocks of the same class" {
     try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 8192));
     a.free(z);
     a.free(y);
-    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
+    try expectUsed(&pool, 0);
 }
 
 test "large allocations coalesce and are reused across sizes" {
@@ -293,12 +300,12 @@ test "large allocations coalesce and are reused across sizes" {
     // Freeing two adjacent blocks yields one extent big enough for a larger allocation.
     a.free(x);
     a.free(y);
-    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
+    try expectUsed(&pool, 0);
     const z = try a.alloc(u8, 6 * mib);
     const small = try a.alloc(u8, 100);
     a.free(small);
     a.free(z);
-    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
+    try expectUsed(&pool, 0);
     try std.testing.expectEqual(@as(usize, 0), pool.num_free_extents);
 
     // Out-of-order frees in the middle coalesce too.
@@ -310,7 +317,7 @@ test "large allocations coalesce and are reused across sizes" {
     a.free(r); // r is lowest (top of region), so q+r return to the region
     try std.testing.expectEqual(@as(usize, 0), pool.num_free_extents);
     a.free(p);
-    try std.testing.expectEqual(@as(usize, 0), pool.metrics.used_bytes.loadUsize());
+    try expectUsed(&pool, 0);
 }
 
 test "std.heap.testAllocator conformance" {

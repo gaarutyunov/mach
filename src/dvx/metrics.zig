@@ -19,21 +19,36 @@
 //! Each metric is individually consistent, but they are not synchronized with each other or with
 //! surrounding memory: a reader may see one metric updated before another. Don't use them to
 //! coordinate threads.
+//!
+//! Metrics are only calculated when built with `-Dmetrics`. Otherwise every metric is zero-sized,
+//! updates do nothing, and reads return zero. Guard anything that is costly to compute just for a
+//! metric, such as reading a clock, with `if (metrics.enabled)`.
 const std = @import("std");
+const build_options = @import("build-options");
+
+/// Whether Mach was built with `-Dmetrics`.
+pub const enabled = build_options.metrics;
+
+/// The storage of a metric: nothing unless metrics are enabled.
+fn Atomic(comptime T: type) type {
+    return if (enabled) std.atomic.Value(T) else void;
+}
 
 /// A value that only goes up, e.g. the number of allocations so far.
 pub const Counter = struct {
-    value: std.atomic.Value(u64) = .init(0),
+    value: Atomic(u64) = if (enabled) .init(0) else {},
 
     pub fn inc(c: *Counter) void {
         c.add(1);
     }
 
     pub fn add(c: *Counter, n: u64) void {
+        if (!enabled) return;
         _ = c.value.fetchAdd(n, .monotonic);
     }
 
     pub fn load(c: *const Counter) u64 {
+        if (!enabled) return 0;
         return c.value.load(.monotonic);
     }
 
@@ -44,30 +59,36 @@ pub const Counter = struct {
 
 /// A value that goes up and down, e.g. bytes currently in use.
 pub const Gauge = struct {
-    value: std.atomic.Value(i64) = .init(0),
+    value: Atomic(i64) = if (enabled) .init(0) else {},
 
     pub fn init(value: i64) Gauge {
+        if (!enabled) return .{};
         return .{ .value = .init(value) };
     }
 
     pub fn set(g: *Gauge, value: i64) void {
+        if (!enabled) return;
         g.value.store(value, .monotonic);
     }
 
     pub fn add(g: *Gauge, n: i64) void {
+        if (!enabled) return;
         _ = g.value.fetchAdd(n, .monotonic);
     }
 
     pub fn sub(g: *Gauge, n: i64) void {
+        if (!enabled) return;
         _ = g.value.fetchSub(n, .monotonic);
     }
 
     /// Raises the gauge to `value` if it is lower, e.g. to track a peak.
     pub fn setMax(g: *Gauge, value: i64) void {
+        if (!enabled) return;
         _ = g.value.fetchMax(value, .monotonic);
     }
 
     pub fn load(g: *const Gauge) i64 {
+        if (!enabled) return 0;
         return g.value.load(.monotonic);
     }
 
@@ -94,8 +115,8 @@ pub fn Histogram(comptime bounds: []const u64) type {
         const Self = @This();
 
         /// Per-bucket (not cumulative) counts.
-        counts: [num_buckets]std.atomic.Value(u64) = @splat(.init(0)),
-        sum: std.atomic.Value(u64) = .init(0),
+        counts: if (enabled) [num_buckets]std.atomic.Value(u64) else void = if (enabled) @splat(.init(0)) else {},
+        sum: Atomic(u64) = if (enabled) .init(0) else {},
 
         /// A copy of a histogram's values, see `snapshot`.
         pub const Snapshot = struct {
@@ -134,11 +155,13 @@ pub fn Histogram(comptime bounds: []const u64) type {
         };
 
         pub fn observe(h: *Self, value: u64) void {
+            if (!enabled) return;
             _ = h.sum.fetchAdd(value, .monotonic);
             _ = h.counts[bucketIndex(value)].fetchAdd(1, .monotonic);
         }
 
         pub fn snapshot(h: *const Self) Snapshot {
+            if (!enabled) return .{};
             var result: Snapshot = .{ .sum = h.sum.load(.monotonic) };
             for (&result.counts, &h.counts) |*r, *c| r.* = c.load(.monotonic);
             return result;
@@ -199,6 +222,7 @@ pub const MeteredAllocator = struct {
     /// Records a change in size. Raises the peak from this thread's own result, so concurrent
     /// updates can't make it miss a value.
     fn addUsed(m: *MeteredAllocator, delta: i64) void {
+        if (!enabled) return;
         const used = m.metrics.used_bytes.value.fetchAdd(delta, .monotonic) + delta;
         m.metrics.peak_bytes.setMax(used);
     }
@@ -237,16 +261,32 @@ pub const MeteredAllocator = struct {
 };
 
 /// Writes every metric in `set`, a pointer to a struct whose fields are all metrics, in the
-/// Prometheus text format. Each metric is named `prefix` followed by its field's name, so together
+/// Prometheus text format, or nothing unless metrics are enabled. Each metric is named `prefix` followed by its field's name, so together
 /// they must form valid and unique Prometheus metric names.
 pub fn write(w: *std.Io.Writer, prefix: []const u8, set: anytype) std.Io.Writer.Error!void {
+    if (!enabled) return;
     const Set = @typeInfo(@TypeOf(set)).pointer.child;
     inline for (@typeInfo(Set).@"struct".field_names) |name| {
         try @field(set, name).writeTo(w, prefix, name);
     }
 }
 
+test "metrics take no space and read as zero unless enabled" {
+    if (enabled) return error.SkipZigTest;
+    try std.testing.expectEqual(0, @sizeOf(Counter));
+    try std.testing.expectEqual(0, @sizeOf(Gauge));
+    try std.testing.expectEqual(0, @sizeOf(Histogram(&.{ 1, 2 })));
+
+    var g: Gauge = .init(5);
+    g.add(1);
+    try std.testing.expectEqual(0, g.load());
+    var h: Histogram(&.{ 1, 2 }) = .{};
+    h.observe(1);
+    try std.testing.expectEqual(0, h.snapshot().count());
+}
+
 test "counter and gauge" {
+    if (!enabled) return error.SkipZigTest;
     var c: Counter = .{};
     c.inc();
     c.add(2);
@@ -264,6 +304,7 @@ test "counter and gauge" {
 }
 
 test "histogram buckets are inclusive, with an overflow bucket" {
+    if (!enabled) return error.SkipZigTest;
     var h: Histogram(&.{ 10, 100 }) = .{};
     h.observe(0);
     h.observe(10);
@@ -276,6 +317,7 @@ test "histogram buckets are inclusive, with an overflow bucket" {
 }
 
 test "histogram quantile" {
+    if (!enabled) return error.SkipZigTest;
     var h: Histogram(&.{ 10, 100, 1000 }) = .{};
     try std.testing.expectEqual(null, h.snapshot().quantile(0.5));
 
@@ -295,6 +337,7 @@ test "histogram quantile" {
 }
 
 test "histogram snapshot since an earlier one" {
+    if (!enabled) return error.SkipZigTest;
     var h: Histogram(&.{ 10, 100 }) = .{};
     h.observe(5);
     const earlier = h.snapshot();
@@ -307,6 +350,7 @@ test "histogram snapshot since an earlier one" {
 }
 
 test "write uses the Prometheus text format" {
+    if (!enabled) return error.SkipZigTest;
     var set: struct {
         allocs_total: Counter = .{},
         used_bytes: Gauge = .{},
@@ -337,6 +381,7 @@ test "write uses the Prometheus text format" {
 }
 
 test "MeteredAllocator records usage" {
+    if (!enabled) return error.SkipZigTest;
     var metered: MeteredAllocator = .{ .parent = std.testing.allocator };
     const a = metered.allocator();
 
@@ -359,6 +404,7 @@ test "MeteredAllocator records usage" {
 }
 
 test "MeteredAllocator conformance" {
+    if (!enabled) return error.SkipZigTest;
     var metered: MeteredAllocator = .{ .parent = std.testing.allocator };
     try std.heap.testAllocator(metered.allocator());
     try std.heap.testAllocatorAligned(metered.allocator());
@@ -368,6 +414,7 @@ test "MeteredAllocator conformance" {
 }
 
 test "concurrent updates are not lost" {
+    if (!enabled) return error.SkipZigTest;
     const num_threads = 8;
     const num_updates = 100_000;
     const Set = struct {

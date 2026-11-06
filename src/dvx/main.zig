@@ -1,6 +1,6 @@
 //! Developer experience: opt-in tools for inspecting and tuning a running Mach application.
 
-/// Atomic counters, gauges and histograms.
+/// Atomic counters, gauges and histograms, calculated only with `-Dmetrics`.
 pub const metrics = @import("metrics.zig");
 
 // Mach modules

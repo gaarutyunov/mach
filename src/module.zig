@@ -4,7 +4,8 @@ const Core = @import("Core.zig");
 const StringTable = @import("StringTable.zig");
 const Graph = @import("graph.zig").Graph;
 const PoolAllocator = @import("PoolAllocator.zig");
-const MeteredAllocator = @import("dvx/metrics.zig").MeteredAllocator;
+const dvx_metrics = @import("dvx/metrics.zig");
+const MeteredAllocator = dvx_metrics.MeteredAllocator;
 const tracy = @import("tracy");
 const build_options = @import("build-options");
 
@@ -975,14 +976,15 @@ pub const Context = struct {
     }
 };
 
-/// A module's memory usage, see `Context.memoryStats`.
+/// A module's memory usage, see `Context.memoryStats`. All zero or null without `-Dmetrics`.
 pub const ModuleMemory = struct {
     /// The module's name, e.g. "mach_gfx_sprite".
     name: []const u8,
     /// Usage of the module's pool, or null if it has no budget (`InitOptions.budgets`).
     pool: ?*const PoolAllocator.Metrics,
     /// What the module allocated from its override or the global allocator, or null if it has a
-    /// budget. Allocations made by others from the same allocator aren't included.
+    /// budget or metrics are disabled. Allocations made by others from the same allocator aren't
+    /// included.
     metered: ?*const MeteredAllocator.Metrics,
 };
 
@@ -1161,7 +1163,7 @@ pub fn Modules(module_lists: anytype) type {
         /// Each module's memory pool, if it was given a budget in `InitOptions.budgets`.
         pools: ModulePools(modules) = .{},
 
-        /// Wraps the allocator of each module without a pool, to record its usage.
+        /// With `-Dmetrics`, wraps the allocator of each module without a pool to record its usage.
         metered_allocators: ModuleMeteredAllocators(modules) = .{},
 
         /// With `-Dtracy`, each module's allocator wrapped to report to Tracy as a named pool.
@@ -1220,8 +1222,10 @@ pub fn Modules(module_lists: anytype) type {
             try m.initPools(io, options);
             inline for (@typeInfo(@TypeOf(m.allocators)).@"struct".field_names) |name| {
                 const base = if (@field(m.pools, name)) |*pool| pool.allocator() else blk: {
+                    const unmetered = @field(options.allocators, name) orelse allocator;
+                    if (!dvx_metrics.enabled) break :blk unmetered;
                     const metered = &@field(m.metered_allocators, name);
-                    metered.* = .{ .parent = @field(options.allocators, name) orelse allocator };
+                    metered.* = .{ .parent = unmetered };
                     break :blk metered.*.?.allocator();
                 };
                 @field(m.allocators, name) = if (build_options.tracy) blk: {
@@ -1319,9 +1323,10 @@ pub fn Modules(module_lists: anytype) type {
             return out[0..n];
         }
 
-        /// With `-Dtracy`, plots the module's pool usage (called after each of its systems runs).
+        /// With `-Dtracy` and `-Dmetrics`, plots the module's pool usage (called after each of its
+        /// systems runs).
         fn plotMemory(m: *@This(), comptime name: []const u8) void {
-            if (!build_options.tracy) return;
+            if (!build_options.tracy or !dvx_metrics.enabled) return;
             if (@field(m.pools, name)) |*pool| {
                 tracy.plot(i64, MemoryPlot(name).name, pool.metrics.used_bytes.load());
             }
@@ -1871,7 +1876,7 @@ test "Per-module budgets" {
 
     // Objects lists allocate from the pool, and are limited by its budget.
     _ = try modules.mods.pooled.things.new(.{ .a = 1 });
-    try std.testing.expect(pool.metrics.used_bytes.load() > 0);
+    if (dvx_metrics.enabled) try std.testing.expect(pool.metrics.used_bytes.load() > 0);
     pool.exhausted = true; // silence the expected out-of-memory warning
     try std.testing.expectError(error.OutOfMemory, modules.mods.pooled.things.ensureTotalCapacity(1024 * 1024));
 
@@ -1882,20 +1887,26 @@ test "Per-module budgets" {
     try std.testing.expectEqualStrings("pooled", stats[0].name);
     const ps = stats[0].pool.?;
     try std.testing.expectEqual(&pool.metrics, ps);
-    try std.testing.expectEqual(1024 * 1024, ps.budget_bytes.load());
-    try std.testing.expect(ps.allocs_total.load() > 0);
-    try std.testing.expectEqual(1, ps.failed_allocs_total.load());
-    try std.testing.expect(ps.touched_bytes.load() >= ps.used_bytes.load());
+    if (dvx_metrics.enabled) {
+        try std.testing.expectEqual(1024 * 1024, ps.budget_bytes.load());
+        try std.testing.expect(ps.allocs_total.load() > 0);
+        try std.testing.expectEqual(1, ps.failed_allocs_total.load());
+        try std.testing.expect(ps.touched_bytes.load() >= ps.used_bytes.load());
+    }
     try std.testing.expect(stats[0].metered == null);
     try std.testing.expectEqualStrings("global", stats[1].name);
     try std.testing.expect(stats[1].pool == null);
 
     // Modules without a budget are metered instead.
-    const metered = stats[1].metered.?;
-    const used_before = metered.used_bytes.load();
-    _ = try modules.mods.global.things.new(.{ .a = 1 });
-    try std.testing.expect(metered.used_bytes.load() > used_before);
-    try std.testing.expect(metered.allocs_total.load() > 0);
+    if (dvx_metrics.enabled) {
+        const metered = stats[1].metered.?;
+        const used_before = metered.used_bytes.load();
+        _ = try modules.mods.global.things.new(.{ .a = 1 });
+        try std.testing.expect(metered.used_bytes.load() > used_before);
+        try std.testing.expect(metered.allocs_total.load() > 0);
+    } else {
+        try std.testing.expect(stats[1].metered == null);
+    }
     try std.testing.expectEqual(1, ctx.memoryStats(buf[0..1]).len);
 }
 

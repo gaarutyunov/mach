@@ -432,7 +432,7 @@ pub fn renderFrame(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
 
     // Frame rate counter.
     core.frame.tick();
-    core.metrics.frame_time_ns.observe(core.frame_timer.lapPrecise());
+    if (dvx_metrics.enabled) core.metrics.frame_time_ns.observe(core.frame_timer.lapPrecise());
     mach.tracy.frameMark();
 }
 

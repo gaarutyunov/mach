@@ -19,6 +19,7 @@ const gpu = mach.gpu;
 const gfx = mach.gfx;
 const math = mach.math;
 const time = mach.time;
+const metrics = @import("metrics.zig");
 
 const vec2 = math.vec2;
 const vec3 = math.vec3;
@@ -148,15 +149,19 @@ pub fn update(
     overlay.addLine(overlay.style_dim, "dev overlay (ctrl+alt+shift+d)   tracy: {s}", .{
         if (!mach.tracy_enabled) "off (build with -Dtracy)" else if (mach.tracy.isConnected()) "connected" else "waiting for profiler",
     });
-    const frame_time = core.metrics.frame_time_ns.snapshot();
-    const frames = if (overlay.rates_valid) frame_time.since(overlay.prev_frame_time) else frame_time;
-    overlay.prev_frame_time = frame_time;
-    overlay.addLine(overlay.style_normal, "frame {d:.0} fps   p50 <={d:.1} ms   p99 <={d:.1} ms   input {d} hz", .{
-        if (frames.sum == 0) 0 else @as(f64, @floatFromInt(frames.count())) * time.ns_per_s / @as(f64, @floatFromInt(frames.sum)),
-        nsToMs(frames.quantile(0.5) orelse 0),
-        nsToMs(frames.quantile(0.99) orelse 0),
-        core.input.rate,
-    });
+    if (metrics.enabled) {
+        const frame_time = core.metrics.frame_time_ns.snapshot();
+        const frames = if (overlay.rates_valid) frame_time.since(overlay.prev_frame_time) else frame_time;
+        overlay.prev_frame_time = frame_time;
+        overlay.addLine(overlay.style_normal, "frame {d:.0} fps   p50 <={d:.1} ms   p99 <={d:.1} ms   input {d} hz", .{
+            if (frames.sum == 0) 0 else @as(f64, @floatFromInt(frames.count())) * time.ns_per_s / @as(f64, @floatFromInt(frames.sum)),
+            nsToMs(frames.quantile(0.5) orelse 0),
+            nsToMs(frames.quantile(0.99) orelse 0),
+            core.input.rate,
+        });
+    } else {
+        overlay.addLine(overlay.style_normal, "frame {d} fps   input {d} hz", .{ core.frame.rate, core.input.rate });
+    }
     overlay.addLine(overlay.style_normal, "objects: {d} sprites, {d} texts", .{
         // Excluding the overlay's own.
         count(&sprite.objects) - 1, count(&text.objects) - 1,
@@ -164,6 +169,11 @@ pub fn update(
     if (overlay.app_info.len > 0) overlay.addLine(overlay.style_normal, "{s}", .{overlay.app_info});
 
     overlay.addLine(overlay.style_dim, "", .{});
+    if (!metrics.enabled) {
+        overlay.addLine(overlay.style_dim, "memory: off (build with -Dmetrics)", .{});
+        try overlay.applyLines(core, sprite, text);
+        return;
+    }
     overlay.addLine(overlay.style_dim, "memory: used / peak / budget, touched, allocs/s -> suggested budget", .{});
     var stats_buf: [max_modules]mach.ModuleMemory = undefined;
     for (ctx.memoryStats(&stats_buf), 0..) |m, i| {
