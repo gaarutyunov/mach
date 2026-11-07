@@ -223,6 +223,9 @@ frame_ready: std.Io.Event = .unset,
 // Internal module state
 allocator: std.mem.Allocator,
 io: std.Io,
+/// Core's context, for logging from functions which aren't systems (e.g. `initWindow`, called by
+/// the platform backends).
+ctx: mach.Context,
 
 backend_events_mu: std.Io.Mutex = .init,
 backend_events: std.ArrayList(Event) = .empty,
@@ -263,6 +266,7 @@ pub fn init(core: *Core, ctx: mach.Context) !void {
 
         .allocator = allocator,
         .io = io,
+        .ctx = ctx,
         .input_state = .{},
         .render_graph = undefined,
 
@@ -284,6 +288,9 @@ pub fn init(core: *Core, ctx: mach.Context) !void {
 
 /// Caller must hold core.windows.lock
 pub fn initWindow(core: *Core, window_id: mach.ObjectID) !void {
+    var ctx = core.ctx;
+    ctx.system_name = "initWindow";
+    ctx.schedule = .{};
     var core_window = core.windows.getValue(window_id);
     defer core.windows.setValueRaw(window_id, core_window);
 
@@ -306,7 +313,7 @@ pub fn initWindow(core: *Core, window_id: mach.ObjectID) !void {
         core_window.queue = existing.queue;
     } else {
         core_window.instance = gpu.createInstance(null) orelse {
-            log.err("failed to create GPU instance", .{});
+            ctx.err("failed to create GPU instance", .{});
             std.process.exit(1);
         };
 
@@ -317,9 +324,9 @@ pub fn initWindow(core: *Core, window_id: mach.ObjectID) !void {
             .force_fallback_adapter = .false,
         }, &response, requestAdapterCallback);
         if (response.status != .success) {
-            log.err("failed to create GPU adapter: {?s}", .{response.message});
+            ctx.err("failed to create GPU adapter: {?s}", .{response.message});
             if (builtin.target.os.tag == .linux) {
-                log.info("-> maybe try MACH_FORCE_GPU_BACKEND=opengl ?", .{});
+                ctx.info("-> maybe try MACH_FORCE_GPU_BACKEND=opengl ?", .{});
             }
             std.process.exit(1);
         }
@@ -327,10 +334,10 @@ pub fn initWindow(core: *Core, window_id: mach.ObjectID) !void {
         var props = std.mem.zeroes(gpu.Adapter.Properties);
         response.adapter.?.getProperties(&props);
         if (props.backend_type == .null) {
-            log.err("no backend found for {s} adapter", .{props.adapter_type.name()});
+            ctx.err("no backend found for {s} adapter", .{props.adapter_type.name()});
             std.process.exit(1);
         }
-        log.info("found {s} backend on {s} adapter: {s}, {s}\n", .{
+        ctx.info("found {s} backend on {s} adapter: {s}, {s}", .{
             props.backend_type.name(),
             props.adapter_type.name(),
             props.name,
@@ -347,7 +354,7 @@ pub fn initWindow(core: *Core, window_id: mach.ObjectID) !void {
             .device_lost_callback = &deviceLostCallback,
             .device_lost_userdata = null,
         }) orelse {
-            log.err("failed to create GPU device\n", .{});
+            ctx.err("failed to create GPU device", .{});
             std.process.exit(1);
         };
         core_window.device.setUncapturedErrorCallback({}, printUnhandledErrorCallback);

@@ -30,6 +30,9 @@ pub const mach_systems = .{
     .appTick,
     .tick,
     .render,
+    .setupPipeline,
+    .beginFrame,
+    .endFrame,
     .deinit,
 };
 
@@ -86,17 +89,18 @@ pub fn init(
     };
 }
 
-fn setupPipeline(
+pub fn setupPipeline(
     core: *mach.Core,
     app: *App,
     sprite: *gfx.Sprite,
+    ctx: mach.Context,
 ) !void {
+    ctx.schedule.params(RenderParams).needs_setup = false;
     const window = core.windows.getValue(core.window);
 
     // Create a sprite rendering pipeline
     app.pipeline_id = try sprite.pipelines.new(.{
         .window = core.window,
-        .render_pass = undefined,
         .texture = try loadTexture(window.device, window.queue, app.allocator),
     });
 
@@ -213,27 +217,31 @@ pub fn appTick(
     app.anim_time += delta_time;
 }
 
-pub fn render(
-    core: *mach.Core,
-    app: *App,
-    sprite: *gfx.Sprite,
-    sprite_mod: mach.Mod(gfx.Sprite),
-) !void {
-    if (app.pipeline_id == null) {
-        try setupPipeline(core, app, sprite);
-        return;
-    }
+pub const RenderParams = struct {
+    needs_setup: bool = true,
+};
+
+/// Runs on the render thread. Each system takes what it needs from the schedule's context, and
+/// the finalizers of what was put there run when the schedule ends, if not removed before that.
+pub const render = mach.scheduleWith(RenderParams, .{
+    .{ App, .setupPipeline, .needs_setup },
+    .{ App, .beginFrame },
+    .{ gfx.Sprite, .render },
+    .{ App, .endFrame },
+});
+
+pub fn beginFrame(core: *mach.Core, ctx: mach.Context) void {
     const label = @tagName(mach_module) ++ ".render";
     const window = core.windows.getValue(core.window);
 
     // Grab the back buffer of the swapchain
     // TODO(core): this wouldn't exist in browser
-    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return;
-    defer back_buffer_view.release();
+    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return ctx.schedule.stop();
+    ctx.schedule.put(.back_buffer, back_buffer_view, .{.release});
 
     // Create a command encoder
     const encoder = window.device.createCommandEncoder(&.{ .label = label });
-    defer encoder.release();
+    ctx.schedule.put(.encoder, encoder, .{.release});
 
     // Begin render pass
     const sky_blue = gpu.Color{ .r = 0.776, .g = 0.988, .b = 1, .a = 1 };
@@ -247,17 +255,19 @@ pub fn render(
         .label = label,
         .color_attachments = &color_attachments,
     }));
+    ctx.schedule.put(.render_pass, render_pass, .{ .end, .release });
+}
 
-    // Render sprites
-    sprite.pipelines.set(app.pipeline_id.?, .render_pass, render_pass);
-    sprite_mod.call(.render);
+pub fn endFrame(core: *mach.Core, app: *App, ctx: mach.Context) !void {
+    const label = @tagName(mach_module) ++ ".render";
+    const window = core.windows.getValue(core.window);
 
     // Finish render pass
-    render_pass.end();
+    ctx.schedule.remove(.render_pass);
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
     var command = encoder.finish(&.{ .label = label });
     window.queue.submit(&[_]*gpu.CommandBuffer{command});
     command.release();
-    render_pass.release();
 
     {
         core.windows.lock();

@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) !void {
 
     const sysgpu_backend = b.option(SysgpuBackend, "sysgpu_backend", "sysgpu API backend") orelse .default;
     const tracy_enable = b.option(bool, "tracy", "Enable Tracy profiling (system zones, per-module memory, logs)") orelse false;
+    const dev_overlay_enable = b.option(bool, "dev_overlay", "Include the dev overlay (mach.dvx.DevOverlay); defaults to Debug builds only") orelse (optimize == .debug);
     const metrics_enable = b.option(bool, "metrics", "Calculate metrics (mach.dvx.metrics), shown by the dev overlay") orelse false;
 
     const build_examples = b.option(bool, "examples", "build/install examples specifically");
@@ -72,6 +73,7 @@ pub fn build(b: *std.Build) !void {
     build_options.addOption(SysgpuBackend, "sysgpu_backend", sysgpu_backend);
     build_options.addOption(bool, "tracy", tracy_enable);
     build_options.addOption(bool, "metrics", metrics_enable);
+    build_options.addOption(bool, "dev_overlay", dev_overlay_enable);
 
     var examples = [_]Example{
         .{ .name = "core-custom-entrypoint", .deps = &.{} },
@@ -291,6 +293,13 @@ pub fn build(b: *std.Build) !void {
             lib.installHeader(b.path("include/libmach.h"), "libmach.h");
             b.installArtifact(lib);
         }
+    }
+
+    // Static check that GPU resources acquired in a function get released.
+    {
+        const lint = addGpuLint(b, b, &.{ "src/gfx", "src/dvx", "examples", "editor/init-project" });
+        b.step("lint-gpu", "Check that GPU resources get released").dependOn(&lint.step);
+        test_step.dependOn(&lint.step);
     }
 
     if (target.result.cpu.arch != .wasm32) {
@@ -517,6 +526,29 @@ const Dependency = enum {
     zigimg,
 };
 
+/// Adds a run of the GPU resource lint over the given files or directories of `b`, failing the
+/// build on findings. From a project depending on Mach:
+///
+/// ```
+/// const lint = @import("mach").addGpuLint(b, mach_dep.builder, &.{"src"});
+/// b.getInstallStep().dependOn(&lint.step);
+/// ```
+pub fn addGpuLint(b: *std.Build, mach_builder: *std.Build, paths: []const []const u8) *std.Build.Step.Run {
+    const exe = b.addExecutable(.{
+        .name = "mach-gpu-lint",
+        .root_module = b.createModule(.{
+            .root_source_file = mach_builder.path("src/dvx/gpu_lint.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    for (paths) |path| {
+        if (std.mem.endsWith(u8, path, ".zig")) run.addFileArg(b.path(path)) else run.addDirectoryArg(b.path(path));
+    }
+    run.expectExitCode(0);
+    return run;
+}
+
 const Example = struct {
     name: []const u8,
     deps: []const Dependency = &.{},
@@ -543,6 +575,7 @@ pub fn addExecutable(
         },
     );
     entrypoint_mod.addImport("app", options.app);
+    entrypoint_mod.addImport("mach", mach_builder.modules.get("mach").?);
 
     return mach_builder.addExecutable(.{
         .name = options.name,

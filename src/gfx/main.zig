@@ -5,6 +5,11 @@ pub const Atlas = @import("atlas/Atlas.zig");
 pub const Sprite = @import("Sprite.zig");
 pub const Text = @import("Text.zig");
 
+/// Selects which pipelines render into a render pass provided by a schedule: those whose
+/// `render_group` matches the `.render_group` schedule value. Define your own groups with
+/// `@fromBackingInt`.
+pub const RenderGroup = enum(u32) { default = 0, _ };
+
 /// All graphics modules
 pub const modules = .{ Sprite, Text };
 

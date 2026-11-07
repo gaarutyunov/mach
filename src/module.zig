@@ -1,5 +1,4 @@
 const std = @import("std");
-const mach = @import("main.zig");
 const Core = @import("Core.zig");
 const StringTable = @import("StringTable.zig");
 const Graph = @import("graph.zig").Graph;
@@ -8,6 +7,29 @@ const dvx_metrics = @import("dvx/metrics.zig");
 const MeteredAllocator = dvx_metrics.MeteredAllocator;
 const tracy = @import("tracy");
 const build_options = @import("build-options");
+
+pub const Context = @import("module/Context.zig");
+pub const ModuleMemory = Context.ModuleMemory;
+pub const ScheduleContext = @import("module/ScheduleContext.zig");
+
+const objects = @import("module/objects.zig");
+pub const ObjectID = objects.ObjectID;
+pub const ObjectsOptions = objects.ObjectsOptions;
+pub const Objects = objects.Objects;
+
+const schedules = @import("module/schedule.zig");
+pub const schedule = schedules.schedule;
+pub const scheduleWith = schedules.scheduleWith;
+const isScheduleDecl = schedules.isScheduleDecl;
+const ScheduleParamsOf = schedules.ScheduleParamsOf;
+
+const trace = @import("module/trace.zig");
+const SystemTrace = trace.SystemTrace;
+const MemoryPlot = trace.MemoryPlot;
+
+const log = @import("module/log.zig");
+pub const logFn = log.logFn;
+const ContextLog = log.ContextLog;
 
 /// A handle to a spawned thread.
 pub const Thread = struct {
@@ -52,838 +74,6 @@ pub fn initGraph(graph: *Graph, allocator: std.mem.Allocator, io: std.Io, compti
     });
 }
 
-/// Validate that the given tuple is a valid schedule, returning true if so.
-fn validateSchedule(comptime entries: anytype) bool {
-    const Entries = @TypeOf(entries);
-    const entries_info = @typeInfo(Entries);
-    if (entries_info != .@"struct" or !entries_info.@"struct".is_tuple) {
-        @compileError("mach.schedule() expects a tuple of .{ Module, .fn_name } entries, found: " ++ @typeName(Entries));
-    }
-    inline for (entries) |tuple| {
-        const tuple_info = @typeInfo(@TypeOf(tuple));
-        // Check it's a 2-field tuple before accessing fields
-        if (tuple_info != .@"struct" or !tuple_info.@"struct".is_tuple or tuple_info.@"struct".field_names.len != 2) {
-            @compileError("mach.schedule() entry expected tuple .{ Module, .fn_name }, found: " ++ @typeName(@TypeOf(tuple)));
-        }
-        const Module: type = tuple.@"0";
-        const fn_name = tuple.@"1";
-
-        // Validate first field is a valid module type
-        if (!isValid(Module)) {
-            @compileError("mach.schedule() entry first field must be a valid Mach module (has `pub const mach_module = .foo_name`), found: " ++ @typeName(Module));
-        }
-        if (!@hasDecl(Module, "mach_systems")) {
-            @compileError("mach.schedule() entry first field must have a `pub const mach_systems` declaration, found: " ++ @typeName(Module));
-        }
-
-        // Validate second field is an enum literal
-        if (@typeInfo(@TypeOf(fn_name)) != .enum_literal) {
-            @compileError("mach.schedule() entry expected tuple .{ Module, .fn_name }, second value not an enum literal, found: " ++ @typeName(@TypeOf(fn_name)));
-        }
-
-        // Validate function name exists in module's mach_systems
-        if (!@hasField(ModuleFunctionName(Module), @tagName(fn_name))) {
-            @compileError("mach.schedule() entry references ." ++ @tagName(fn_name) ++ " but module " ++ @typeName(Module) ++ " has no such entry in `mach_systems`");
-        }
-    }
-
-    return true;
-}
-
-/// When a schedule is called, the list of module functions described within are executed in order.
-///
-/// Example:
-/// ```
-/// pub const foo = mach.schedule(.{
-///     .{ App, .init },
-///     .{ Physics, .init },
-///     .{ App, .main },
-/// });
-/// ...
-/// my_mod.call(.foo); // runs App.init, Physics.init, App.main in order
-/// ```
-pub fn schedule(entries: anytype) @TypeOf(entries) {
-    _ = comptime validateSchedule(entries);
-    return entries;
-}
-
-/// An ID representing a mach object. This is an opaque identifier which effectively encodes:
-///
-/// * An array index that can be used to O(1) lookup the actual data / struct fields of the object.
-/// * The generation (or 'version') of the object, enabling detecting use-after-free in
-///   many (but not all) cases.
-/// * Which module the object came from, allowing looking up type information or the module name
-///   from ID alone.
-/// * Which list of objects in a module the object came from, allowing looking up type information
-///   or the object type name - which enables debugging and type safety when passing opaque IDs
-///   around.
-///
-pub const ObjectID = u64;
-
-const ObjectTypeID = u16;
-
-pub const ObjectsOptions = struct {
-    /// If set to true, Mach will track when fields are set using the setField/setAll
-    /// methods using a bitset with one bit per field to indicate 'the field was set'.
-    /// You can get this information by calling `.updated(.field_name)`
-    /// Note that calling `.updated(.field_name) will also set the flag back to false.
-    track_fields: bool = false,
-
-    /// When true, delete() will result in a panic indicating that objects in this list must be
-    /// explicitly free()'d instead.
-    require_free: bool = false,
-};
-
-pub fn Objects(options: ObjectsOptions, comptime T: type) type {
-    // MultiArrayList doesn't support zero-field structs, so add a dummy field to make it work.
-    // TODO(object): avoid constructing MultiArrayList entirely in this case?
-    const has_fields = @typeInfo(T).@"struct".field_names.len > 0;
-    const StorageT = if (has_fields) T else struct { _padding: u0 = 0 };
-
-    return struct {
-        internal: struct {
-            allocator: std.mem.Allocator,
-            io: std.Io,
-
-            /// Mutex to be held when operating on these objects.
-            mu: std.Io.RwLock = .init,
-
-            /// A registered ID indicating the type of objects being represented. This can be
-            /// thought of as a hash of the module name + field name where this objects list is
-            /// stored.
-            type_id: ObjectTypeID,
-
-            /// The actual object data
-            data: std.MultiArrayList(StorageT) = .empty,
-
-            /// Whether a given slot in data[i] has been freed or not
-            freed: std.bit_set.DynamicBitSetUnmanaged = .{},
-
-            /// Whether a given slot in data[i] is marked for pending deletion
-            pending_delete: std.bit_set.DynamicBitSetUnmanaged = .{},
-
-            /// The current generation number of data[i], when data[i] becomes freed and then alive
-            /// again, this number is incremented by one.
-            generation: std.ArrayList(Generation) = .empty,
-
-            /// The recycling bin which tells which data indices are freed and can be reused.
-            recycling_bin: std.ArrayList(Index) = .empty,
-
-            /// The number of objects that could not fit in the recycling bin and hence were thrown
-            /// on the floor and forgotten about. This means there are freed items recorded by freed.set(index)
-            /// which aren't in the recycling_bin, and the next call to new() may consider cleaning up.
-            thrown_on_the_floor: u32 = 0,
-
-            /// Global pointer to object relations graph
-            graph: *Graph,
-
-            /// A bitset used to track per-field changes. Only used if options.track_fields == true.
-            updated: ?std.bit_set.DynamicBitSetUnmanaged = if (options.track_fields) .{} else null,
-
-            /// Tags storage
-            tags: std.AutoHashMapUnmanaged(TaggedObject, ?ObjectID) = .{},
-        },
-
-        pub const IsMachObjects = void;
-
-        fn toStorage(value: T) StorageT {
-            if (has_fields) return value else return .{};
-        }
-
-        fn fromStorage(value: StorageT) T {
-            if (has_fields) return value else return .{};
-        }
-
-        const Generation = u16;
-        const Index = u32;
-
-        const TaggedObject = struct {
-            object_id: ObjectID,
-            tag_hash: u64,
-        };
-
-        const PackedID = packed struct(u64) {
-            type_id: ObjectTypeID,
-            generation: Generation,
-            index: Index,
-        };
-
-        pub const Slice = struct {
-            index: Index,
-            objs: *Objects(options, T),
-
-            pub fn next(s: *Slice) ?ObjectID {
-                const freed = &s.objs.internal.freed;
-                const generation = &s.objs.internal.generation;
-                const num_objects = generation.items.len;
-
-                while (true) {
-                    if (s.index == num_objects) {
-                        s.index = 0;
-                        return null;
-                    }
-                    defer s.index += 1;
-
-                    if (!freed.isSet(s.index) and !s.objs.internal.pending_delete.isSet(s.index)) return @bitCast(PackedID{
-                        .type_id = s.objs.internal.type_id,
-                        .generation = generation.items[s.index],
-                        .index = s.index,
-                    });
-                }
-            }
-        };
-
-        /// Tries to acquire the mutex without blocking the caller's thread.
-        /// Returns `false` if the calling thread would have to block to acquire it.
-        /// Otherwise, returns `true` and the caller should `unlock()` the Mutex to release it.
-        pub fn tryLock(objs: *@This()) bool {
-            return objs.internal.mu.tryLock(objs.internal.io);
-        }
-
-        /// Acquires the mutex, blocking the caller's thread until it can.
-        /// It is undefined behavior if the mutex is already held by the caller's thread.
-        /// Once acquired, call `unlock()` on the Mutex to release it.
-        pub fn lock(objs: *@This()) void {
-            objs.internal.mu.lockUncancelable(objs.internal.io);
-        }
-
-        /// Releases the mutex which was previously acquired with `lock()` or `tryLock()`.
-        /// It is undefined behavior if the mutex is unlocked from a different thread that it was locked from.
-        pub fn unlock(objs: *@This()) void {
-            objs.internal.mu.unlock(objs.internal.io);
-        }
-
-        /// Tries to acquire a shared (read) lock without blocking the caller's thread.
-        ///
-        /// Returns `false` if the calling thread would have to block to acquire it.
-        /// Otherwise, returns `true` and the caller should call `unlockShared()` to release it.
-        pub fn tryLockShared(objs: *@This()) bool {
-            return objs.internal.mu.tryLockShared(objs.internal.io);
-        }
-
-        /// Acquires a shared (read) lock, blocking the caller's thread until it can.
-        /// Multiple readers may hold the lock concurrently, but no writer may hold it while readers
-        /// do.
-        /// Once acquired, call `unlockShared()` on the Mutex to release it.
-        pub fn lockShared(objs: *@This()) void {
-            objs.internal.mu.lockSharedUncancelable(objs.internal.io);
-        }
-
-        /// Releases the shared (reader) lock which was previously acquired with `lockShared()` or
-        /// `tryLockShared()`.
-        pub fn unlockShared(objs: *@This()) void {
-            objs.internal.mu.unlockShared(objs.internal.io);
-        }
-
-        pub fn new(objs: *@This(), value: T) std.mem.Allocator.Error!ObjectID {
-            const allocator = objs.internal.allocator;
-            const data = &objs.internal.data;
-            const freed = &objs.internal.freed;
-            const pending_delete = &objs.internal.pending_delete;
-            const generation = &objs.internal.generation;
-            const recycling_bin = &objs.internal.recycling_bin;
-
-            // The recycling bin should always be big enough, but we check at this point if 10% of
-            // all objects have been thrown on the floor. If they have, we find them and grow the
-            // recycling bin to fit them.
-            if (objs.internal.thrown_on_the_floor >= (data.len / 10)) {
-                var iter = freed.iterator(.{ .kind = .set });
-                freed_object_loop: while (iter.next()) |index| {
-                    // We need to check if this index is already in the recycling bin since
-                    // if it is, it could get recycled a second time while still
-                    // in use.
-                    for (recycling_bin.items) |recycled_index| {
-                        if (index == recycled_index) continue :freed_object_loop;
-                    }
-
-                    // freed bitset contains data.capacity number of entries, we only care about ones that are in data.len range.
-                    if (index > data.len - 1) break;
-                    try recycling_bin.append(allocator, @intCast(index));
-                }
-                objs.internal.thrown_on_the_floor = 0;
-            }
-
-            if (recycling_bin.pop()) |index| {
-                // Reuse a free slot from the recycling bin.
-                freed.unset(index);
-                pending_delete.unset(index);
-                const gen = generation.items[index] + 1;
-                generation.items[index] = gen;
-                data.set(index, toStorage(value));
-                return @bitCast(PackedID{
-                    .type_id = objs.internal.type_id,
-                    .generation = gen,
-                    .index = index,
-                });
-            }
-
-            // Ensure we have space for the new object
-            try data.ensureUnusedCapacity(allocator, 1);
-            try freed.resize(allocator, data.capacity, false);
-            try pending_delete.resize(allocator, data.capacity, false);
-            try generation.ensureUnusedCapacity(allocator, 1);
-
-            // If we are tracking fields, we need to resize the bitset to hold another object's fields
-            if (objs.internal.updated) |*updated_fields| {
-                try updated_fields.resize(allocator, data.capacity * @typeInfo(T).@"struct".field_names.len, true);
-            }
-
-            const index = data.len;
-            data.appendAssumeCapacity(toStorage(value));
-            freed.unset(index);
-            generation.appendAssumeCapacity(0);
-
-            return @bitCast(PackedID{
-                .type_id = objs.internal.type_id,
-                .generation = 0,
-                .index = @intCast(index),
-            });
-        }
-
-        /// Frees all memory owned by this list. Called by `Modules.deinit()`; object IDs from this
-        /// list are invalid afterwards.
-        pub fn deinit(objs: *@This()) void {
-            const allocator = objs.internal.allocator;
-            objs.internal.data.deinit(allocator);
-            objs.internal.freed.deinit(allocator);
-            objs.internal.pending_delete.deinit(allocator);
-            objs.internal.generation.deinit(allocator);
-            objs.internal.recycling_bin.deinit(allocator);
-            if (objs.internal.updated) |*updated_fields| updated_fields.deinit(allocator);
-            objs.internal.tags.deinit(allocator);
-        }
-
-        /// Preallocates storage for at least `new_capacity` objects (live or freed), so that
-        /// `new()` and `free()` do not allocate until that many slots are in use.
-        pub fn ensureTotalCapacity(objs: *@This(), new_capacity: usize) std.mem.Allocator.Error!void {
-            const allocator = objs.internal.allocator;
-            const data = &objs.internal.data;
-
-            try data.ensureTotalCapacity(allocator, new_capacity);
-            try objs.internal.freed.resize(allocator, data.capacity, false);
-            try objs.internal.pending_delete.resize(allocator, data.capacity, false);
-            try objs.internal.generation.ensureTotalCapacity(allocator, data.capacity);
-            try objs.internal.recycling_bin.ensureTotalCapacity(allocator, data.capacity);
-            if (objs.internal.updated) |*updated_fields| {
-                try updated_fields.resize(allocator, data.capacity * @typeInfo(T).@"struct".field_names.len, true);
-            }
-        }
-
-        /// Sets all fields of the given object to the given value.
-        ///
-        /// Unlike setAll(), this method does not respect any mach.Objects tracking
-        /// options, so changes made to an object through this method will not be tracked.
-        pub fn setValueRaw(objs: *@This(), id: ObjectID, value: T) void {
-            const data = &objs.internal.data;
-
-            const unpacked = objs.validateAndUnpack(id, "setValueRaw");
-            data.set(unpacked.index, toStorage(value));
-        }
-
-        /// Sets all fields of the given object to the given value.
-        ///
-        /// Unlike setAllRaw, this method respects mach.Objects tracking
-        /// and changes made to an object through this method will be tracked.
-        pub fn setValue(objs: *@This(), id: ObjectID, value: T) void {
-            const data = &objs.internal.data;
-
-            const unpacked = objs.validateAndUnpack(id, "setValue");
-            data.set(unpacked.index, toStorage(value));
-
-            if (objs.internal.updated) |*updated_fields| {
-                const updated_start = unpacked.index * @typeInfo(T).@"struct".field_names.len;
-                const updated_end = updated_start + @typeInfo(T).@"struct".field_names.len;
-                updated_fields.setRangeValue(.{ .start = @intCast(updated_start), .end = @intCast(updated_end) }, true);
-            }
-        }
-
-        /// Sets a single field of the given object to the given value.
-        ///
-        /// Unlike set(), this method does not respect any mach.Objects tracking
-        /// options, so changes made to an object through this method will not be tracked.
-        pub fn setRaw(objs: *@This(), id: ObjectID, comptime field_name: std.meta.FieldEnum(T), value: @FieldType(T, @tagName(field_name))) void {
-            const data = &objs.internal.data;
-            const unpacked = objs.validateAndUnpack(id, "setRaw");
-
-            data.items(field_name)[unpacked.index] = value;
-        }
-
-        /// Sets a single field of the given object to the given value.
-        ///
-        /// Unlike setAllRaw, this method respects mach.Objects tracking
-        /// and changes made to an object through this method will be tracked.
-        pub fn set(objs: *@This(), id: ObjectID, comptime field_name: std.meta.FieldEnum(T), value: @FieldType(T, @tagName(field_name))) void {
-            const data = &objs.internal.data;
-            const unpacked = objs.validateAndUnpack(id, "set");
-
-            data.items(field_name)[unpacked.index] = value;
-
-            if (options.track_fields)
-                if (std.meta.fieldIndex(T, @tagName(field_name))) |field_index|
-                    if (objs.internal.updated) |*updated_fields|
-                        updated_fields.set(unpacked.index * @typeInfo(T).@"struct".field_names.len + field_index);
-        }
-
-        /// Get a single field.
-        pub fn get(objs: *@This(), id: ObjectID, comptime field_name: std.meta.FieldEnum(T)) @FieldType(T, @tagName(field_name)) {
-            const data = &objs.internal.data;
-
-            const unpacked = objs.validateAndUnpack(id, "get");
-            return data.items(field_name)[unpacked.index];
-        }
-
-        /// Get all fields.
-        pub fn getValue(objs: *@This(), id: ObjectID) T {
-            const data = &objs.internal.data;
-
-            const unpacked = objs.validateAndUnpack(id, "getValue");
-            return fromStorage(data.get(unpacked.index));
-        }
-
-        /// Returns an iterator over a single field of every live object, in the same order that
-        /// `slice()` yields their IDs. Excludes any objects which have been freed or marked for
-        /// deletion.
-        pub fn sliceField(objs: *@This(), comptime field_name: std.meta.FieldEnum(T)) SliceField(field_name) {
-            // Sync any cascaded deletions that may have occurred prior to this so our
-            // pending_delete bits are up to date.
-            objs.internal.graph.sync(objs.internal.allocator) catch {};
-
-            return .{ .index = 0, .objs = objs };
-        }
-
-        pub fn SliceField(comptime field_name: std.meta.FieldEnum(T)) type {
-            return struct {
-                index: Index,
-                objs: *Objects(options, T),
-
-                pub fn next(s: *@This()) ?@FieldType(T, @tagName(field_name)) {
-                    const freed = &s.objs.internal.freed;
-                    const pending_delete = &s.objs.internal.pending_delete;
-                    const num_objects = s.objs.internal.generation.items.len;
-
-                    while (true) {
-                        if (s.index == num_objects) {
-                            s.index = 0;
-                            return null;
-                        }
-                        defer s.index += 1;
-
-                        if (!freed.isSet(s.index) and !pending_delete.isSet(s.index)) {
-                            // Re-fetched each call: new() may reallocate the column mid-iteration.
-                            return s.objs.internal.data.items(field_name)[s.index];
-                        }
-                    }
-                }
-            };
-        }
-
-        /// Marks an object for deletion. The object is flagged for deletion, it remains alive and
-        /// readable until someone, usually the owning module that knows how to cleanup its
-        /// resources, invokes `free()` on it.
-        ///
-        /// Deletion is cascaded to all descendants in the object graph, marking them as deleted too
-        ///
-        /// Use `isDeleted()` to check if an object has been deleted but not yet freed, or
-        /// `sliceDeleted()` to iterate all deleted objects from the set.
-        ///
-        /// If `require_free = true`, it is a @compileError to invoke this method on the set and
-        /// free() must be used instead.
-        pub fn delete(objs: *@This(), id: ObjectID) void {
-            if (options.require_free) @compileError("delete() cannot be used when require_free is set; use free() instead");
-            const unpacked = objs.validateAndUnpack(id, "delete");
-            objs.internal.pending_delete.set(unpacked.index);
-
-            // Enqueue the cascaded delete to all descendants in the graph.
-            // TODO(object): better error handling here
-            objs.internal.graph.cascadeDelete(objs.internal.allocator, id) catch {};
-        }
-
-        /// Immediately removes an object from the pool, freeing its slot for reuse.
-        ///
-        /// Freeing an object also removes its parent object in the graph, if any.
-        ///
-        /// In order to free an object, you must know how to release its resources - including graph
-        /// resources. If `require_free = true`, then an object is declared as requiring manual
-        /// `free()`.
-        ///
-        /// If `require_free = false`, you should use `delete()` instead which doesn't require
-        /// knowing how to free the objects resources - by allowing the module that owns the object
-        /// to release them later (by ultimately calling `free()` itself) instead.
-        ///
-        /// In debug builds, calling free() on an object which has children in the graph results in
-        /// a panic.
-        pub fn free(objs: *@This(), id: ObjectID) void {
-            const unpacked = objs.validateAndUnpack(id, "free");
-            const data = &objs.internal.data;
-            const freed = &objs.internal.freed;
-            const recycling_bin = &objs.internal.recycling_bin;
-            if (recycling_bin.items.len < recycling_bin.capacity) {
-                recycling_bin.appendAssumeCapacity(unpacked.index);
-            } else objs.internal.thrown_on_the_floor += 1;
-
-            freed.set(unpacked.index);
-            objs.internal.pending_delete.unset(unpacked.index);
-
-            // Enqueue our parents' removal from the graph
-            objs.internal.graph.removeParent(objs.internal.allocator, id) catch {};
-
-            if (mach.is_debug) {
-                const undef: StorageT = undefined;
-                data.set(unpacked.index, undef);
-            }
-        }
-
-        /// Returns an iterator over objects marked for deletion.
-        ///
-        /// Used by modules to find objects that need to cleanup resources on objects before
-        /// ultimately calling free() on each object.
-        pub fn sliceDeleted(objs: *@This()) SliceDeleted {
-            // Sync any cascaded deletions that may have occurred prior to this so our
-            // pending_delete bits are up to date.
-            objs.internal.graph.sync(objs.internal.allocator) catch {};
-
-            return .{ .index = 0, .objs = objs };
-        }
-
-        pub const SliceDeleted = struct {
-            index: Index,
-            objs: *Objects(options, T),
-
-            pub fn next(s: *SliceDeleted) ?ObjectID {
-                const pending = &s.objs.internal.pending_delete;
-                const generation = &s.objs.internal.generation;
-                const num_objects = generation.items.len;
-
-                while (true) {
-                    if (s.index == num_objects) {
-                        s.index = 0;
-                        return null;
-                    }
-                    defer s.index += 1;
-
-                    if (pending.isSet(s.index)) return @bitCast(PackedID{
-                        .type_id = s.objs.internal.type_id,
-                        .generation = generation.items[s.index],
-                        .index = s.index,
-                    });
-                }
-            }
-        };
-
-        /// Returns true if the object has been marked for deferred deletion.
-        ///
-        /// Calling this on an object which has been free()'d already is illegal and will result in
-        /// undefined behavior in production builds, and a safety-check panic in debug builds.
-        pub fn isDeleted(objs: *const @This(), id: ObjectID) bool {
-            const unpacked = objs.validateAndUnpack(id, "isDeleted");
-
-            // Sync any cascaded deletions that may have occurred prior to this so our
-            // pending_delete bits are up to date.
-            objs.internal.graph.sync(objs.internal.allocator) catch {};
-
-            return objs.internal.pending_delete.isSet(unpacked.index);
-        }
-
-        /// Returns the number of objects currently marked for deferred deletion.
-        pub fn numDeleted(objs: *const @This()) u32 {
-            // Sync any cascaded deletions that may have occurred prior to this so our
-            // pending_delete bits are up to date.
-            objs.internal.graph.sync(objs.internal.allocator) catch {};
-
-            return @intCast(objs.internal.pending_delete.count());
-        }
-
-        // TODO(objects): evaluate whether tag operations should ever return an error
-
-        /// Sets a tag on an object
-        pub fn setTag(objs: *@This(), id: ObjectID, comptime M: type, tag: ModuleTagEnum(M), value_id: ?ObjectID) !void {
-            _ = objs.validateAndUnpack(id, "setTag");
-
-            // TODO: validate that value_id is an object coming from the mach.Objects(T) list indicated by the tag value in M.mach_tags.
-            //const value_mach_objects = moduleTagValueObjects(M, tag);
-
-            const tagged = TaggedObject{
-                .object_id = id,
-                .tag_hash = std.hash.Wyhash.hash(0, @tagName(tag)),
-            };
-            try objs.internal.tags.put(objs.internal.allocator, tagged, value_id);
-        }
-
-        /// Removes a tag on an object
-        pub fn removeTag(objs: *@This(), id: ObjectID, comptime M: type, tag: ModuleTagEnum(M)) void {
-            _ = objs.validateAndUnpack(id, "removeTag");
-            const tagged = TaggedObject{
-                .object_id = id,
-                .tag_hash = std.hash.Wyhash.hash(0, @tagName(tag)),
-            };
-            _ = objs.internal.tags.remove(tagged);
-        }
-
-        /// Whether an object has a tag
-        pub fn hasTag(objs: *@This(), id: ObjectID, comptime M: type, tag: ModuleTagEnum(M)) bool {
-            _ = objs.validateAndUnpack(id, "hasTag");
-            const tagged = TaggedObject{
-                .object_id = id,
-                .tag_hash = std.hash.Wyhash.hash(0, @tagName(tag)),
-            };
-            return objs.internal.tags.contains(tagged);
-        }
-
-        /// Get an object's tag value, or null.
-        pub fn getTag(objs: *@This(), id: ObjectID, comptime M: type, tag: ModuleTagEnum(M)) ?mach.ObjectID {
-            _ = objs.validateAndUnpack(id, "getTag");
-            const tagged = TaggedObject{
-                .object_id = id,
-                .tag_hash = std.hash.Wyhash.hash(0, @tagName(tag)),
-            };
-            return objs.internal.tags.get(tagged) orelse null;
-        }
-
-        /// Returns an iterator over all live objects. Excludes any objects which have been freed
-        /// or marked for deletion.
-        pub fn slice(objs: *@This()) Slice {
-            // Sync any cascaded deletions that may have occurred prior to this so our
-            // pending_delete bits are up to date.
-            objs.internal.graph.sync(objs.internal.allocator) catch {};
-
-            return Slice{
-                .index = 0,
-                .objs = objs,
-            };
-        }
-
-        /// Validates the given object is from this list (type check) and alive (not a use after free
-        /// situation.)
-        fn validateAndUnpack(objs: *const @This(), id: ObjectID, comptime fn_name: []const u8) PackedID {
-            const freed = &objs.internal.freed;
-            const generation = &objs.internal.generation;
-
-            // TODO(object): decide whether to disable safety checks like this in some conditions,
-            // e.g. in release builds
-            const unpacked: PackedID = @bitCast(id);
-            if (unpacked.type_id != objs.internal.type_id) {
-                @panic("mach: " ++ fn_name ++ "() called with object not from this list");
-            }
-            if (unpacked.generation != generation.items[unpacked.index]) {
-                @panic("mach: " ++ fn_name ++ "() called with a freed object (use after free, recycled slot)");
-            }
-            if (freed.isSet(unpacked.index)) {
-                @panic("mach: " ++ fn_name ++ "() called with a freed object (use after free)");
-            }
-            return unpacked;
-        }
-
-        /// If options have tracking enabled, this returns true when the given field has been set
-        /// using the set() or setAll() methods. A subsequent call to .updated(), .anyUpdated(), etc.
-        /// will return false until another set() or setAll() call is made.
-        pub fn updated(objs: *@This(), id: ObjectID, field_name: anytype) bool {
-            return objs.updatedOptions(id, field_name, false);
-        }
-
-        /// Same as updated(), but doesn't alter the behavior of subsequent .updated(), .anyUpdated(),
-        /// etc. calls
-        pub fn peekUpdated(objs: *@This(), id: ObjectID, field_name: anytype) bool {
-            return objs.updatedOptions(id, field_name, true);
-        }
-
-        inline fn updatedOptions(objs: *@This(), id: ObjectID, field_name: anytype, comptime peek: bool) bool {
-            if (!options.track_fields) return false;
-            const unpacked = objs.validateAndUnpack(id, "updated");
-            const field_index = std.meta.fieldIndex(T, @tagName(field_name)).?;
-            const updated_fields = &(objs.internal.updated orelse return false);
-            const updated_index = unpacked.index * @typeInfo(T).@"struct".field_names.len + field_index;
-            const updated_value = updated_fields.isSet(updated_index);
-            if (!peek) updated_fields.unset(updated_index);
-            return updated_value;
-        }
-
-        /// If options have tracking enabled, this returns true when any field has been set using
-        /// the set() or setAll() methods. A subsequent call to .updated(), .anyUpdated(), etc. will
-        /// return false until another set() or setAll() call is made.
-        pub fn anyUpdated(objs: *@This(), id: ObjectID) bool {
-            return objs.anyUpdatedOptions(id, false);
-        }
-
-        /// Same as anyUpdated(), but doesn't alter the behavior of subsequent .updated(), .anyUpdated(),
-        /// etc. calls
-        pub fn peekAnyUpdated(objs: *@This(), id: ObjectID) bool {
-            return objs.anyUpdatedOptions(id, true);
-        }
-
-        inline fn anyUpdatedOptions(objs: *@This(), id: ObjectID, comptime peek: bool) bool {
-            if (!options.track_fields) return false;
-            const unpacked = objs.validateAndUnpack(id, "updated");
-            const updated_fields = &(objs.internal.updated orelse return false);
-            var any_updated = false;
-            inline for (0..@typeInfo(T).@"struct".field_names.len) |field_index| {
-                const updated_index = unpacked.index * @typeInfo(T).@"struct".field_names.len + field_index;
-                const updated_value = updated_fields.isSet(updated_index);
-                if (!peek) updated_fields.unset(updated_index);
-                if (updated_value) any_updated = true;
-            }
-            return any_updated;
-        }
-
-        /// Tells if the given object is from this pool of objects. If it is, then it must also be
-        /// alive/valid or else a panic will occur.
-        pub fn is(objs: *const @This(), id: ObjectID) bool {
-            const unpacked: PackedID = @bitCast(id);
-            if (unpacked.type_id != objs.internal.type_id) return false;
-            _ = objs.validateAndUnpack(id, "is");
-            return true;
-        }
-
-        /// Get the parent of the child, or null.
-        ///
-        /// Object relations may cross the object-pool boundary; for example the parent or child of
-        /// an object in this pool may not itself be in this pool. It might be from a different
-        /// pool and a different type of object.
-        pub fn getParent(objs: *@This(), id: ObjectID) !?ObjectID {
-            return objs.internal.graph.getParent(objs.internal.allocator, id);
-        }
-
-        /// Set the parent of the child, or no-op if already the case.
-        ///
-        /// Object relations may cross the object-pool boundary; for example the parent or child of
-        /// an object in this pool may not itself be in this pool. It might be from a different
-        /// pool and a different type of object.
-        pub fn setParent(objs: *@This(), id: ObjectID, parent: ?ObjectID) !void {
-            try objs.internal.graph.setParent(objs.internal.allocator, id, parent orelse return objs.internal.graph.removeParent(objs.internal.allocator, id));
-        }
-
-        /// Get the children of the parent; returning a results.items slice which is read-only.
-        /// Call results.deinit() when you are done to return memory to the graph's memory pool for
-        /// reuse later.
-        ///
-        /// Object relations may cross the object-pool boundary; for example the parent or child of
-        /// an object in this pool may not itself be in this pool. It might be from a different
-        /// pool and a different type of object.
-        pub fn getChildren(objs: *@This(), id: ObjectID) !Graph.Results {
-            return objs.internal.graph.getChildren(objs.internal.allocator, id);
-        }
-
-        /// Add the given child to the parent, or no-op if already the case.
-        ///
-        /// Object relations may cross the object-pool boundary; for example the parent or child of
-        /// an object in this pool may not itself be in this pool. It might be from a different
-        /// pool and a different type of object.
-        pub fn addChild(objs: *@This(), id: ObjectID, child: ObjectID) !void {
-            return objs.internal.graph.addChild(objs.internal.allocator, id, child);
-        }
-
-        /// Remove the given child from the parent, or no-op if not the case.
-        ///
-        /// Object relations may cross the object-pool boundary; for example the parent or child of
-        /// an object in this pool may not itself be in this pool. It might be from a different
-        /// pool and a different type of object.
-        pub fn removeChild(objs: *@This(), id: ObjectID, child: ObjectID) !void {
-            return objs.internal.graph.removeChild(objs.internal.allocator, id, child);
-        }
-
-        /// Copies all object data from src into this Objects instance.
-        ///
-        /// All objects' fields are copied (not a deep copy, so beware of pointer fields!)
-        ///
-        /// src.graph is not copied, and dst.graph is not modified. Tags are copied. Note that
-        /// tags and the graph store object IDs, effectively array indices, not object pointers
-        /// or values. The pending_delete bitset is copied (which objects are deleted but not freed)
-        /// but is not registered with src.graph or dst.graph for future cascading deletes.
-        ///
-        /// The copy is optimized for speed rather than memory efficiency, operating under the
-        /// assumption that the objects to be copied may be frequently copied from src to dst.
-        /// For example, freed to-be-recycled objects are copied too rather than being garbage
-        /// collected during the copy process. Additional capacity in arrays is also mirrored
-        /// rather than resizing to fit only what is needed, under the assumption that capacity
-        /// may be needed in the next copy.
-        pub fn copyFrom(dst: *@This(), src: *const @This()) std.mem.Allocator.Error!void {
-            // allocator, io, and mu fields are not copied.
-            const allocator = dst.internal.allocator;
-
-            // copy type_id
-            dst.internal.type_id = src.internal.type_id;
-
-            // copy data
-            const src_len = src.internal.data.len;
-            try dst.internal.data.ensureTotalCapacity(allocator, src.internal.data.capacity);
-            dst.internal.data.len = src_len;
-            if (has_fields) {
-                const src_slice = src.internal.data.slice();
-                const dst_slice = dst.internal.data.slice();
-                inline for (0..@typeInfo(StorageT).@"struct".field_names.len) |i| {
-                    const field_tag: std.meta.FieldEnum(StorageT) = @fromBackingInt(@intCast(i));
-                    @memcpy(dst_slice.items(field_tag)[0..src_len], src_slice.items(field_tag)[0..src_len]);
-                }
-            }
-
-            // copy freed
-            try dst.internal.freed.resize(allocator, src.internal.freed.bit_length, false);
-            const MaskInt = std.bit_set.DynamicBitSetUnmanaged.MaskInt;
-            const freed_masks = (src.internal.freed.bit_length + @bitSizeOf(MaskInt) - 1) / @bitSizeOf(MaskInt);
-            if (freed_masks > 0) {
-                @memcpy(dst.internal.freed.masks[0..freed_masks], src.internal.freed.masks[0..freed_masks]);
-            }
-
-            // Sync any cascaded deletions that may have occurred prior to this so our
-            // pending_delete bits are up to date.
-            src.internal.graph.sync(src.internal.allocator) catch {};
-
-            try dst.internal.pending_delete.resize(allocator, src.internal.pending_delete.bit_length, false);
-            const pd_masks = (src.internal.pending_delete.bit_length + @bitSizeOf(MaskInt) - 1) / @bitSizeOf(MaskInt);
-            if (pd_masks > 0) {
-                @memcpy(dst.internal.pending_delete.masks[0..pd_masks], src.internal.pending_delete.masks[0..pd_masks]);
-            }
-
-            // copy generation
-            try dst.internal.generation.ensureTotalCapacity(allocator, src.internal.generation.capacity);
-            dst.internal.generation.items.len = src_len;
-            if (src_len > 0) {
-                @memcpy(dst.internal.generation.items[0..src_len], src.internal.generation.items[0..src_len]);
-            }
-
-            // copy recycling_bin
-            try dst.internal.recycling_bin.ensureTotalCapacity(allocator, src.internal.recycling_bin.capacity);
-            dst.internal.recycling_bin.items.len = src.internal.recycling_bin.items.len;
-            if (src.internal.recycling_bin.items.len > 0) {
-                @memcpy(dst.internal.recycling_bin.items, src.internal.recycling_bin.items);
-            }
-
-            // copy thrown_on_the_floor
-            dst.internal.thrown_on_the_floor = src.internal.thrown_on_the_floor;
-
-            // copy updated
-            if (options.track_fields) {
-                if (src.internal.updated) |src_updated| {
-                    try dst.internal.updated.?.resize(allocator, src_updated.bit_length, false);
-                    const updated_masks = (src_updated.bit_length + @bitSizeOf(MaskInt) - 1) / @bitSizeOf(MaskInt);
-                    if (updated_masks > 0) {
-                        @memcpy(dst.internal.updated.?.masks[0..updated_masks], src_updated.masks[0..updated_masks]);
-                    }
-                }
-            }
-
-            // copy tags
-            dst.internal.tags.clearRetainingCapacity();
-            try dst.internal.tags.ensureTotalCapacity(allocator, src.internal.tags.capacity());
-            var tag_iter = src.internal.tags.iterator();
-            while (tag_iter.next()) |entry| {
-                dst.internal.tags.putAssumeCapacity(entry.key_ptr.*, entry.value_ptr.*);
-            }
-        }
-
-        /// Queries the children of the given object ID (which may be any object, including one not
-        /// in this list of objects - and finds the first child which would be from this list of
-        /// objects.
-        pub fn getFirstChildOfType(objs: *@This(), id: ObjectID) !?ObjectID {
-            var children = try objs.getChildren(id);
-            defer children.deinit();
-            for (children.items) |child_id| {
-                if (objs.is(child_id)) return child_id;
-            }
-            return null;
-        }
-    };
-}
-
 /// Unique identifier for every module in the program, including those only known at runtime.
 pub const ModuleID = u32;
 
@@ -893,144 +83,8 @@ pub const ModuleFunctionID = u16;
 /// Unique identifier for a function within a module, including those only known at runtime.
 pub const FunctionID = struct { module_id: ModuleID, fn_id: ModuleFunctionID };
 
-/// Per-module context given to systems which declare a `mach.Context` parameter:
-///
-/// ```
-/// pub fn init(app: *App, ctx: mach.Context) !void {
-///     app.items = try std.ArrayList(Item).initCapacity(ctx.allocator, 64);
-///     ctx.info("reserved {d} items", .{app.items.capacity});
-/// }
-/// ```
-///
-/// Logging through the context uses the module name as the `std.log` scope (so it can be
-/// filtered per module with `std_options.log_scope_levels`) and prefixes the running system:
-///
-/// ```
-/// info(app): [init] reserved 64 items
-/// ```
-///
-/// When built with `-Dtracy`, every system run is a Tracy zone named `module.system`, each
-/// module's allocator is tracked as a named Tracy memory pool, and context log messages are
-/// also sent to Tracy (colored by level).
-pub const Context = struct {
-    /// This module's allocator: its pool if it has a budget (`InitOptions.budgets`), its override
-    /// (`InitOptions.allocators`), or else the global allocator passed to `Modules.init`.
-    /// With `-Dtracy`, wrapped in a `tracy.TracingAllocator` named after the module.
-    allocator: std.mem.Allocator,
-
-    io: std.Io,
-
-    /// This module's memory pool, if it was given a budget in `InitOptions.budgets`.
-    pool: ?*PoolAllocator,
-
-    /// The name of the module whose system is running, e.g. "mach_gfx_sprite".
-    module_name: []const u8,
-
-    /// The name of the system being run, e.g. "init". Empty for a context obtained outside of a
-    /// system via `Modules.context()`.
-    system_name: []const u8 = "",
-
-    _modules: *anyopaque,
-    _report_memory: *const fn (modules: *anyopaque) void,
-    _memory_stats: *const fn (modules: *anyopaque, out: []ModuleMemory) []ModuleMemory,
-    _log: *const fn (level: std.log.Level, system_name: []const u8, msg: []const u8) void,
-    _log_enabled: *const fn (level: std.log.Level) bool,
-
-    /// Logs usage and high-water mark of every module's memory pool.
-    pub fn reportMemory(ctx: Context) void {
-        ctx._report_memory(ctx._modules);
-    }
-
-    /// Fills `out` with a memory snapshot of every module (up to `out.len` of them) and returns
-    /// the filled part. Lock-free, so it can be called from any thread, e.g. every frame.
-    pub fn memoryStats(ctx: Context, out: []ModuleMemory) []ModuleMemory {
-        return ctx._memory_stats(ctx._modules, out);
-    }
-
-    /// Messages longer than this are truncated.
-    pub const max_log_len = 1024;
-
-    /// Logs a message scoped to this module and prefixed with the running system's name.
-    pub fn log(ctx: Context, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
-        if (!ctx._log_enabled(level)) return;
-        var buf: [max_log_len]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        w.print(format, args) catch {};
-        ctx._log(level, ctx.system_name, w.buffered());
-    }
-
-    pub fn err(ctx: Context, comptime format: []const u8, args: anytype) void {
-        ctx.log(.err, format, args);
-    }
-
-    pub fn warn(ctx: Context, comptime format: []const u8, args: anytype) void {
-        ctx.log(.warn, format, args);
-    }
-
-    pub fn info(ctx: Context, comptime format: []const u8, args: anytype) void {
-        ctx.log(.info, format, args);
-    }
-
-    pub fn debug(ctx: Context, comptime format: []const u8, args: anytype) void {
-        ctx.log(.debug, format, args);
-    }
-};
-
-/// A module's memory usage, see `Context.memoryStats`. Usage reads as zero without `-Dmetrics`.
-pub const ModuleMemory = struct {
-    /// The module's name, e.g. "mach_gfx_sprite".
-    name: []const u8,
-    /// What the module allocated: from its pool, or from its override or the global allocator.
-    /// In the latter case, allocations made by others from the same allocator aren't included.
-    usage: *const dvx_metrics.AllocatorMetrics,
-    /// The module's pool, or null if it has no budget (`InitOptions.budgets`).
-    pool: ?*const PoolAllocator,
-};
-
 /// The usage of a module that isn't metered, because metrics are disabled.
 const no_usage: dvx_metrics.AllocatorMetrics = .{};
-
-/// Name of the Tracy plot of a module's pool usage. A type, so the name has one address: Tracy
-/// identifies plots by pointer.
-fn MemoryPlot(comptime module_name: []const u8) type {
-    return struct {
-        const name: [:0]const u8 = std.fmt.comptimePrint("mem {s}", .{module_name});
-    };
-}
-
-/// Returns the `Context._log` / `Context._log_enabled` implementations for a module, whose
-/// `mach_module` enum literal is used as the `std.log` scope.
-fn ContextLog(comptime scope: @EnumLiteral()) type {
-    return struct {
-        fn enabled(level: std.log.Level) bool {
-            // Tracy receives every message regardless of std.log filtering.
-            if (build_options.tracy) return true;
-            return switch (level) {
-                inline else => |l| std.log.logEnabled(l, scope),
-            };
-        }
-
-        fn log(level: std.log.Level, system_name: []const u8, msg: []const u8) void {
-            switch (level) {
-                inline else => |l| {
-                    if (comptime std.log.logEnabled(l, scope)) {
-                        if (system_name.len == 0) {
-                            std.options.logFn(l, scope, "{s}", .{msg});
-                        } else {
-                            std.options.logFn(l, scope, "[{s}] {s}", .{ system_name, msg });
-                        }
-                    }
-                    tracy.printColor("{s}.{s}: {s}", .{ @tagName(scope), system_name, msg }, switch (l) {
-                        .err => 0xff4040,
-                        .warn => 0xffc040,
-                        .info => 0xffffff,
-                        .debug => 0x909090,
-                    });
-                },
-            }
-        }
-    };
-}
 
 pub fn Mod(comptime M: type) type {
     return struct {
@@ -1042,9 +96,20 @@ pub fn Mod(comptime M: type) type {
         id: ModFunctionIDs(M),
         _ctx: *anyopaque,
         _run: *const fn (ctx: *anyopaque, fn_id: FunctionID) void,
+        _schedule_params: *const fn (ctx: *anyopaque, fn_id: FunctionID) *anyopaque,
 
         pub fn run(r: *const @This(), fn_id: FunctionID) void {
             r._run(r._ctx, fn_id);
+        }
+
+        /// Returns the params of this module's schedule `f` (declared with `mach.scheduleWith`),
+        /// e.g. to set its conditions from outside of it. They are the same params its systems
+        /// get from `ctx.schedule.params()` while it runs.
+        ///
+        /// Schedules may run on other threads (e.g. the render thread): fields written from a
+        /// thread other than the one running the schedule must be `std.atomic.Value(bool)`.
+        pub fn scheduleParams(r: *const @This(), comptime f: ModuleFunctionName(M)) *ScheduleParamsOf(M, @tagName(f)) {
+            return @ptrCast(@alignCast(r._schedule_params(r._ctx, @field(r.id, @tagName(f)))));
         }
 
         pub fn call(r: *const @This(), comptime f: ModuleFunctionName(M)) void {
@@ -1071,7 +136,8 @@ pub fn ModFunctionIDs(comptime Module: type) type {
 }
 
 /// Enum describing all declarations for a given comptime-known module.
-fn ModuleFunctionName(comptime M: type) type {
+pub fn ModuleFunctionName(comptime M: type) type {
+    @setEvalBranchQuota(10_000);
     validate(M);
     var enum_names: []const []const u8 = &.{};
     inline for (M.mach_systems) |fn_tag| {
@@ -1096,7 +162,7 @@ fn validateModuleSystemDecls(comptime M: type) void {
         const F = @TypeOf(@field(M, name));
         const f_info = @typeInfo(F);
         const is_fn = f_info == .@"fn";
-        const is_schedule = f_info == .@"struct" and f_info.@"struct".is_tuple;
+        const is_schedule = isScheduleDecl(F);
         if (!is_fn and !is_schedule) {
             @compileError("Module ." ++ @tagName(M.mach_module) ++ " mach_systems entry ." ++ name ++ " must be a `pub fn` or `pub const " ++ name ++ " = mach.schedule(...)`, found: " ++ @typeName(F));
         }
@@ -1104,7 +170,7 @@ fn validateModuleSystemDecls(comptime M: type) void {
 }
 
 /// Enum describing all mach_tags for a given comptime-known module.
-fn ModuleTagEnum(comptime M: type) type {
+pub fn ModuleTagEnum(comptime M: type) type {
     // TODO(object): handle duplicate enum field case in mach_tags with a more clear error?
     // TODO(object): improve validation error messages here
     validate(M);
@@ -1181,6 +247,9 @@ pub fn Modules(module_lists: anytype) type {
             object_name_id: u32,
         }) = .{},
         graph: Graph,
+
+        /// The params of each schedule declared with `scheduleWith`, by "module.schedule" name.
+        schedule_params: ModuleScheduleParams(modules) = .{},
 
         pub const InitOptions = struct {
             /// Per-module allocator overrides, by module name, e.g.:
@@ -1389,32 +458,62 @@ pub fn Modules(module_lists: anytype) type {
                     comptime fn_name: ModuleFunctionName(module),
                 ) void {
                     const debug_name = @tagName(module_name) ++ "." ++ @tagName(fn_name);
-                    const zone = tracy.initZone(@src(), .{ .name = debug_name });
-                    defer zone.deinit();
-                    defer m.modules.plotMemory(@tagName(module_name));
                     if (!@hasField(module, @tagName(fn_name)) and !@hasDecl(module, @tagName(fn_name))) {
                         @compileError("Module ." ++ @tagName(module_name) ++ " declares mach_systems entry ." ++ @tagName(fn_name) ++ " but no pub fn or schedule with that name exists.");
                     }
                     const f = @field(module, @tagName(fn_name));
                     const F = @TypeOf(f);
 
-                    if (@typeInfo(F) == .@"struct" and @typeInfo(F).@"struct".is_tuple) {
+                    // Every system and schedule gets a zone, so a schedule's zone contains a zone
+                    // for each part that ran. Its zone text lists the parts which didn't.
+                    const zone = SystemTrace(module, @tagName(fn_name), debug_name).begin();
+                    defer zone.deinit();
+                    defer m.modules.plotMemory(@tagName(module_name));
+
+                    if (comptime isScheduleDecl(F)) {
                         // Run a list of functions instead of a single function
-                        // TODO: verify this is a mach.schedule() decl
-                        if (module_name != .app) @compileLog(module_name);
-                        inline for (f) |schedule_entry| {
+                        var frame: ScheduleContext.Frame = .{ .parent = ScheduleContext.current_frame };
+                        if (F.Params != void) {
+                            frame.params = &@field(m.modules.schedule_params, @tagName(module_name) ++ "." ++ @tagName(fn_name));
+                            frame.params_type = &ScheduleContext.TypeTag(F.Params).tag;
+                        }
+                        ScheduleContext.current_frame = &frame;
+                        defer {
+                            ScheduleContext.current_frame = frame.parent;
+                            if (frame.len > 0) {
+                                const finalize_zone = tracy.initZone(@src(), .{
+                                    .name = debug_name ++ " finalize",
+                                    .color = trace.colors.finalize,
+                                });
+                                defer finalize_zone.deinit();
+                                frame.finalizeAll();
+                            }
+                        }
+
+                        inline for (F.entries) |schedule_entry| {
                             // TODO: unify with Modules(modules).get(M)
                             const callMod: Module(schedule_entry.@"0") = .{ .mods = m.mods, .modules = m.modules };
                             if (!@hasField(ModuleFunctionName(schedule_entry.@"0"), @tagName(schedule_entry.@"1"))) {
                                 @compileError("Module ." ++ @tagName(@TypeOf(callMod).mod_name) ++ " has no mach_systems entry '." ++ @tagName(schedule_entry.@"1") ++ "'");
                             }
                             const callFn = @as(ModuleFunctionName(schedule_entry.@"0"), schedule_entry.@"1");
-                            callMod.run(callFn);
+                            const entry_name = @tagName(@TypeOf(callMod).mod_name) ++ "." ++ @tagName(callFn);
+                            const skipped_by_condition = comptime if (@typeInfo(@TypeOf(schedule_entry)).@"struct".field_names.len < 3)
+                                ""
+                            else
+                                "skipped " ++ entry_name ++ " (." ++ @tagName(schedule_entry.@"2") ++ " is false)";
+                            if (frame.stopped) {
+                                zone.text("skipped " ++ entry_name ++ " (stopped)");
+                            } else if (!m.scheduleEntryEnabled(@tagName(fn_name), schedule_entry)) {
+                                zone.text(skipped_by_condition);
+                            } else {
+                                callMod.run(callFn);
+                                if (frame.stopped) zone.text("stopped by " ++ entry_name);
+                            }
                         }
                         return;
                     }
 
-                    // Inject arguments
                     var args: std.meta.ArgsTuple(F) = undefined;
                     outer: inline for (@typeInfo(std.meta.ArgsTuple(F)).@"struct".field_names, @typeInfo(std.meta.ArgsTuple(F)).@"struct".field_types) |arg_name, arg_type| {
                         if (@typeInfo(arg_type) == .pointer and
@@ -1433,6 +532,7 @@ pub fn Modules(module_lists: anytype) type {
                         if (arg_type == Context) {
                             var ctx = m.modules.context(module_name);
                             ctx.system_name = @tagName(fn_name);
+                            ctx.schedule = .{ .frame = ScheduleContext.current_frame };
                             @field(args, arg_name) = ctx;
                             continue :outer;
                         }
@@ -1447,6 +547,12 @@ pub fn Modules(module_lists: anytype) type {
                                         modules2.callDynamic(fn_id);
                                     }
                                 }).run,
+                                ._schedule_params = (struct {
+                                    pub fn get(ctx: *anyopaque, fn_id: FunctionID) *anyopaque {
+                                        const modules2: *Modules(module_lists) = @ptrCast(@alignCast(ctx));
+                                        return modules2.scheduleParamsDynamic(fn_id);
+                                    }
+                                }).get,
                             };
                             inline for (M.mach_systems) |m_fn_name| {
                                 @field(mv.id, @tagName(m_fn_name)) = Module(M).getFunction(m_fn_name);
@@ -1463,6 +569,18 @@ pub fn Modules(module_lists: anytype) type {
                         .error_union => @call(.auto, f, args) catch |err| std.debug.panic("error: {s}", .{@errorName(err)}),
                         else => @call(.auto, f, args),
                     }
+                }
+
+                /// Whether a schedule entry of this module should run, according to its condition.
+                fn scheduleEntryEnabled(
+                    m: *const @This(),
+                    comptime schedule_name: []const u8,
+                    comptime schedule_entry: anytype,
+                ) bool {
+                    if (@typeInfo(@TypeOf(schedule_entry)).@"struct".field_names.len < 3) return true;
+                    const params = &@field(m.modules.schedule_params, @tagName(module_name) ++ "." ++ schedule_name);
+                    const condition = &@field(params, @tagName(schedule_entry.@"2"));
+                    return if (@TypeOf(condition.*) == bool) condition.* else condition.load(.acquire);
                 }
             };
         }
@@ -1503,6 +621,25 @@ pub fn Modules(module_lists: anytype) type {
             return @field(m.allocators, @tagName(Module(module_tag_or_type).mod_name));
         }
 
+        /// The params of the schedule `f`, which must have been declared with `mach.scheduleWith`.
+        fn scheduleParamsDynamic(m: *@This(), f: FunctionID) *anyopaque {
+            if (comptime modules.len == 0) unreachable;
+            const module_name: ModuleName = @fromBackingInt(@intCast(f.module_id));
+            switch (module_name) {
+                inline else => |mod_name| {
+                    const M = @field(module_types_by_name, @tagName(mod_name));
+                    const module_fn_name: ModuleFunctionName(M) = @fromBackingInt(@intCast(f.fn_id));
+                    switch (module_fn_name) {
+                        inline else => |fn_name| {
+                            const F = @TypeOf(@field(M, @tagName(fn_name)));
+                            if (comptime !isScheduleDecl(F) or F.Params == void) unreachable;
+                            return &@field(m.schedule_params, @tagName(mod_name) ++ "." ++ @tagName(fn_name));
+                        },
+                    }
+                },
+            }
+        }
+
         pub fn callDynamic(m: *@This(), f: FunctionID) void {
             if (comptime modules.len == 0) return;
             const module_name: ModuleName = @fromBackingInt(@intCast(f.module_id));
@@ -1529,7 +666,7 @@ fn validate(comptime module: anytype) void {
     if (@typeInfo(@TypeOf(module.mach_module)) != .enum_literal) @compileError("mach: invalid module, expected `pub const mach_module = .foo_name;` declaration, found: " ++ @typeName(@TypeOf(module.mach_module)));
 }
 
-fn isValid(comptime module: anytype) bool {
+pub fn isValid(comptime module: anytype) bool {
     if (!@hasDecl(module, "mach_module")) return false;
     if (@typeInfo(@TypeOf(module.mach_module)) != .enum_literal) return false;
     return true;
@@ -1606,6 +743,30 @@ fn ModuleTypesByName(comptime modules: anytype) type {
             .@"comptime" = true,
             .@"align" = null,
         }};
+    }
+    return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one field per schedule declared with
+/// `scheduleWith`, named "module.schedule", holding its params with their default values.
+fn ModuleScheduleParams(comptime modules: anytype) type {
+    var field_names: []const []const u8 = &.{};
+    var field_types: []const type = &.{};
+    var field_attrs: []const std.builtin.Type.Struct.FieldAttributes = &.{};
+    for (modules) |M| {
+        if (!@hasDecl(M, "mach_systems")) continue;
+        for (M.mach_systems) |system| {
+            const F = @TypeOf(@field(M, @tagName(system)));
+            if (!isScheduleDecl(F) or F.Params == void) continue;
+            const default: F.Params = .{};
+            field_names = field_names ++ [_][]const u8{@tagName(M.mach_module) ++ "." ++ @tagName(system)};
+            field_types = field_types ++ [_]type{F.Params};
+            field_attrs = field_attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{.{
+                .default_value_ptr = @ptrCast(&default),
+                .@"comptime" = false,
+                .@"align" = null,
+            }};
+        }
     }
     return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
 }
@@ -1914,47 +1075,9 @@ test "Per-module budgets" {
     try std.testing.expectEqual(1, ctx.memoryStats(buf[0..1]).len);
 }
 
-test "Objects.sliceField" {
-    const test_module = struct {
-        pub const mach_module = .test_module;
-        things: Objects(.{}, struct { a: u32, b: f32 }),
-    };
-
-    //TODO: swap to testing allocator once remainder of deinit implemented
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer aa.deinit();
-    const allocator = aa.allocator();
-
-    const io = std.Options.debug_io;
-    var modules = Modules(.{test_module}){
-        .mods = undefined,
-        .graph = undefined,
-        .io = io,
-    };
-    try modules.init(allocator, io);
-    defer modules.deinit(allocator);
-
-    const things = &modules.mods.test_module.things;
-    _ = try things.new(.{ .a = 1, .b = 1.5 });
-    const freed = try things.new(.{ .a = 2, .b = 2.5 });
-    const deleted = try things.new(.{ .a = 3, .b = 3.5 });
-    _ = try things.new(.{ .a = 4, .b = 4.5 });
-    things.free(freed);
-    things.delete(deleted);
-
-    var as = things.sliceField(.a);
-    try std.testing.expectEqual(@as(?u32, 1), as.next());
-    try std.testing.expectEqual(@as(?u32, 4), as.next());
-    try std.testing.expectEqual(@as(?u32, null), as.next());
-
-    var bs = things.sliceField(.b);
-    try std.testing.expectEqual(@as(?f32, 1.5), bs.next());
-    try std.testing.expectEqual(@as(?f32, 4.5), bs.next());
-    try std.testing.expectEqual(@as(?f32, null), bs.next());
-
-    // Order matches slice()
-    var ids = things.slice();
-    var values = things.sliceField(.a);
-    while (ids.next()) |id| try std.testing.expectEqual(@as(?u32, things.get(id, .a)), values.next());
-    try std.testing.expectEqual(@as(?u32, null), values.next());
+test {
+    _ = @import("module/ScheduleContext.zig");
+    _ = @import("module/schedule.zig");
+    _ = @import("module/objects.zig");
+    _ = @import("module/trace.zig");
 }

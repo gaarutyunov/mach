@@ -11,4 +11,5 @@ test {
     const std = @import("std");
     std.testing.refAllDecls(metrics);
     std.testing.refAllDecls(DevOverlay);
+    _ = @import("gpu_lint.zig");
 }

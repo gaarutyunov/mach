@@ -33,6 +33,8 @@ pub const mach_systems = .{
     .appTick,
     .tick,
     .render,
+    .renderWindow,
+    .submit,
     .deinit,
     .deinit2,
     .audioStateChange,
@@ -459,29 +461,35 @@ pub fn appTick(
     }
 }
 
-pub fn render(
+pub const render = mach.schedule(.{
+    .{ App, .renderWindow },
+    .{ dvx.DevOverlay, .render },
+    .{ App, .submit },
+});
+
+pub fn renderWindow(
     core: *mach.Core,
     app: *App,
     sprite: *gfx.Sprite,
     sprite_mod: mach.Mod(gfx.Sprite),
     text: *gfx.Text,
     text_mod: mach.Mod(gfx.Text),
-    overlay: *dvx.DevOverlay,
+    ctx: mach.Context,
 ) !void {
     if (!app.has_setup_shared) {
         try setupShared(core, app, sprite, text);
         app.has_setup_shared = true;
-        return;
+        return ctx.schedule.stop();
     }
 
     const label = @tagName(mach_module) ++ ".render";
     const window = core.windows.getValue(core.window);
 
-    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return;
-    defer back_buffer_view.release();
+    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return ctx.schedule.stop();
+    ctx.schedule.put(.back_buffer, back_buffer_view, .{.release});
 
     const encoder = window.device.createCommandEncoder(&.{ .label = label });
-    defer encoder.release();
+    ctx.schedule.put(.encoder, encoder, .{.release});
 
     const sky_blue = gpu.Color{ .r = 0.776, .g = 0.988, .b = 1, .a = 1 };
     const color_attachments = [_]gpu.RenderPassColorAttachment{.{
@@ -524,7 +532,7 @@ pub fn render(
     render_pass.end();
     render_pass.release();
 
-    // Null out this window's pipelines (the pass is gone), then draw the dev overlay on top.
+    // Null out this window's pipelines (the pass is gone), before the dev overlay draws on top.
     if (core.windows.getTag(core.window, App, .window_meta)) |window_meta_id| {
         if (app.window_meta.get(window_meta_id, .sprite_pipeline_id)) |sprite_pipeline_id| {
             sprite.pipelines.set(sprite_pipeline_id, .render_pass, null);
@@ -533,8 +541,12 @@ pub fn render(
             text.pipelines.set(text_pipeline_id, .render_pass, null);
         }
     }
-    overlay.render(core, encoder, back_buffer_view, sprite, sprite_mod, text, text_mod);
+}
 
+pub fn submit(core: *mach.Core, ctx: mach.Context) void {
+    const label = @tagName(mach_module) ++ ".render";
+    const window = core.windows.getValue(core.window);
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
     var command = encoder.finish(&.{ .label = label });
     window.queue.submit(&[_]*gpu.CommandBuffer{command});
     command.release();

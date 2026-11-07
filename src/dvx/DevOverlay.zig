@@ -5,6 +5,10 @@
 //! Toggle with Ctrl+Alt+Shift+D (the same chord as YouTube's "Stats for nerds"), or set
 //! `MACH_DEV_OVERLAY=1` to show it from startup.
 //!
+//! Only included in Debug builds (override with `-Ddev_overlay=true|false`). Otherwise the module
+//! stays registered with the same API, but every system does nothing, nothing is drawn, and its
+//! pipelines, GPU resources and text are never created.
+//!
 //! Usage from the app (register `mach.dvx.DevOverlay` in your `mach.Modules`):
 //! * schedule `.{ dvx.DevOverlay, .init }` before the app's init, then call `attach()` with the
 //!   window
@@ -20,6 +24,10 @@ const gfx = mach.gfx;
 const math = mach.math;
 const time = mach.time;
 const metrics = @import("metrics.zig");
+const build_options = @import("build-options");
+
+/// Whether the overlay is compiled in, see `-Ddev_overlay`.
+pub const enabled = build_options.dev_overlay;
 
 const vec2 = math.vec2;
 const vec3 = math.vec3;
@@ -31,7 +39,31 @@ const DevOverlay = @This();
 
 pub const mach_module = .mach_dvx_dev_overlay;
 
-pub const mach_systems = .{ .init, .update, .snapshot };
+pub const mach_systems = .{ .init, .update, .snapshot, .render, .beginPass };
+
+/// Draws the overlay on top of the frame. Chain it into the window's render schedule, once the
+/// frame has been drawn and any render pass ended, with these schedule values provided:
+///
+/// * `.encoder`: `*gpu.CommandEncoder`
+/// * `.back_buffer`: `*gpu.TextureView`, the view to draw on top of
+///
+/// ```
+/// pub const render = mach.schedule(.{
+///     .{ App, .beginFrame }, // puts .encoder and .back_buffer
+///     .{ gfx.Sprite, .render },
+///     .{ App, .endPass },
+///     .{ dvx.DevOverlay, .render },
+///     .{ App, .endFrame },
+/// });
+/// ```
+pub const render = if (enabled) mach.schedule(.{
+    .{ DevOverlay, .beginPass },
+    .{ gfx.Sprite, .render },
+    .{ gfx.Text, .render },
+}) else mach.schedule(.{});
+
+/// The overlay's pipelines only render into its own pass.
+const render_group: gfx.RenderGroup = @fromBackingInt(0x6465_7600);
 
 const max_lines = 20;
 const max_line_len = 160;
@@ -104,7 +136,7 @@ pub fn init(overlay: *DevOverlay, ctx: mach.Context) void {
         .allocator = ctx.allocator,
         .io = ctx.io,
         .refresh_timer = time.Timer.start(ctx.io),
-        .visible = if (std.c.getenv("MACH_DEV_OVERLAY")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
+        .visible = if (!enabled) false else if (std.c.getenv("MACH_DEV_OVERLAY")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
     };
 }
 
@@ -115,6 +147,7 @@ pub fn attach(overlay: *DevOverlay, window_id: mach.ObjectID) void {
 
 /// Handles the toggle chord. Returns true if `ev` was it, in which case the app should ignore it.
 pub fn handleKey(overlay: *DevOverlay, ev: mach.Core.Event.Key) bool {
+    if (!enabled) return false;
     if (ev.key != .d or !ev.mods.control or !ev.mods.alt or !ev.mods.shift) return false;
     overlay.visible = !overlay.visible;
     overlay.refresh_now = true;
@@ -124,6 +157,7 @@ pub fn handleKey(overlay: *DevOverlay, ev: mach.Core.Event.Key) bool {
 
 /// Sets a line of app-specific info shown in the overlay, e.g. the current scene.
 pub fn setAppInfo(overlay: *DevOverlay, comptime fmt: []const u8, args: anytype) void {
+    if (!enabled) return;
     var w: std.Io.Writer = .fixed(&overlay.app_info_buf);
     w.print(fmt, args) catch {};
     overlay.app_info = w.buffered();
@@ -136,6 +170,7 @@ pub fn update(
     text: *gfx.Text,
     ctx: mach.Context,
 ) !void {
+    if (!enabled) return;
     if (!overlay.ready) {
         if (!overlay.gpu_ready.load(.acquire)) return;
         try overlay.setup(sprite, text);
@@ -221,6 +256,7 @@ pub fn update(
 /// Copies the state the render thread needs. Runs while the app thread holds the render snapshot
 /// lock.
 pub fn snapshot(overlay: *DevOverlay) void {
+    if (!enabled) return;
     overlay.render_state = .{
         .visible = overlay.visible and overlay.ready,
         .bg_pipeline_id = overlay.bg_pipeline_id,
@@ -228,51 +264,31 @@ pub fn snapshot(overlay: *DevOverlay) void {
     };
 }
 
-/// Draws the overlay on top of `view`. Call from the window's render callback (on the render
-/// thread) once the frame has been drawn, with no other gfx pipeline's `render_pass` set. Does
-/// nothing for windows other than the attached one.
-pub fn render(
-    overlay: *DevOverlay,
-    core: *mach.Core,
-    encoder: *gpu.CommandEncoder,
-    view: *gpu.TextureView,
-    sprite: *gfx.Sprite,
-    sprite_mod: mach.Mod(gfx.Sprite),
-    text: *gfx.Text,
-    text_mod: mach.Mod(gfx.Text),
-) void {
-    if (core.window != overlay.window_id) return;
+/// Begins the overlay's render pass, or else skips the rest of `render`. Does nothing for windows
+/// other than the attached one.
+pub fn beginPass(overlay: *DevOverlay, core: *mach.Core, ctx: mach.Context) void {
+    if (!enabled) return ctx.schedule.stop();
+    if (core.window != overlay.window_id) return ctx.schedule.stop();
     if (!overlay.gpu_ready.load(.acquire)) {
         overlay.createGpu(core.windows.getValue(core.window));
-        return;
+        return ctx.schedule.stop();
     }
-    const rs = overlay.render_state;
-    if (!rs.visible) return;
-
-    const zone = mach.tracy.initZone(@src(), .{ .name = label ++ ".render" });
-    defer zone.deinit();
+    if (!overlay.render_state.visible) return ctx.schedule.stop();
 
     const color_attachments = [_]gpu.RenderPassColorAttachment{.{
-        .view = view,
+        .view = ctx.schedule.require(.back_buffer, *gpu.TextureView),
         .clear_value = std.mem.zeroes(gpu.Color),
         .load_op = .load,
         .store_op = .store,
     }};
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
     const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
         .label = label,
         .color_attachments = &color_attachments,
     }));
-    defer pass.release();
-
-    sprite.pipelines.setRaw(rs.bg_pipeline_id, .render_pass, pass);
-    sprite_mod.call(.render);
-    sprite.pipelines.setRaw(rs.bg_pipeline_id, .render_pass, null);
-
-    text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, pass);
-    text_mod.call(.render);
-    text.pipelines.setRaw(rs.text_pipeline_id, .render_pass, null);
-
-    pass.end();
+    // The pass ends when this schedule does.
+    ctx.schedule.put(.render_pass, pass, .{ .end, .release });
+    ctx.schedule.put(.render_group, render_group, .{});
 }
 
 /// Creates the background texture. Called once on the render thread, where all GPU work happens.
@@ -295,10 +311,11 @@ fn createGpu(overlay: *DevOverlay, window: anytype) void {
 /// Created after the app's pipelines, so they draw on top within a pass.
 fn setup(overlay: *DevOverlay, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     overlay.bg_pipeline_id = try sprite.pipelines.new(.{
+        .render_group = render_group,
         .window = overlay.window_id,
         .texture = overlay.bg_texture,
     });
-    overlay.text_pipeline_id = try text.pipelines.new(.{ .window = overlay.window_id });
+    overlay.text_pipeline_id = try text.pipelines.new(.{ .window = overlay.window_id, .render_group = render_group });
 
     // The 1x1 texture is clamp-sampled, so the sprite is a solid translucent panel at any size.
     overlay.bg_sprite_id = try sprite.objects.new(.{

@@ -41,7 +41,10 @@ pub const Objects = module.Objects;
 pub const Thread = module.Thread;
 pub const initGraph = module.initGraph;
 pub const schedule = module.schedule;
+pub const scheduleWith = module.scheduleWith;
+pub const ScheduleContext = module.ScheduleContext;
 pub const startThread = module.startThread;
+pub const logFn = module.logFn;
 
 /// Dynamic library loading and symbol lookup. Same as `std.DynLib`, except that it also supports
 /// Windows (which `std.DynLib` no longer does as of Zig 0.17.)
