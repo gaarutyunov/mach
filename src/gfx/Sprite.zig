@@ -80,9 +80,14 @@ const Pipelines = mach.Objects(.{ .track_fields = true }, struct {
     /// Which window (device/queue) to use. If not set, this pipeline will not be rendered.
     window: ?mach.ObjectID = null,
 
-    /// Which render pass should be used during rendering. If not set, this pipeline will not be
-    /// rendered.
+    /// Which render pass should be used during rendering. If not set, this pipeline renders into
+    /// the `.render_pass` of the running schedule, if any and if its `render_group` matches.
+    /// Otherwise, this pipeline will not be rendered.
     render_pass: ?*gpu.RenderPassEncoder = null,
+
+    /// Which render passes of the running schedule this pipeline renders into: those whose
+    /// `.render_group` schedule value matches (`.default` if the schedule has no such value).
+    render_group: gfx.RenderGroup = .default,
 
     /// Texture to use when rendering. The default shader can handle only one texture input.
     /// Must be specified for a pipeline entity to be valid.
@@ -321,7 +326,12 @@ pub fn snapshot(sprite: *Sprite, core: *mach.Core) !void {
     }
 }
 
-pub fn render(sprite: *Sprite, core: *mach.Core) !void {
+/// Renders each pipeline into its `.render_pass` if set, or else into the `.render_pass` of the
+/// running schedule if its `render_group` matches the schedule's `.render_group`.
+pub fn render(sprite: *Sprite, core: *mach.Core, ctx: mach.Context) !void {
+    const scheduled_pass = ctx.schedule.get(.render_pass, *gpu.RenderPassEncoder);
+    const render_group = ctx.schedule.get(.render_group, gfx.RenderGroup) orelse .default;
+
     var pipelines = sprite.render_pipelines.slice();
     while (pipelines.next()) |pipeline_id| {
         // Is this pipeline usable for rendering? If not, no need to process it.
@@ -331,11 +341,15 @@ pub fn render(sprite: *Sprite, core: *mach.Core) !void {
 
         // render_pass is a transient GPU resource set by the render thread each frame
         // directly on the app-side pipelines — read it from there, not the snapshot.
-        const render_pass = sprite.pipelines.get(pipeline_id, .render_pass) orelse continue;
+        const render_pass = sprite.pipelines.get(pipeline_id, .render_pass) orelse blk: {
+            if (pipeline.render_group != render_group) continue;
+            break :blk scheduled_pass orelse continue;
+        };
 
         // Changing these fields shouldn't trigger a pipeline rebuild, so clear their update values:
         _ = sprite.render_pipelines.updated(pipeline_id, .window);
         _ = sprite.render_pipelines.updated(pipeline_id, .render_pass);
+        _ = sprite.render_pipelines.updated(pipeline_id, .render_group);
         _ = sprite.render_pipelines.updated(pipeline_id, .view_projection);
         _ = sprite.render_pipelines.updated(pipeline_id, .num_sprites);
         _ = sprite.render_pipelines.updated(pipeline_id, .built_index);
@@ -455,7 +469,9 @@ fn rebuildPipeline(
     const texture3_view = if (pipeline.texture3) |tex| tex.createView(&gpu.TextureView.Descriptor{ .label = label }) else texture_view;
     const texture4_view = if (pipeline.texture4) |tex| tex.createView(&gpu.TextureView.Descriptor{ .label = label }) else texture_view;
     defer texture_view.release();
-    // TODO: texture views 2-4 leak
+    defer if (pipeline.texture2 != null) texture2_view.release();
+    defer if (pipeline.texture3 != null) texture3_view.release();
+    defer if (pipeline.texture4 != null) texture4_view.release();
 
     const bind_group = pipeline.bind_group orelse device.createBindGroup(
         &gpu.BindGroup.Descriptor.init(.{

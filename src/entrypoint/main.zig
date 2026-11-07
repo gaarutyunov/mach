@@ -1,5 +1,10 @@
 const std = @import("std");
 const app = @import("app");
+const mach = @import("mach");
+
+/// The app's own `std_options` if it has some, or else logging through `mach.logFn`, which also
+/// sends every `std.log` message to Tracy (with `-Dtracy`).
+pub const std_options: std.Options = if (@hasDecl(app, "std_options")) app.std_options else .{ .logFn = mach.logFn };
 
 pub fn main() !void {
     var io_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});

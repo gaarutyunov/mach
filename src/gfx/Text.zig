@@ -160,9 +160,14 @@ const TextPipelines = mach.Objects(.{ .track_fields = true }, struct {
     /// Which window (device/queue) to use. If not set, this pipeline will not be rendered.
     window: ?mach.ObjectID = null,
 
-    /// Which render pass should be used during rendering. If not set, this pipeline will not be
-    /// rendered.
+    /// Which render pass should be used during rendering. If not set, this pipeline renders into
+    /// the `.render_pass` of the running schedule, if any and if its `render_group` matches.
+    /// Otherwise, this pipeline will not be rendered.
     render_pass: ?*gpu.RenderPassEncoder = null,
+
+    /// Which render passes of the running schedule this pipeline renders into: those whose
+    /// `.render_group` schedule value matches (`.default` if the schedule has no such value).
+    render_group: gfx.RenderGroup = .default,
 
     /// View*Projection matrix to use when rendering with this pipeline. This controls both
     /// the size of the 'virtual canvas' which is rendered onto, as well as the 'camera position'.
@@ -568,7 +573,12 @@ pub fn snapshot(text: *Text, core: *mach.Core) !void {
         }
     }
 }
-pub fn render(text: *Text, core: *mach.Core) !void {
+/// Renders each pipeline into its `.render_pass` if set, or else into the `.render_pass` of the
+/// running schedule if its `render_group` matches the schedule's `.render_group`.
+pub fn render(text: *Text, core: *mach.Core, ctx: mach.Context) !void {
+    const scheduled_pass = ctx.schedule.get(.render_pass, *gpu.RenderPassEncoder);
+    const render_group = ctx.schedule.get(.render_group, gfx.RenderGroup) orelse .default;
+
     var pipelines = text.render_pipelines.slice();
     while (pipelines.next()) |pipeline_id| {
         // Is this pipeline usable for rendering? If not, no need to process it.
@@ -578,11 +588,15 @@ pub fn render(text: *Text, core: *mach.Core) !void {
 
         // render_pass is a transient GPU resource set by the render thread each frame
         // directly on the app-side pipelines — read it from there, not the snapshot.
-        const render_pass = text.pipelines.get(pipeline_id, .render_pass) orelse continue;
+        const render_pass = text.pipelines.get(pipeline_id, .render_pass) orelse blk: {
+            if (pipeline.render_group != render_group) continue;
+            break :blk scheduled_pass orelse continue;
+        };
 
         // Changing these fields shouldn't trigger a pipeline rebuild, so clear their update values:
         _ = text.render_pipelines.updated(pipeline_id, .window);
         _ = text.render_pipelines.updated(pipeline_id, .render_pass);
+        _ = text.render_pipelines.updated(pipeline_id, .render_group);
         _ = text.render_pipelines.updated(pipeline_id, .view_projection);
         _ = text.render_pipelines.updated(pipeline_id, .num_texts);
         _ = text.render_pipelines.updated(pipeline_id, .num_segments);

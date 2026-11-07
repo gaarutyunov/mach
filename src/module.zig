@@ -53,17 +53,23 @@ pub fn initGraph(graph: *Graph, allocator: std.mem.Allocator, io: std.Io, compti
 }
 
 /// Validate that the given tuple is a valid schedule, returning true if so.
-fn validateSchedule(comptime entries: anytype) bool {
+fn validateSchedule(comptime Params: type, comptime entries: anytype) bool {
+    if (Params != void and @typeInfo(Params) != .@"struct") {
+        @compileError("mach.scheduleWith() expects a struct type for its params, found: " ++ @typeName(Params));
+    }
+
     const Entries = @TypeOf(entries);
     const entries_info = @typeInfo(Entries);
     if (entries_info != .@"struct" or !entries_info.@"struct".is_tuple) {
-        @compileError("mach.schedule() expects a tuple of .{ Module, .fn_name } entries, found: " ++ @typeName(Entries));
+        @compileError("mach.schedule() expects a tuple of .{ Module, .fn_name, condition? } entries, found: " ++ @typeName(Entries));
     }
     inline for (entries) |tuple| {
         const tuple_info = @typeInfo(@TypeOf(tuple));
-        // Check it's a 2-field tuple before accessing fields
-        if (tuple_info != .@"struct" or !tuple_info.@"struct".is_tuple or tuple_info.@"struct".field_names.len != 2) {
-            @compileError("mach.schedule() entry expected tuple .{ Module, .fn_name }, found: " ++ @typeName(@TypeOf(tuple)));
+        // Check it's a 2 or 3-field tuple before accessing fields
+        if (tuple_info != .@"struct" or !tuple_info.@"struct".is_tuple or
+            (tuple_info.@"struct".field_names.len != 2 and tuple_info.@"struct".field_names.len != 3))
+        {
+            @compileError("mach.schedule() entry expected tuple .{ Module, .fn_name, condition? }, found: " ++ @typeName(@TypeOf(tuple)));
         }
         const Module: type = tuple.@"0";
         const fn_name = tuple.@"1";
@@ -85,9 +91,43 @@ fn validateSchedule(comptime entries: anytype) bool {
         if (!@hasField(ModuleFunctionName(Module), @tagName(fn_name))) {
             @compileError("mach.schedule() entry references ." ++ @tagName(fn_name) ++ " but module " ++ @typeName(Module) ++ " has no such entry in `mach_systems`");
         }
+
+        if (tuple_info.@"struct".field_names.len == 3) validateCondition(Params, tuple.@"2");
     }
 
     return true;
+}
+
+/// Validates the optional third field of a schedule entry: the name of a bool or
+/// `std.atomic.Value(bool)` field of its params.
+fn validateCondition(comptime Params: type, comptime condition: anytype) void {
+    if (@typeInfo(@TypeOf(condition)) != .enum_literal) {
+        @compileError("mach.schedule() entry condition must name a bool or std.atomic.Value(bool) field of the schedule's params, found: " ++ @typeName(@TypeOf(condition)));
+    }
+    const name = @tagName(condition);
+    if (Params == void) {
+        @compileError("mach.schedule() entry condition ." ++ name ++ " needs a params struct with that field, see mach.scheduleWith()");
+    }
+    if (!@hasField(Params, name)) {
+        @compileError("mach.schedule() entry condition ." ++ name ++ " is not a field of " ++ @typeName(Params));
+    }
+    const T = @FieldType(Params, name);
+    if (T != bool and T != std.atomic.Value(bool)) {
+        @compileError("mach.schedule() entry condition ." ++ name ++ " must be a bool or std.atomic.Value(bool), found: " ++ @typeName(T));
+    }
+}
+
+/// The value of a schedule declaration, as returned by `schedule` and `scheduleWith`.
+fn ScheduleDecl(comptime P: type, comptime schedule_entries: anytype) type {
+    return struct {
+        pub const IsMachSchedule = void;
+        pub const Params = P;
+        pub const entries = schedule_entries;
+    };
+}
+
+fn isScheduleDecl(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "IsMachSchedule");
 }
 
 /// When a schedule is called, the list of module functions described within are executed in order.
@@ -102,9 +142,67 @@ fn validateSchedule(comptime entries: anytype) bool {
 /// ...
 /// my_mod.call(.foo); // runs App.init, Physics.init, App.main in order
 /// ```
-pub fn schedule(entries: anytype) @TypeOf(entries) {
-    _ = comptime validateSchedule(entries);
-    return entries;
+///
+/// An entry may name a schedule of any module, which runs as a nested schedule.
+///
+/// Each run of a schedule has its own `ScheduleContext`, available to its systems as
+/// `ctx.schedule`, for sharing values between them and releasing them when the schedule ends.
+///
+/// Use `scheduleWith` to give a schedule parameters, and to run entries conditionally.
+pub fn schedule(comptime entries: anytype) ScheduleDecl(void, entries) {
+    _ = comptime validateSchedule(void, entries);
+    return .{};
+}
+
+/// Same as `schedule`, for a schedule with parameters: an instance of the given struct, whose
+/// fields must all have default values. There is one instance per schedule per `mach.Modules`, so
+/// it keeps its values between runs. Systems access it with `ctx.schedule.params(Params)`.
+///
+/// An entry may have the name of a bool field of the params as its third field, in which case it
+/// only runs if that field is true when the entry is reached:
+///
+/// ```
+/// pub const RenderParams = struct {
+///     needs_setup: bool = true,
+///     show_overlay: bool = false,
+/// };
+///
+/// pub const render = mach.scheduleWith(RenderParams, .{
+///     .{ App, .setupGpu, .needs_setup },
+///     .{ App, .beginFrame },
+///     .{ gfx.Sprite, .render },
+///     .{ Overlay, .render, .show_overlay },
+///     .{ App, .endFrame },
+/// });
+///
+/// pub fn setupGpu(ctx: mach.Context) void {
+///     ...
+///     ctx.schedule.params(RenderParams).needs_setup = false;
+/// }
+/// ```
+///
+/// A condition may also be a `std.atomic.Value(bool)` (read with `.acquire`), for one set from
+/// another thread, e.g. by the render thread through `Mod(M).scheduleParams()`:
+///
+/// ```
+/// pub const TickParams = struct {
+///     gpu_ready: std.atomic.Value(bool) = .init(false),
+/// };
+///
+/// pub const tick = mach.scheduleWith(TickParams, .{
+///     .{ App, .setupPipelines, .gpu_ready },
+///     ...
+/// });
+///
+/// // On the render thread:
+/// pub fn setupGpu(app_mod: mach.Mod(App)) void {
+///     ...
+///     app_mod.scheduleParams(.tick).gpu_ready.store(true, .release);
+/// }
+/// ```
+pub fn scheduleWith(comptime Params: type, comptime entries: anytype) ScheduleDecl(Params, entries) {
+    _ = comptime validateSchedule(Params, entries);
+    return .{};
 }
 
 /// An ID representing a mach object. This is an opaque identifier which effectively encodes:
@@ -893,6 +991,272 @@ pub const ModuleFunctionID = u16;
 /// Unique identifier for a function within a module, including those only known at runtime.
 pub const FunctionID = struct { module_id: ModuleID, fn_id: ModuleFunctionID };
 
+/// The running schedule's frame on this thread, if any. Systems reach it via `ctx.schedule`.
+threadlocal var current_schedule_frame: ?*ScheduleContext.Frame = null;
+
+/// Values shared between the systems of a running schedule, instead of being passed through module
+/// fields. Available to systems as `ctx.schedule`:
+///
+/// ```
+/// pub const render = mach.schedule(.{
+///     .{ App, .beginPass },
+///     .{ gfx.Sprite, .render },
+///     .{ App, .endPass },
+/// });
+///
+/// pub fn beginPass(ctx: mach.Context, ...) void {
+///     ...
+///     ctx.schedule.put(.render_pass, encoder.beginRenderPass(...), .{ .end, .release });
+/// }
+///
+/// pub fn endPass(ctx: mach.Context) void {
+///     ctx.schedule.remove(.render_pass); // Runs its finalizers now, or else when the schedule ends.
+/// }
+/// ```
+///
+/// Each run of a schedule has its own values, stored on the stack of the thread running it:
+///
+/// * Reads also search the schedules it is nested in, so a nested schedule can see the values of
+///   the schedule which called it. Writes only affect the running schedule.
+/// * Systems called with `Mod.call` from within a schedule see it too.
+/// * Values aren't shared with other threads, or kept between runs. Only the schedule's params are
+///   kept between runs, see `scheduleWith`.
+///
+/// Outside of a schedule there are no values: `get` returns null, and `stop` does nothing.
+pub const ScheduleContext = struct {
+    frame: ?*Frame = null,
+
+    /// Tracy zone colors (with `-Dtracy`), to tell schedules and their parts apart from systems.
+    const trace_colors = struct {
+        const schedule = 0x4a7fb5;
+        const finalize = 0x9a6a2e;
+        const finalizer = 0xc89a5a;
+    };
+
+    /// How many values a single run of a schedule can hold.
+    pub const max_values = 16;
+
+    /// The largest value that can be stored; put a pointer to anything larger.
+    pub const max_value_size = 32;
+
+    const Slot = struct {
+        key_hash: u64,
+        key_name: []const u8,
+        type_id: *const anyopaque,
+        type_name: []const u8,
+        finalize: ?*const fn (value: *anyopaque) void,
+        value: [max_value_size]u8 align(16),
+
+        fn runFinalizers(slot: *Slot) void {
+            if (slot.finalize) |finalize| finalize(&slot.value);
+        }
+    };
+
+    pub const Frame = struct {
+        parent: ?*Frame,
+        stopped: bool = false,
+        params: ?*anyopaque = null,
+        params_type: ?*const anyopaque = null,
+        len: u8 = 0,
+        slots: [max_values]Slot = undefined,
+
+        fn find(frame: *Frame, key_hash: u64) ?usize {
+            var i = frame.len;
+            while (i > 0) {
+                i -= 1;
+                if (frame.slots[i].key_hash == key_hash) return i;
+            }
+            return null;
+        }
+
+        fn removeAt(frame: *Frame, index: usize) void {
+            for (index..frame.len - 1) |i| frame.slots[i] = frame.slots[i + 1];
+            frame.len -= 1;
+        }
+
+        fn finalizeAll(frame: *Frame) void {
+            while (frame.len > 0) {
+                frame.len -= 1;
+                frame.slots[frame.len].runFinalizers();
+            }
+        }
+    };
+
+    /// A unique address per type, to identify the type of a stored value.
+    fn TypeTag(comptime T: type) type {
+        return struct {
+            const Type = T;
+            var tag: u8 = 0;
+        };
+    }
+
+    fn keyHash(comptime key: @EnumLiteral()) u64 {
+        return comptime std.hash.Wyhash.hash(0, @tagName(key));
+    }
+
+    fn checkValueType(comptime T: type) void {
+        if (@sizeOf(T) > max_value_size or @alignOf(T) > @alignOf(Slot)) {
+            @compileError("mach: value of type " ++ @typeName(T) ++ " is too large for the schedule context, store a pointer to it instead");
+        }
+    }
+
+    fn slotValue(comptime T: type, comptime key: @EnumLiteral(), slot: *Slot) *T {
+        if (slot.type_id != @as(*const anyopaque, &TypeTag(T).tag)) {
+            std.debug.panic("mach: schedule value ." ++ @tagName(key) ++ " is a {s}, not a " ++ @typeName(T), .{slot.type_name});
+        }
+        return @ptrCast(@alignCast(&slot.value));
+    }
+
+    /// Returns a function calling each of the finalizers on a value of type `T`, or null if none.
+    fn finalizeFn(comptime T: type, comptime key: @EnumLiteral(), comptime finalizers: anytype) ?*const fn (value: *anyopaque) void {
+        const info = @typeInfo(@TypeOf(finalizers));
+        if (info != .@"struct" or !info.@"struct".is_tuple) {
+            @compileError("mach: schedule value finalizers must be a tuple of method names, e.g. .{ .end, .release }, found: " ++ @typeName(@TypeOf(finalizers)));
+        }
+        if (finalizers.len == 0) return null;
+
+        // Methods are looked up like in a method call: on the type, or the type it points to.
+        const Base = switch (@typeInfo(T)) {
+            .pointer => |pointer| if (pointer.size == .one) pointer.child else T,
+            else => T,
+        };
+        for (finalizers) |finalizer| {
+            if (@typeInfo(@TypeOf(finalizer)) != .enum_literal) {
+                @compileError("mach: schedule value finalizer must be a method name, e.g. .release, found: " ++ @typeName(@TypeOf(finalizer)));
+            }
+            const name = @tagName(finalizer);
+            const has_method = switch (@typeInfo(Base)) {
+                .@"struct", .@"opaque", .@"union", .@"enum" => @hasDecl(Base, name),
+                else => false,
+            };
+            if (!has_method) @compileError("mach: schedule value of type " ++ @typeName(T) ++ " has no finalizer method ." ++ name);
+            const param_types = @typeInfo(@TypeOf(@field(Base, name))).@"fn".param_types;
+            if (param_types.len != 1 or (param_types[0] != T and param_types[0] != *T)) {
+                @compileError("mach: method ." ++ name ++ " can't be called as a finalizer on a schedule value of type " ++ @typeName(T));
+            }
+        }
+        return (struct {
+            fn finalize(value: *anyopaque) void {
+                const typed: *T = @ptrCast(@alignCast(value));
+                inline for (finalizers) |finalizer| {
+                    // Traced as e.g. `render_pass.end`.
+                    const zone = tracy.initZone(@src(), .{
+                        .name = @tagName(key) ++ "." ++ @tagName(finalizer),
+                        .color = trace_colors.finalizer,
+                    });
+                    defer zone.deinit();
+                    const method = @field(Base, @tagName(finalizer));
+                    const arg = if (@typeInfo(@TypeOf(method)).@"fn".param_types[0] == T) typed.* else typed;
+                    const Ret = @typeInfo(@TypeOf(method)).@"fn".return_type orelse void;
+                    switch (@typeInfo(Ret)) {
+                        .error_union => method(arg) catch |err| std.debug.panic("error: {s}", .{@errorName(err)}),
+                        else => method(arg),
+                    }
+                }
+            }
+        }).finalize;
+    }
+
+    /// Stores a value in the running schedule, replacing any value of this key.
+    ///
+    /// `finalizers` is a tuple of names of methods to call on the value, in order, when it's replaced
+    /// or removed, or else when the schedule which put it ends. Values are finalized in the opposite
+    /// order they were put. For example `.{ .end, .release }`, or `.{}` for no finalizers.
+    ///
+    /// Panics if no schedule is running on this thread.
+    pub fn put(s: ScheduleContext, comptime key: @EnumLiteral(), value: anytype, comptime finalizers: anytype) void {
+        const T = @TypeOf(value);
+        comptime checkValueType(T);
+        const frame = s.frame orelse @panic("mach: ctx.schedule.put(." ++ @tagName(key) ++ ") called outside of a schedule");
+        const hash = comptime keyHash(key);
+
+        if (frame.find(hash)) |index| {
+            // The replaced value is finalized only now, in case `value` was derived from it.
+            frame.slots[index].runFinalizers();
+            frame.removeAt(index);
+        }
+        if (frame.len == max_values) {
+            @panic("mach: ctx.schedule.put(." ++ @tagName(key) ++ ") exceeds ScheduleContext.max_values");
+        }
+
+        const slot = &frame.slots[frame.len];
+        slot.* = .{
+            .key_hash = hash,
+            .key_name = @tagName(key),
+            .type_id = &TypeTag(T).tag,
+            .type_name = @typeName(T),
+            .finalize = comptime finalizeFn(T, key, finalizers),
+            .value = undefined,
+        };
+        @as(*T, @ptrCast(@alignCast(&slot.value))).* = value;
+        frame.len += 1;
+    }
+
+    /// Returns the value of this key from the innermost schedule having it, or null. Panics if it
+    /// has a different type than `T`.
+    pub fn get(s: ScheduleContext, comptime key: @EnumLiteral(), comptime T: type) ?T {
+        const hash = comptime keyHash(key);
+        var maybe_frame = s.frame;
+        while (maybe_frame) |frame| : (maybe_frame = frame.parent) {
+            if (frame.find(hash)) |index| return slotValue(T, key, &frame.slots[index]).*;
+        }
+        return null;
+    }
+
+    /// Same as `get`, for values which the schedule is required to provide: panics if it's missing.
+    pub fn require(s: ScheduleContext, comptime key: @EnumLiteral(), comptime T: type) T {
+        return s.get(key, T) orelse @panic("mach: schedule has no value ." ++ @tagName(key) ++ ": is the system providing it scheduled before this one?");
+    }
+
+    /// Whether this key has a value in the running schedule or those it is nested in.
+    pub fn has(s: ScheduleContext, comptime key: @EnumLiteral()) bool {
+        const hash = comptime keyHash(key);
+        var maybe_frame = s.frame;
+        while (maybe_frame) |frame| : (maybe_frame = frame.parent) {
+            if (frame.find(hash) != null) return true;
+        }
+        return false;
+    }
+
+    /// Removes a value of the running schedule, running its finalizers now. Does nothing if the
+    /// running schedule has no such value.
+    pub fn remove(s: ScheduleContext, comptime key: @EnumLiteral()) void {
+        const frame = s.frame orelse return;
+        const index = frame.find(comptime keyHash(key)) orelse return;
+        frame.slots[index].runFinalizers();
+        frame.removeAt(index);
+    }
+
+    /// Removes a value of the running schedule and returns it without running its finalizers,
+    /// handing ownership to the caller. Returns null if the running schedule has no such value.
+    pub fn take(s: ScheduleContext, comptime key: @EnumLiteral(), comptime T: type) ?T {
+        const frame = s.frame orelse return null;
+        const index = frame.find(comptime keyHash(key)) orelse return null;
+        const value = slotValue(T, key, &frame.slots[index]).*;
+        frame.removeAt(index);
+        return value;
+    }
+
+    /// Returns the params of the innermost running schedule having params of this type, see
+    /// `mach.scheduleWith`. Panics if there is none.
+    ///
+    /// Params are shared by all runs of the schedule and aren't synchronized, so a schedule run on
+    /// multiple threads at once must synchronize access to them itself.
+    pub fn params(s: ScheduleContext, comptime P: type) *P {
+        var maybe_frame = s.frame;
+        while (maybe_frame) |frame| : (maybe_frame = frame.parent) {
+            if (frame.params_type == @as(*const anyopaque, &TypeTag(P).tag)) return @ptrCast(@alignCast(frame.params.?));
+        }
+        @panic("mach: no running schedule has params of type " ++ @typeName(P));
+    }
+
+    /// Skips the remaining entries of the running schedule, e.g. when there's nothing to render.
+    /// Its values are still finalized, and any schedule it is nested in carries on.
+    pub fn stop(s: ScheduleContext) void {
+        if (s.frame) |frame| frame.stopped = true;
+    }
+};
+
 /// Per-module context given to systems which declare a `mach.Context` parameter:
 ///
 /// ```
@@ -929,6 +1293,9 @@ pub const Context = struct {
     /// The name of the system being run, e.g. "init". Empty for a context obtained outside of a
     /// system via `Modules.context()`.
     system_name: []const u8 = "",
+
+    /// Values shared between the systems of the running schedule. See `ScheduleContext`.
+    schedule: ScheduleContext = .{},
 
     _modules: *anyopaque,
     _report_memory: *const fn (modules: *anyopaque) void,
@@ -998,6 +1365,135 @@ fn MemoryPlot(comptime module_name: []const u8) type {
     };
 }
 
+/// The Tracy zone of a system or schedule. Its source location is the system's (or the schedule's
+/// declaration), so that Tracy's source view shows its code, rather than where it's called from.
+/// Resolved from debug info the first time it runs, see `resolveTraceLocation`.
+fn SystemTrace(comptime M: type, comptime fn_name: []const u8, comptime debug_name: [:0]const u8) type {
+    return struct {
+        const is_schedule = isScheduleDecl(@TypeOf(@field(M, fn_name)));
+
+        /// Without file and line until resolved, or if there is no debug info.
+        var src_loc: tracy.SourceLocation = .{
+            .name = debug_name.ptr,
+            .function = @typeName(M) ++ "." ++ fn_name,
+            .file = null,
+            .line = 0,
+            .color = if (is_schedule) ScheduleContext.trace_colors.schedule else 0,
+        };
+        var resolved: std.atomic.Value(bool) = .init(false);
+
+        inline fn begin() @TypeOf(tracy.initZoneAt(&src_loc, .{})) {
+            if (!build_options.tracy) return tracy.initZoneAt(&src_loc, .{});
+            if (!resolved.load(.acquire)) resolve();
+            return tracy.initZoneAt(&src_loc, .{});
+        }
+
+        fn resolve() void {
+            @branchHint(.cold);
+            trace_resolve_lock.lock();
+            defer trace_resolve_lock.unlock();
+            if (resolved.load(.monotonic)) return;
+            defer resolved.store(true, .release);
+
+            // A schedule has no code: find a function of its module for the file, and then its
+            // declaration in there.
+            const address = @intFromPtr(&@field(M, if (is_schedule) anyModuleFunction(M) orelse return else fn_name));
+            const location = resolveTraceLocation(address, if (is_schedule) fn_name else null) orelse return;
+            src_loc.file = location.file;
+            src_loc.line = location.line;
+        }
+    };
+}
+
+/// The name of any function of the module, or null if it has none.
+fn anyModuleFunction(comptime M: type) ?[]const u8 {
+    for (M.mach_systems) |system| {
+        if (@typeInfo(@TypeOf(@field(M, @tagName(system)))) == .@"fn") return @tagName(system);
+    }
+    return null;
+}
+
+/// Serializes resolving trace locations, since `std.debug.SelfInfo` isn't thread-safe.
+var trace_resolve_lock: struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(l: *@This()) void {
+        while (l.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(l: *@This()) void {
+        l.locked.store(false, .release);
+    }
+} = .{};
+
+/// Looks up the source file and line of the function at `address` in the debug info. With
+/// `decl_name`, finds the line of `const <decl_name> =` in that file instead. Results live forever,
+/// since Tracy may read them at any time. Only used with `-Dtracy`, once per system.
+fn resolveTraceLocation(address: usize, decl_name: ?[]const u8) ?struct { file: [*:0]const u8, line: u32 } {
+    const S = struct {
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    };
+    const allocator = S.arena.allocator();
+    const io = std.Options.debug_io;
+    const debug_info = std.debug.getSelfDebugInfo() catch return null;
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    debug_info.getSymbols(io, allocator, allocator, address, false, &symbols) catch return null;
+    if (symbols.items.len == 0) return null;
+    const location = symbols.items[0].source_location orelse return null;
+    const file = allocator.dupeSentinel(u8, location.file_name, 0) catch return null;
+
+    const name = decl_name orelse return .{ .file = file, .line = @intCast(location.line) };
+    const source = std.Io.Dir.cwd().readFileAlloc(io, file, allocator, .limited(16 * 1024 * 1024)) catch return null;
+    // The file may declare several of that name (e.g. in different structs): take the one closest
+    // to the module's function.
+    const fn_line: u32 = @intCast(location.line);
+    var best: ?u32 = null;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var line: u32 = 1;
+    while (lines.next()) |text| : (line += 1) {
+        const trimmed = std.mem.trimStart(u8, text, " ");
+        const decl = if (std.mem.startsWith(u8, trimmed, "pub ")) trimmed["pub ".len..] else trimmed;
+        if (!std.mem.startsWith(u8, decl, "const ")) continue;
+        const rest = decl["const ".len..];
+        if (!std.mem.startsWith(u8, rest, name) or !std.mem.startsWith(u8, std.mem.trimStart(u8, rest[name.len..], " "), "=")) continue;
+        if (best == null or @abs(@as(i64, line) - fn_line) < @abs(@as(i64, best.?) - fn_line)) best = line;
+    }
+    return .{ .file = file, .line = best orelse fn_line };
+}
+
+/// A `std.Options.logFn` which logs like the default one, and with `-Dtracy` also sends every
+/// message to Tracy as `scope: message`, colored by level. Messages from `ctx.log` are sent once,
+/// not twice. Set it in the app's root file to see all `std.log` messages in Tracy, including
+/// those of mach's platform code and GPU/audio callbacks, which have no `mach.Context`:
+///
+/// ```
+/// pub const std_options: std.Options = .{ .logFn = mach.logFn };
+/// ```
+///
+/// Apps using mach's entrypoint (`mach.addExecutable`) get it by default.
+pub fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    std.log.defaultLog(level, scope, format, args);
+    if (!build_options.tracy) return;
+    var buf: [Context.max_log_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print(format, args) catch {};
+    traceLog(level, @tagName(scope), w.buffered());
+}
+
+fn traceLog(level: std.log.Level, scope: []const u8, msg: []const u8) void {
+    tracy.printColor("{s}: {s}", .{ scope, msg }, switch (level) {
+        .err => 0xff4040,
+        .warn => 0xffc040,
+        .info => 0xffffff,
+        .debug => 0x909090,
+    });
+}
+
 /// Returns the `Context._log` / `Context._log_enabled` implementations for a module, whose
 /// `mach_module` enum literal is used as the `std.log` scope.
 fn ContextLog(comptime scope: @EnumLiteral()) type {
@@ -1013,19 +1509,23 @@ fn ContextLog(comptime scope: @EnumLiteral()) type {
         fn log(level: std.log.Level, system_name: []const u8, msg: []const u8) void {
             switch (level) {
                 inline else => |l| {
-                    if (comptime std.log.logEnabled(l, scope)) {
+                    const logged = comptime std.log.logEnabled(l, scope);
+                    if (logged) {
                         if (system_name.len == 0) {
                             std.options.logFn(l, scope, "{s}", .{msg});
                         } else {
                             std.options.logFn(l, scope, "[{s}] {s}", .{ system_name, msg });
                         }
                     }
-                    tracy.printColor("{s}.{s}: {s}", .{ @tagName(scope), system_name, msg }, switch (l) {
-                        .err => 0xff4040,
-                        .warn => 0xffc040,
-                        .info => 0xffffff,
-                        .debug => 0x909090,
-                    });
+                    // mach.logFn has already sent it to Tracy.
+                    if (build_options.tracy and !(logged and comptime std.options.logFn == logFn)) {
+                        if (system_name.len == 0) {
+                            traceLog(l, @tagName(scope), msg);
+                        } else {
+                            var buf: [Context.max_log_len]u8 = undefined;
+                            traceLog(l, @tagName(scope), std.fmt.bufPrint(&buf, "[{s}] {s}", .{ system_name, msg }) catch msg);
+                        }
+                    }
                 },
             }
         }
@@ -1042,9 +1542,20 @@ pub fn Mod(comptime M: type) type {
         id: ModFunctionIDs(M),
         _ctx: *anyopaque,
         _run: *const fn (ctx: *anyopaque, fn_id: FunctionID) void,
+        _schedule_params: *const fn (ctx: *anyopaque, fn_id: FunctionID) *anyopaque,
 
         pub fn run(r: *const @This(), fn_id: FunctionID) void {
             r._run(r._ctx, fn_id);
+        }
+
+        /// Returns the params of this module's schedule `f` (declared with `mach.scheduleWith`),
+        /// e.g. to set its conditions from outside of it. They are the same params its systems
+        /// get from `ctx.schedule.params()` while it runs.
+        ///
+        /// Schedules may run on other threads (e.g. the render thread): fields written from a
+        /// thread other than the one running the schedule must be `std.atomic.Value(bool)`.
+        pub fn scheduleParams(r: *const @This(), comptime f: ModuleFunctionName(M)) *ScheduleParamsOf(M, @tagName(f)) {
+            return @ptrCast(@alignCast(r._schedule_params(r._ctx, @field(r.id, @tagName(f)))));
         }
 
         pub fn call(r: *const @This(), comptime f: ModuleFunctionName(M)) void {
@@ -1052,6 +1563,14 @@ pub fn Mod(comptime M: type) type {
             r.run(fn_id);
         }
     };
+}
+
+fn ScheduleParamsOf(comptime M: type, comptime name: []const u8) type {
+    const F = @TypeOf(@field(M, name));
+    if (!isScheduleDecl(F) or F.Params == void) {
+        @compileError("mach: ." ++ @tagName(M.mach_module) ++ "." ++ name ++ " is not a schedule with params, see mach.scheduleWith()");
+    }
+    return F.Params;
 }
 
 pub fn ModFunctionIDs(comptime Module: type) type {
@@ -1072,6 +1591,7 @@ pub fn ModFunctionIDs(comptime Module: type) type {
 
 /// Enum describing all declarations for a given comptime-known module.
 fn ModuleFunctionName(comptime M: type) type {
+    @setEvalBranchQuota(10_000);
     validate(M);
     var enum_names: []const []const u8 = &.{};
     inline for (M.mach_systems) |fn_tag| {
@@ -1096,7 +1616,7 @@ fn validateModuleSystemDecls(comptime M: type) void {
         const F = @TypeOf(@field(M, name));
         const f_info = @typeInfo(F);
         const is_fn = f_info == .@"fn";
-        const is_schedule = f_info == .@"struct" and f_info.@"struct".is_tuple;
+        const is_schedule = isScheduleDecl(F);
         if (!is_fn and !is_schedule) {
             @compileError("Module ." ++ @tagName(M.mach_module) ++ " mach_systems entry ." ++ name ++ " must be a `pub fn` or `pub const " ++ name ++ " = mach.schedule(...)`, found: " ++ @typeName(F));
         }
@@ -1181,6 +1701,9 @@ pub fn Modules(module_lists: anytype) type {
             object_name_id: u32,
         }) = .{},
         graph: Graph,
+
+        /// The params of each schedule declared with `scheduleWith`, by "module.schedule" name.
+        schedule_params: ModuleScheduleParams(modules) = .{},
 
         pub const InitOptions = struct {
             /// Per-module allocator overrides, by module name, e.g.:
@@ -1389,32 +1912,62 @@ pub fn Modules(module_lists: anytype) type {
                     comptime fn_name: ModuleFunctionName(module),
                 ) void {
                     const debug_name = @tagName(module_name) ++ "." ++ @tagName(fn_name);
-                    const zone = tracy.initZone(@src(), .{ .name = debug_name });
-                    defer zone.deinit();
-                    defer m.modules.plotMemory(@tagName(module_name));
                     if (!@hasField(module, @tagName(fn_name)) and !@hasDecl(module, @tagName(fn_name))) {
                         @compileError("Module ." ++ @tagName(module_name) ++ " declares mach_systems entry ." ++ @tagName(fn_name) ++ " but no pub fn or schedule with that name exists.");
                     }
                     const f = @field(module, @tagName(fn_name));
                     const F = @TypeOf(f);
 
-                    if (@typeInfo(F) == .@"struct" and @typeInfo(F).@"struct".is_tuple) {
+                    // Every system and schedule gets a zone, so a schedule's zone contains a zone
+                    // for each part that ran. Its zone text lists the parts which didn't.
+                    const zone = SystemTrace(module, @tagName(fn_name), debug_name).begin();
+                    defer zone.deinit();
+                    defer m.modules.plotMemory(@tagName(module_name));
+
+                    if (comptime isScheduleDecl(F)) {
                         // Run a list of functions instead of a single function
-                        // TODO: verify this is a mach.schedule() decl
-                        if (module_name != .app) @compileLog(module_name);
-                        inline for (f) |schedule_entry| {
+                        var frame: ScheduleContext.Frame = .{ .parent = current_schedule_frame };
+                        if (F.Params != void) {
+                            frame.params = &@field(m.modules.schedule_params, @tagName(module_name) ++ "." ++ @tagName(fn_name));
+                            frame.params_type = &ScheduleContext.TypeTag(F.Params).tag;
+                        }
+                        current_schedule_frame = &frame;
+                        defer {
+                            current_schedule_frame = frame.parent;
+                            if (frame.len > 0) {
+                                const finalize_zone = tracy.initZone(@src(), .{
+                                    .name = debug_name ++ " finalize",
+                                    .color = ScheduleContext.trace_colors.finalize,
+                                });
+                                defer finalize_zone.deinit();
+                                frame.finalizeAll();
+                            }
+                        }
+
+                        inline for (F.entries) |schedule_entry| {
                             // TODO: unify with Modules(modules).get(M)
                             const callMod: Module(schedule_entry.@"0") = .{ .mods = m.mods, .modules = m.modules };
                             if (!@hasField(ModuleFunctionName(schedule_entry.@"0"), @tagName(schedule_entry.@"1"))) {
                                 @compileError("Module ." ++ @tagName(@TypeOf(callMod).mod_name) ++ " has no mach_systems entry '." ++ @tagName(schedule_entry.@"1") ++ "'");
                             }
                             const callFn = @as(ModuleFunctionName(schedule_entry.@"0"), schedule_entry.@"1");
-                            callMod.run(callFn);
+                            const entry_name = @tagName(@TypeOf(callMod).mod_name) ++ "." ++ @tagName(callFn);
+                            const skipped_by_condition = comptime if (@typeInfo(@TypeOf(schedule_entry)).@"struct".field_names.len < 3)
+                                ""
+                            else
+                                "skipped " ++ entry_name ++ " (." ++ @tagName(schedule_entry.@"2") ++ " is false)";
+                            if (frame.stopped) {
+                                zone.text("skipped " ++ entry_name ++ " (stopped)");
+                            } else if (!m.scheduleEntryEnabled(@tagName(fn_name), schedule_entry)) {
+                                zone.text(skipped_by_condition);
+                            } else {
+                                callMod.run(callFn);
+                                if (frame.stopped) zone.text("stopped by " ++ entry_name);
+                            }
                         }
                         return;
                     }
 
-                    // Inject arguments
                     var args: std.meta.ArgsTuple(F) = undefined;
                     outer: inline for (@typeInfo(std.meta.ArgsTuple(F)).@"struct".field_names, @typeInfo(std.meta.ArgsTuple(F)).@"struct".field_types) |arg_name, arg_type| {
                         if (@typeInfo(arg_type) == .pointer and
@@ -1433,6 +1986,7 @@ pub fn Modules(module_lists: anytype) type {
                         if (arg_type == Context) {
                             var ctx = m.modules.context(module_name);
                             ctx.system_name = @tagName(fn_name);
+                            ctx.schedule = .{ .frame = current_schedule_frame };
                             @field(args, arg_name) = ctx;
                             continue :outer;
                         }
@@ -1447,6 +2001,12 @@ pub fn Modules(module_lists: anytype) type {
                                         modules2.callDynamic(fn_id);
                                     }
                                 }).run,
+                                ._schedule_params = (struct {
+                                    pub fn get(ctx: *anyopaque, fn_id: FunctionID) *anyopaque {
+                                        const modules2: *Modules(module_lists) = @ptrCast(@alignCast(ctx));
+                                        return modules2.scheduleParamsDynamic(fn_id);
+                                    }
+                                }).get,
                             };
                             inline for (M.mach_systems) |m_fn_name| {
                                 @field(mv.id, @tagName(m_fn_name)) = Module(M).getFunction(m_fn_name);
@@ -1463,6 +2023,18 @@ pub fn Modules(module_lists: anytype) type {
                         .error_union => @call(.auto, f, args) catch |err| std.debug.panic("error: {s}", .{@errorName(err)}),
                         else => @call(.auto, f, args),
                     }
+                }
+
+                /// Whether a schedule entry of this module should run, according to its condition.
+                fn scheduleEntryEnabled(
+                    m: *const @This(),
+                    comptime schedule_name: []const u8,
+                    comptime schedule_entry: anytype,
+                ) bool {
+                    if (@typeInfo(@TypeOf(schedule_entry)).@"struct".field_names.len < 3) return true;
+                    const params = &@field(m.modules.schedule_params, @tagName(module_name) ++ "." ++ schedule_name);
+                    const condition = &@field(params, @tagName(schedule_entry.@"2"));
+                    return if (@TypeOf(condition.*) == bool) condition.* else condition.load(.acquire);
                 }
             };
         }
@@ -1501,6 +2073,25 @@ pub fn Modules(module_lists: anytype) type {
         /// Returns the allocator for the given module (its override, or the global allocator).
         pub fn allocatorFor(m: *@This(), module_tag_or_type: anytype) std.mem.Allocator {
             return @field(m.allocators, @tagName(Module(module_tag_or_type).mod_name));
+        }
+
+        /// The params of the schedule `f`, which must have been declared with `mach.scheduleWith`.
+        fn scheduleParamsDynamic(m: *@This(), f: FunctionID) *anyopaque {
+            if (comptime modules.len == 0) unreachable;
+            const module_name: ModuleName = @fromBackingInt(@intCast(f.module_id));
+            switch (module_name) {
+                inline else => |mod_name| {
+                    const M = @field(module_types_by_name, @tagName(mod_name));
+                    const module_fn_name: ModuleFunctionName(M) = @fromBackingInt(@intCast(f.fn_id));
+                    switch (module_fn_name) {
+                        inline else => |fn_name| {
+                            const F = @TypeOf(@field(M, @tagName(fn_name)));
+                            if (comptime !isScheduleDecl(F) or F.Params == void) unreachable;
+                            return &@field(m.schedule_params, @tagName(mod_name) ++ "." ++ @tagName(fn_name));
+                        },
+                    }
+                },
+            }
         }
 
         pub fn callDynamic(m: *@This(), f: FunctionID) void {
@@ -1606,6 +2197,30 @@ fn ModuleTypesByName(comptime modules: anytype) type {
             .@"comptime" = true,
             .@"align" = null,
         }};
+    }
+    return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
+}
+
+/// Given .{Foo, Bar, Baz} Mach modules, returns a struct with one field per schedule declared with
+/// `scheduleWith`, named "module.schedule", holding its params with their default values.
+fn ModuleScheduleParams(comptime modules: anytype) type {
+    var field_names: []const []const u8 = &.{};
+    var field_types: []const type = &.{};
+    var field_attrs: []const std.builtin.Type.Struct.FieldAttributes = &.{};
+    for (modules) |M| {
+        if (!@hasDecl(M, "mach_systems")) continue;
+        for (M.mach_systems) |system| {
+            const F = @TypeOf(@field(M, @tagName(system)));
+            if (!isScheduleDecl(F) or F.Params == void) continue;
+            const default: F.Params = .{};
+            field_names = field_names ++ [_][]const u8{@tagName(M.mach_module) ++ "." ++ @tagName(system)};
+            field_types = field_types ++ [_]type{F.Params};
+            field_attrs = field_attrs ++ [_]std.builtin.Type.Struct.FieldAttributes{.{
+                .default_value_ptr = @ptrCast(&default),
+                .@"comptime" = false,
+                .@"align" = null,
+            }};
+        }
     }
     return @Struct(.auto, null, field_names[0..field_names.len], field_types[0..field_types.len], field_attrs[0..field_attrs.len]);
 }
@@ -1957,4 +2572,451 @@ test "Objects.sliceField" {
     var values = things.sliceField(.a);
     while (ids.next()) |id| try std.testing.expectEqual(@as(?u32, things.get(id, .a)), values.next());
     try std.testing.expectEqual(@as(?u32, null), values.next());
+}
+
+/// A resource which records when it was released, for the schedule tests.
+const TestResource = struct {
+    id: u8,
+    log: *std.ArrayList(u8),
+
+    pub fn release(r: *TestResource) void {
+        r.log.appendAssumeCapacity(r.id);
+    }
+};
+
+test "ScheduleContext: share values, finalize in reverse order when the schedule ends" {
+    const a = struct {
+        const A = @This();
+        pub const mach_module = .a;
+        pub const mach_systems = .{ .frame, .begin, .use };
+
+        pub const frame = schedule(.{
+            .{ A, .begin },
+            .{ A, .use },
+        });
+
+        first: TestResource,
+        second: TestResource,
+        seen: u32,
+        released_during_use: usize,
+
+        pub fn begin(m: *A, ctx: Context) void {
+            ctx.schedule.put(.first, &m.first, .{.release});
+            ctx.schedule.put(.second, &m.second, .{.release});
+            ctx.schedule.put(.number, @as(u32, 42), .{});
+        }
+
+        pub fn use(m: *A, ctx: Context) void {
+            m.seen = ctx.schedule.require(.number, u32);
+            m.released_during_use = m.first.log.items.len;
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var log: std.ArrayList(u8) = .initBuffer(&buf);
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{a}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.a.first = .{ .id = 1, .log = &log };
+    modules.mods.a.second = .{ .id = 2, .log = &log };
+
+    modules.get(.a).run(.frame);
+    try std.testing.expectEqual(42, modules.mods.a.seen);
+    try std.testing.expectEqual(0, modules.mods.a.released_during_use);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, log.items);
+
+    // Values don't outlive the run.
+    try std.testing.expect(current_schedule_frame == null);
+}
+
+test "ScheduleContext: chained schedules across modules" {
+    const inner = struct {
+        const Inner = @This();
+        pub const mach_module = .inner;
+        pub const mach_systems = .{ .chain, .readParent };
+
+        pub const chain = schedule(.{
+            .{ Inner, .readParent },
+        });
+
+        from_parent: ?u32,
+        resource: TestResource,
+
+        pub fn readParent(m: *Inner, ctx: Context) void {
+            m.from_parent = ctx.schedule.get(.parent_value, u32);
+            ctx.schedule.put(.inner_value, @as(u32, 2), .{});
+            ctx.schedule.put(.parent_value, @as(u32, 99), .{}); // Shadows, within this schedule.
+            ctx.schedule.put(.resource, &m.resource, .{.release});
+        }
+    };
+    const outer = struct {
+        const Outer = @This();
+        pub const mach_module = .outer;
+        pub const mach_systems = .{ .main, .begin, .check };
+
+        pub const main = schedule(.{
+            .{ Outer, .begin },
+            .{ inner, .chain },
+            .{ Outer, .check },
+        });
+
+        parent_value_after: ?u32,
+        inner_value_after: ?u32,
+        released_before_check: usize,
+        log: *std.ArrayList(u8),
+
+        pub fn begin(ctx: Context) void {
+            ctx.schedule.put(.parent_value, @as(u32, 1), .{});
+        }
+
+        pub fn check(m: *Outer, ctx: Context) void {
+            m.parent_value_after = ctx.schedule.get(.parent_value, u32);
+            m.inner_value_after = ctx.schedule.get(.inner_value, u32);
+            m.released_before_check = m.log.items.len;
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var log: std.ArrayList(u8) = .initBuffer(&buf);
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{ outer, inner }) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.outer.log = &log;
+    modules.mods.inner.resource = .{ .id = 7, .log = &log };
+
+    modules.get(.outer).run(.main);
+    try std.testing.expectEqual(1, modules.mods.inner.from_parent);
+    try std.testing.expectEqual(1, modules.mods.outer.parent_value_after);
+    try std.testing.expectEqual(null, modules.mods.outer.inner_value_after);
+    // The nested schedule's values were released when it ended, before the outer one carried on.
+    try std.testing.expectEqual(1, modules.mods.outer.released_before_check);
+}
+
+test "ScheduleContext: systems called with Mod.call see the schedule" {
+    const callee = struct {
+        pub const mach_module = .callee;
+        pub const mach_systems = .{.read};
+
+        seen: ?u32,
+
+        pub fn read(m: *@This(), ctx: Context) void {
+            m.seen = ctx.schedule.get(.value, u32);
+        }
+    };
+    const caller = struct {
+        const Caller = @This();
+        pub const mach_module = .caller;
+        pub const mach_systems = .{ .main, .callIt };
+
+        pub const main = schedule(.{
+            .{ Caller, .callIt },
+        });
+
+        pub fn callIt(ctx: Context, callee_mod: Mod(callee)) void {
+            ctx.schedule.put(.value, @as(u32, 5), .{});
+            callee_mod.call(.read);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{ caller, callee }) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+
+    modules.get(.caller).run(.main);
+    try std.testing.expectEqual(5, modules.mods.callee.seen);
+
+    // Outside of a schedule, there are no values.
+    modules.get(.callee).run(.read);
+    try std.testing.expectEqual(null, modules.mods.callee.seen);
+}
+
+test "ScheduleContext: stop skips the rest of the running schedule only" {
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .outer, .inner, .stopIt, .neverRuns, .afterInner, .provide };
+
+        pub const outer = schedule(.{
+            .{ M, .inner },
+            .{ M, .afterInner },
+        });
+
+        pub const inner = schedule(.{
+            .{ M, .provide },
+            .{ M, .stopIt },
+            .{ M, .neverRuns },
+        });
+
+        resource: TestResource,
+        never_ran: bool,
+        after_inner_ran: bool,
+
+        pub fn provide(m_: *M, ctx: Context) void {
+            ctx.schedule.put(.resource, &m_.resource, .{.release});
+        }
+
+        pub fn stopIt(ctx: Context) void {
+            ctx.schedule.stop();
+        }
+
+        pub fn neverRuns(m_: *M) void {
+            m_.never_ran = true;
+        }
+
+        pub fn afterInner(m_: *M) void {
+            m_.after_inner_ran = true;
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var log: std.ArrayList(u8) = .initBuffer(&buf);
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{m}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.m = .{
+        .resource = .{ .id = 3, .log = &log },
+        .never_ran = false,
+        .after_inner_ran = false,
+    };
+
+    modules.get(.m).run(.outer);
+    try std.testing.expect(!modules.mods.m.never_ran);
+    try std.testing.expect(modules.mods.m.after_inner_ran);
+    try std.testing.expectEqualSlices(u8, &.{3}, log.items); // Still released.
+}
+
+test "ScheduleContext: replace, remove and take" {
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .main, .work };
+
+        pub const main = schedule(.{
+            .{ M, .work },
+        });
+
+        a: TestResource,
+        b: TestResource,
+        c: TestResource,
+        d: TestResource,
+        taken: ?*TestResource,
+        has_after_remove: bool,
+
+        pub fn work(m_: *M, ctx: Context) void {
+            ctx.schedule.put(.pass, &m_.a, .{.release});
+            ctx.schedule.put(.pass, &m_.b, .{.release}); // releases a
+            ctx.schedule.remove(.pass); // releases b
+            m_.has_after_remove = ctx.schedule.has(.pass);
+            ctx.schedule.put(.owned, &m_.c, .{.release});
+            m_.taken = ctx.schedule.take(.owned, *TestResource); // never released
+            ctx.schedule.put(.last, &m_.d, .{.release}); // released at the end
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var log: std.ArrayList(u8) = .initBuffer(&buf);
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{m}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.m.a = .{ .id = 1, .log = &log };
+    modules.mods.m.b = .{ .id = 2, .log = &log };
+    modules.mods.m.c = .{ .id = 3, .log = &log };
+    modules.mods.m.d = .{ .id = 4, .log = &log };
+
+    modules.get(.m).run(.main);
+    try std.testing.expect(!modules.mods.m.has_after_remove);
+    try std.testing.expectEqual(&modules.mods.m.c, modules.mods.m.taken.?);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4 }, log.items);
+}
+
+test "ScheduleContext: finalizer methods run in order, on the value or a pointer to it" {
+    const Handle = struct {
+        id: u8,
+        log: *std.ArrayList(u8),
+
+        pub fn close(h: *@This()) void {
+            h.log.appendAssumeCapacity(h.id);
+        }
+
+        pub fn flush(h: @This()) error{}!void {
+            h.log.appendAssumeCapacity(h.id + 1);
+        }
+    };
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .main, .work };
+
+        pub const main = schedule(.{
+            .{ M, .work },
+        });
+
+        handle: Handle,
+
+        pub fn work(m_: *M, ctx: Context) void {
+            ctx.schedule.put(.handle, m_.handle, .{ .flush, .close });
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var log: std.ArrayList(u8) = .initBuffer(&buf);
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{m}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.m.handle = .{ .id = 1, .log = &log };
+
+    modules.get(.m).run(.main);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, log.items);
+}
+
+test "Schedule params and conditions" {
+    const Params = struct {
+        needs_setup: bool = true,
+        gated: bool = false,
+        count: u32 = 10,
+    };
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .main, .nested, .setup, .always, .gated, .readFromNested };
+
+        pub const main = scheduleWith(Params, .{
+            .{ M, .setup, .needs_setup },
+            .{ M, .always },
+            .{ M, .gated, .gated },
+            .{ M, .nested },
+        });
+
+        pub const nested = schedule(.{
+            .{ M, .readFromNested },
+        });
+
+        setups: u32,
+        always_runs: u32,
+        gated_runs: u32,
+        count_seen: u32,
+
+        pub fn setup(m_: *M, ctx: Context) void {
+            m_.setups += 1;
+            ctx.schedule.params(Params).needs_setup = false;
+        }
+
+        pub fn always(m_: *M, ctx: Context) void {
+            m_.always_runs += 1;
+            // Takes effect for the entries after this one.
+            ctx.schedule.params(Params).gated = m_.always_runs >= 3;
+            ctx.schedule.params(Params).count += 1;
+        }
+
+        pub fn gated(m_: *M) void {
+            m_.gated_runs += 1;
+        }
+
+        pub fn readFromNested(m_: *M, ctx: Context) void {
+            m_.count_seen = ctx.schedule.params(Params).count;
+        }
+    };
+    const zero: m = .{ .setups = 0, .always_runs = 0, .gated_runs = 0, .count_seen = 0 };
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{m}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.m = zero;
+
+    modules.get(.m).run(.main);
+    modules.get(.m).run(.main);
+    modules.get(.m).run(.main);
+
+    try std.testing.expectEqual(1, modules.mods.m.setups);
+    try std.testing.expectEqual(3, modules.mods.m.always_runs);
+    try std.testing.expectEqual(1, modules.mods.m.gated_runs);
+    // Params are kept between runs, and visible to nested schedules.
+    try std.testing.expectEqual(13, modules.mods.m.count_seen);
+
+    // Params are per Modules instance.
+    var other: Modules(.{m}) = undefined;
+    try other.init(allocator, std.Options.debug_io);
+    defer other.deinit(allocator);
+    other.mods.m = zero;
+    other.get(.m).run(.main);
+    try std.testing.expectEqual(1, other.mods.m.setups);
+    try std.testing.expectEqual(11, other.mods.m.count_seen);
+}
+
+test "Schedule atomic conditions, set from another schedule" {
+    const Params = struct {
+        ready: std.atomic.Value(bool) = .init(false),
+    };
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .tick, .onReady, .publish };
+
+        pub const tick = scheduleWith(Params, .{
+            .{ M, .onReady, .ready },
+        });
+
+        ready_runs: u32 = 0,
+
+        pub fn onReady(m_: *M, ctx: Context) void {
+            m_.ready_runs += 1;
+            ctx.schedule.params(Params).ready.store(false, .release);
+        }
+
+        /// Not part of `tick`, e.g. running on another thread.
+        pub fn publish(m_mod: Mod(M)) void {
+            m_mod.scheduleParams(.tick).ready.store(true, .release);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{m}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.m = .{};
+
+    modules.get(.m).run(.tick);
+    try std.testing.expectEqual(0, modules.mods.m.ready_runs);
+    modules.get(.m).run(.publish);
+    modules.get(.m).run(.tick);
+    modules.get(.m).run(.tick);
+    try std.testing.expectEqual(1, modules.mods.m.ready_runs);
+}
+
+test "Trace locations resolve to systems and schedule declarations" {
+    if (std.debug.SelfInfo == void) return error.SkipZigTest;
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .tick, .system };
+
+        pub const tick = schedule(.{
+            .{ M, .system },
+        });
+
+        pub fn system() std.builtin.SourceLocation {
+            return @src();
+        }
+    };
+
+    const src = m.system();
+    const fn_location = resolveTraceLocation(@intFromPtr(&m.system), null) orelse return error.SkipZigTest;
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.span(fn_location.file), "module.zig"));
+    // The line of `pub fn system`, just above the @src() in its body.
+    try std.testing.expectEqual(src.line - 1, fn_location.line);
+
+    const schedule_location = resolveTraceLocation(@intFromPtr(&m.system), "tick") orelse return error.SkipZigTest;
+    try std.testing.expectEqual(src.line - 5, schedule_location.line);
 }
