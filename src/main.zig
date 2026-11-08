@@ -43,6 +43,7 @@ pub const initGraph = module.initGraph;
 pub const schedule = module.schedule;
 pub const scheduleWith = module.scheduleWith;
 pub const ScheduleContext = module.ScheduleContext;
+pub const Require = module.Require;
 pub const startThread = module.startThread;
 pub const logFn = module.logFn;
 

@@ -25,6 +25,22 @@
 //! * Systems called with `Mod.call` from within a schedule see it too.
 //! * Values aren't shared with other threads, or kept between runs. Only the schedule's params are
 //!   kept between runs, see `scheduleWith`.
+//! * A value put in a nested schedule is finalized when it ends, unless a later entry of a schedule
+//!   it is nested in declares a `Require` parameter for it: then it moves up to that schedule, and
+//!   lives until it ends. This is worked out at comptime from the systems' signatures:
+//!
+//! ```
+//! pub const setup = mach.schedule(.{
+//!     .{ Asset, .setup }, // nested schedule, its setupAtlas puts .atlas_layout
+//!     .{ Renderer, .setupPipeline },
+//! });
+//!
+//! pub fn setupPipeline(layout: mach.Require(.atlas_layout, *gpu.BindGroupLayout)) void {
+//!     ... layout.value ...
+//! }
+//! ```
+//!
+//!   Values read only with `get` or `require` don't count, nor systems run with `Mod.call`.
 //!
 //! Outside of a schedule there are no values: `get` returns null, and `stop` does nothing.
 const std = @import("std");
@@ -65,6 +81,9 @@ const Slot = struct {
 pub const Frame = struct {
     parent: ?*Frame,
     stopped: bool = false,
+    /// Keys of the values which the entries after the running one require, see `Require`. Values
+    /// of these keys outlive the schedules nested in this one.
+    keep: []const u64 = &.{},
     params: ?*anyopaque = null,
     params_type: ?*const anyopaque = null,
     len: u8 = 0,
@@ -90,7 +109,78 @@ pub const Frame = struct {
             frame.slots[frame.len].runFinalizers();
         }
     }
+
+    /// Called when the schedule ends: moves the values still required by a schedule it is nested
+    /// in to its parent, and finalizes the rest in the opposite order they were put.
+    pub fn end(frame: *Frame) void {
+        if (frame.parent) |parent| {
+            var remaining: u8 = 0;
+            for (frame.slots[0..frame.len]) |slot| {
+                if (parent.keeps(slot.key_hash)) {
+                    parent.adopt(slot);
+                } else {
+                    frame.slots[remaining] = slot;
+                    remaining += 1;
+                }
+            }
+            frame.len = remaining;
+        }
+        frame.finalizeAll();
+    }
+
+    /// Whether this frame or one it is nested in keeps values of this key.
+    fn keeps(frame: *Frame, key_hash: u64) bool {
+        var maybe_frame: ?*Frame = frame;
+        while (maybe_frame) |f| : (maybe_frame = f.parent) {
+            if (std.mem.indexOfScalar(u64, f.keep, key_hash) != null) return true;
+        }
+        return false;
+    }
+
+    /// Takes over a value of a nested schedule, as if it was put in this one.
+    fn adopt(frame: *Frame, slot: Slot) void {
+        if (frame.find(slot.key_hash)) |index| {
+            frame.slots[index].runFinalizers();
+            frame.removeAt(index);
+        }
+        if (frame.len == max_values) {
+            std.debug.panic("mach: keeping schedule value .{s} exceeds ScheduleContext.max_values", .{slot.key_name});
+        }
+        frame.slots[frame.len] = slot;
+        frame.len += 1;
+    }
 };
+
+/// A system parameter for a value of the running schedule which the system requires, like
+/// `ctx.schedule.require(key, T)`. Unlike `require`, it is visible to the schedule at comptime: a
+/// value of this key put in a schedule nested in the same one, and before it, is kept alive for it
+/// instead of being finalized when its schedule ends.
+///
+/// ```
+/// pub fn draw(pass: mach.Require(.render_pass, *gpu.RenderPassEncoder)) void {
+///     pass.value.draw(3, 1, 0, 0);
+/// }
+/// ```
+pub fn Require(comptime key: @EnumLiteral(), comptime T: type) type {
+    comptime checkValueType(T);
+    return struct {
+        pub const IsMachRequire = void;
+        pub const Value = T;
+        pub const key_name = @tagName(key);
+        pub const key_hash = keyHash(key);
+
+        value: T,
+
+        /// Panics if the running schedule has no such value.
+        pub fn init(s: ScheduleContext) @This() {
+            return .{ .value = s.require(key, T) };
+        }
+    };
+}
+
+pub fn isRequire(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "IsMachRequire");
+}
 
 /// A unique address per type, to identify the type of a stored value.
 pub fn TypeTag(comptime T: type) type {
@@ -570,4 +660,97 @@ test "ScheduleContext: finalizer methods run in order, on the value or a pointer
 
     modules.get(.m).run(.main);
     try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, log.items);
+}
+
+test "ScheduleContext: values required by a later entry outlive their nested schedule" {
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .main, .mid, .inner, .later, .provide, .checkMid, .consume };
+
+        pub const main = schedule(.{
+            .{ M, .mid },
+            .{ M, .later },
+        });
+
+        pub const mid = schedule(.{
+            .{ M, .inner },
+            .{ M, .checkMid },
+        });
+
+        pub const inner = schedule(.{
+            .{ M, .provide },
+        });
+
+        pub const later = schedule(.{
+            .{ M, .consume },
+        });
+
+        kept: TestResource,
+        dropped: TestResource,
+        released_at_check_mid: []const u8,
+        released_at_consume: []const u8,
+        consumed_id: u8,
+
+        pub fn provide(m_: *M, ctx: Context) void {
+            ctx.schedule.put(.kept, &m_.kept, .{.release});
+            ctx.schedule.put(.dropped, &m_.dropped, .{.release});
+        }
+
+        pub fn checkMid(m_: *M) void {
+            m_.released_at_check_mid = m_.kept.log.items;
+        }
+
+        pub fn consume(m_: *M, kept: module.Require(.kept, *TestResource)) void {
+            m_.consumed_id = kept.value.id;
+            m_.released_at_consume = m_.kept.log.items;
+        }
+    };
+
+    var buf: [8]u8 = undefined;
+    var log: std.ArrayList(u8) = .initBuffer(&buf);
+
+    const allocator = std.testing.allocator;
+    var modules: Modules(.{m}) = undefined;
+    try modules.init(allocator, std.Options.debug_io);
+    defer modules.deinit(allocator);
+    modules.mods.m.kept = .{ .id = 1, .log = &log };
+    modules.mods.m.dropped = .{ .id = 2, .log = &log };
+
+    modules.get(.m).run(.main);
+    // Not required later, so released when its schedule ended, as before.
+    try std.testing.expectEqualSlices(u8, &.{2}, modules.mods.m.released_at_check_mid);
+    // Required by `later`, so kept through `inner` and `mid` ending, and released by `main`.
+    try std.testing.expectEqual(1, modules.mods.m.consumed_id);
+    try std.testing.expectEqualSlices(u8, &.{2}, modules.mods.m.released_at_consume);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, log.items);
+}
+
+test "ScheduleContext: Require is visible to the schedule at comptime" {
+    const m = struct {
+        const M = @This();
+        pub const mach_module = .m;
+        pub const mach_systems = .{ .main, .nested, .a, .b };
+
+        pub const main = schedule(.{
+            .{ M, .a },
+            .{ M, .nested },
+        });
+
+        pub const nested = schedule(.{
+            .{ M, .b },
+        });
+
+        pub fn a(ctx: Context) void {
+            _ = ctx;
+        }
+
+        pub fn b(x: module.Require(.x, u32), y: module.Require(.y, bool)) void {
+            _ = x;
+            _ = y;
+        }
+    };
+    const keys = @import("schedule.zig").keysRequiredAfter(@TypeOf(m.main).entries, 0);
+    try std.testing.expectEqualSlices(u64, &.{ comptime keyHash(.x), comptime keyHash(.y) }, keys);
+    try std.testing.expectEqual(0, @import("schedule.zig").keysRequiredAfter(@TypeOf(m.main).entries, 1).len);
 }

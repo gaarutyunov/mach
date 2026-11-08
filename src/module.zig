@@ -20,7 +20,9 @@ pub const Objects = objects.Objects;
 const schedules = @import("module/schedule.zig");
 pub const schedule = schedules.schedule;
 pub const scheduleWith = schedules.scheduleWith;
+pub const Require = ScheduleContext.Require;
 const isScheduleDecl = schedules.isScheduleDecl;
+const keysRequiredAfter = schedules.keysRequiredAfter;
 const ScheduleParamsOf = schedules.ScheduleParamsOf;
 
 const trace = @import("module/trace.zig");
@@ -486,11 +488,11 @@ pub fn Modules(module_lists: anytype) type {
                                     .color = trace.colors.finalize,
                                 });
                                 defer finalize_zone.deinit();
-                                frame.finalizeAll();
+                                frame.end();
                             }
                         }
 
-                        inline for (F.entries) |schedule_entry| {
+                        inline for (F.entries, 0..) |schedule_entry, entry_index| {
                             // TODO: unify with Modules(modules).get(M)
                             const callMod: Module(schedule_entry.@"0") = .{ .mods = m.mods, .modules = m.modules };
                             if (!@hasField(ModuleFunctionName(schedule_entry.@"0"), @tagName(schedule_entry.@"1"))) {
@@ -502,6 +504,7 @@ pub fn Modules(module_lists: anytype) type {
                                 ""
                             else
                                 "skipped " ++ entry_name ++ " (." ++ @tagName(schedule_entry.@"2") ++ " is false)";
+                            frame.keep = comptime keysRequiredAfter(F.entries, entry_index);
                             if (frame.stopped) {
                                 zone.text("skipped " ++ entry_name ++ " (stopped)");
                             } else if (!m.scheduleEntryEnabled(@tagName(fn_name), schedule_entry)) {
@@ -534,6 +537,10 @@ pub fn Modules(module_lists: anytype) type {
                             ctx.system_name = @tagName(fn_name);
                             ctx.schedule = .{ .frame = ScheduleContext.current_frame };
                             @field(args, arg_name) = ctx;
+                            continue :outer;
+                        }
+                        if (comptime ScheduleContext.isRequire(arg_type)) {
+                            @field(args, arg_name) = .init(.{ .frame = ScheduleContext.current_frame });
                             continue :outer;
                         }
                         if (@typeInfo(arg_type) == .@"struct" and @hasDecl(arg_type, "IsMachMod")) {

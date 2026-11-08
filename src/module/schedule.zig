@@ -84,6 +84,37 @@ pub fn isScheduleDecl(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "IsMachSchedule");
 }
 
+/// The keys of the `ScheduleContext.Require` parameters of a system, or of all systems of a
+/// schedule and those nested in it.
+pub fn requiredKeys(comptime M: type, comptime fn_name: @EnumLiteral()) []const u64 {
+    return comptime blk: {
+        const F = @TypeOf(@field(M, @tagName(fn_name)));
+        var keys: []const u64 = &.{};
+        if (isScheduleDecl(F)) {
+            for (F.entries) |entry| keys = keys ++ requiredKeys(entry.@"0", entry.@"1");
+        } else if (@typeInfo(F) == .@"fn") {
+            for (@typeInfo(std.meta.ArgsTuple(F)).@"struct".field_types) |T| {
+                if (ScheduleContext.isRequire(T)) keys = keys ++ &[_]u64{T.key_hash};
+            }
+        }
+        const final = keys[0..keys.len].*;
+        break :blk &final;
+    };
+}
+
+/// The keys required by the entries after the one at `index`, see `requiredKeys`: those whose
+/// values outlive the schedule run by the entry at `index`.
+pub fn keysRequiredAfter(comptime entries: anytype, comptime index: usize) []const u64 {
+    return comptime blk: {
+        var keys: []const u64 = &.{};
+        for (entries, 0..) |entry, i| {
+            if (i > index) keys = keys ++ requiredKeys(entry.@"0", entry.@"1");
+        }
+        const final = keys[0..keys.len].*;
+        break :blk &final;
+    };
+}
+
 /// When a schedule is called, the list of module functions described within are executed in order.
 ///
 /// Example:
