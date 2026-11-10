@@ -94,6 +94,9 @@ const BuiltPipeline = struct {
     uv_transforms: *gpu.Buffer,
     sizes: *gpu.Buffer,
     buffer_cap: u32,
+    /// Hash of the render list the buffers were last filled from: adding or removing objects
+    /// doesn't flag any object as updated (e.g. `cleanup` edits the list with `setRaw`).
+    list_hash: u64 = 0,
 
     fn deinit(p: *const BuiltPipeline) void {
         p.render.release();
@@ -447,7 +450,11 @@ pub fn render(sprite: *Sprite, core: *mach.Core, ctx: mach.Context) !void {
 
         // If the pipeline was just rebuilt, or any sprites were updated, we need to
         // upload all sprite data to the GPU storage buffers.
-        const any_sprites_updated = needs_rebuild or blk: {
+        const list_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(render_list));
+        const built_list = &sprite.built_pipelines.items[pipeline.built_index.?].?.list_hash;
+        const list_changed = built_list.* != list_hash;
+        built_list.* = list_hash;
+        const any_sprites_updated = needs_rebuild or list_changed or blk: {
             for (render_list) |sprite_id| {
                 if (!sprite.render_objects.is(sprite_id)) continue;
                 if (sprite.render_objects.anyUpdated(sprite_id)) break :blk true;

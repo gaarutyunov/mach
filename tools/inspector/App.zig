@@ -203,7 +203,10 @@ graph_arena: std.heap.ArenaAllocator,
 graph: Model.Graph = .{},
 /// Positions of nodes the user moved, by node key, kept across reloads.
 moved: std.AutoHashMapUnmanaged(u64, [2]f32) = .empty,
+/// The selected node's index in `graph`, resolved from `selected_key` whenever the graph is
+/// rebuilt (node indices change between snapshots).
 selected: ?u32 = null,
+selected_key: ?u64 = null,
 show_problems: bool = true,
 needs_fit: bool = true,
 /// How graph views are laid out: a force simulation on the GPU (`G` toggles), or columns.
@@ -375,7 +378,7 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                     dirty_scene = true;
                 },
                 .escape => {
-                    app.selected = null;
+                    app.select(null);
                     dirty_scene = true;
                 },
                 .left => app.cam_x -= pan_step,
@@ -437,7 +440,7 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                 const wx, const wy = app.toWorld(app.mouse_x, app.mouse_y);
                 const hit = app.graph.hit(wx, wy);
                 if (app.drag != .none and hit != app.selected) {
-                    app.selected = hit;
+                    app.select(hit);
                     dirty_scene = true;
                 }
             }
@@ -498,6 +501,11 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
     }
 }
 
+fn select(app: *App, i: ?u32) void {
+    app.selected = i;
+    app.selected_key = if (i) |n| app.graph.nodes.items[n].key else null;
+}
+
 /// Whether the current graph is laid out by the force simulation.
 fn simulating(app: *const App) bool {
     return app.layout_mode == .gravity and !app.graph.positioned and app.graph.nodes.items.len > 0;
@@ -506,7 +514,7 @@ fn simulating(app: *const App) bool {
 fn setView(app: *App, view: Model.View, dirty: *bool) void {
     if (app.view == view) return;
     app.view = view;
-    app.selected = null;
+    app.select(null);
     app.needs_fit = true;
     dirty.* = true;
 }
@@ -713,9 +721,8 @@ fn rebuildScene(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     app.graph = .{};
     const s = app.snapshot orelse return;
     app.graph = try Model.build(app.graph_arena.allocator(), &s, app.view, app.options);
-    if (app.selected) |i| if (i >= app.graph.nodes.items.len) {
-        app.selected = null;
-    };
+    // Same node as before the rebuild, wherever it is now.
+    app.selected = if (app.selected_key) |k| app.graph.find(k) else null;
     for (app.graph.nodes.items) |*n| {
         if (app.moved.get(n.key)) |pos| {
             n.x = pos[0];
@@ -1070,7 +1077,7 @@ fn showGpuObject(app: *App, id: u32, dirty_scene: *bool, dirty_camera: *bool) vo
         n.y = pos[1];
     };
     const i = app.graph.find(Model.keyOf(.{ "gpu", id })) orelse return;
-    app.selected = i;
+    app.select(i);
     const n = app.graph.nodes.items[i];
     app.cam_x = n.x + n.w / 2 + details_width / 2 / app.zoom;
     app.cam_y = n.y + n.h / 2;

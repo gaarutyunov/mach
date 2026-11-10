@@ -1102,9 +1102,31 @@ fn xmlText(w: *std.Io.Writer, s: []const u8) !void {
 // ---------------------------------------------------------------------------------------------
 // Layered layout: layers by longest path (cycles broken), order by barycenter sweeps.
 
-const max_per_column = 30;
 const layer_gap: f32 = 120;
 const node_gap: f32 = 14;
+
+/// Assigns rows (`top`, growing downwards) to a column's nodes, in their order: each node level
+/// with its neighbors in later columns (`from_right`) or earlier ones, and pushed down by the
+/// node above it when they'd overlap.
+fn placeColumn(g: *Graph, column: []const u32, layer: []const u32, li: u32, top: []f32, from_right: bool) void {
+    var bottom: f32 = -std.math.inf(f32);
+    for (column) |ni| {
+        const node = g.nodes.items[ni];
+        var sum: f32 = 0;
+        var count: f32 = 0;
+        for (g.edges.items) |e| {
+            const other: ?u32 = if (from_right and e.from == ni and layer[e.to] > li) e.to else if (!from_right and e.to == ni and layer[e.from] < li) e.from else null;
+            if (other) |o| {
+                sum += top[o] + g.nodes.items[o].h / 2;
+                count += 1;
+            }
+        }
+        const first = bottom == -std.math.inf(f32);
+        const want = if (count > 0) sum / count - node.h / 2 else if (first) top[ni] else bottom + node_gap;
+        top[ni] = if (first) want else @max(want, bottom + node_gap);
+        bottom = top[ni] + node.h;
+    }
+}
 
 pub fn layout(a: std.mem.Allocator, g: *Graph) !void {
     const n = g.nodes.items.len;
@@ -1156,15 +1178,22 @@ pub fn layout(a: std.mem.Allocator, g: *Graph) !void {
             }
         }
     }
-    // Pull sources right next to their first successor, so they don't all sit in layer 0.
-    for (0..n) |i| {
-        var min_succ: u32 = std.math.maxInt(u32);
-        var has_pred = false;
-        for (dag.items) |e| {
-            if (e[0] == i) min_succ = @min(min_succ, layer[e[1]]);
-            if (e[1] == i) has_pred = true;
+    // Push every node right, next to its nearest successor (a consumer's inputs then sit in the
+    // column just left of it), keeping the order along edges.
+    changed = true;
+    rounds = 0;
+    while (changed and rounds < n + 1) : (rounds += 1) {
+        changed = false;
+        for (0..n) |i| {
+            var min_succ: u32 = std.math.maxInt(u32);
+            for (dag.items) |e| {
+                if (e[0] == i) min_succ = @min(min_succ, layer[e[1]]);
+            }
+            if (min_succ != std.math.maxInt(u32) and min_succ > 0 and layer[i] < min_succ - 1) {
+                layer[i] = min_succ - 1;
+                changed = true;
+            }
         }
-        if (!has_pred and min_succ != std.math.maxInt(u32) and min_succ > 0) layer[i] = min_succ - 1;
     }
 
     var num_layers: u32 = 0;
@@ -1173,63 +1202,85 @@ pub fn layout(a: std.mem.Allocator, g: *Graph) !void {
         num_layers = @max(num_layers, l + 1);
     }
 
-    // Initial order: insertion order within each layer.
-    var layers = try a.alloc(std.ArrayList(u32), num_layers);
-    for (layers) |*l| l.* = .empty;
-    for (0..n) |i| try layers[layer[i]].append(a, @intCast(i));
-    for (layers) |l| for (l.items, 0..) |ni, pos| {
-        g.nodes.items[ni].order = @floatFromInt(pos);
-    };
-
-    // Barycenter sweeps.
-    const bary = try a.alloc(f32, n);
-    for (0..12) |sweep| {
-        const down = sweep % 2 == 0;
-        for (0..n) |i| {
-            var sum: f32 = 0;
-            var count: f32 = 0;
-            for (g.edges.items) |e| {
-                const other: ?u32 = if (down and e.to == i) e.from else if (!down and e.from == i) e.to else null;
-                if (other) |o| {
-                    sum += g.nodes.items[o].order;
-                    count += 1;
-                }
-            }
-            bary[i] = if (count > 0) sum / count else g.nodes.items[i].order;
+    // Order: depth-first from the sinks (the rightmost nodes, e.g. pipelines) towards their
+    // inputs, so that a node's inputs are numbered together, right after it. Sorting each layer by
+    // these numbers keeps every node's inputs in one block, in the order of their consumers.
+    var preds = try a.alloc(std.ArrayList(u32), n);
+    for (preds) |*l| l.* = .empty;
+    var has_succ = try a.alloc(bool, n);
+    @memset(has_succ, false);
+    for (dag.items) |e| {
+        try preds[e[1]].append(a, e[0]);
+        has_succ[e[0]] = true;
+    }
+    const seq = try a.alloc(u32, n);
+    @memset(seq, std.math.maxInt(u32));
+    var next_seq: u32 = 0;
+    var dfs: std.ArrayList(u32) = .empty;
+    // Sinks first (by layer, rightmost first, then in insertion order), then anything left.
+    var roots: std.ArrayList(u32) = .empty;
+    for (0..n) |i| if (!has_succ[i]) try roots.append(a, @intCast(i));
+    std.mem.sort(u32, roots.items, layer, struct {
+        fn lt(l: []u32, x: u32, y: u32) bool {
+            return l[x] > l[y] or (l[x] == l[y] and x < y);
         }
-        for (layers) |l| {
-            std.mem.sort(u32, l.items, bary, struct {
-                fn lt(b: []f32, x: u32, y: u32) bool {
-                    return b[x] < b[y];
-                }
-            }.lt);
-            for (l.items, 0..) |ni, pos| g.nodes.items[ni].order = @floatFromInt(pos);
+    }.lt);
+    for (0..n) |i| try roots.append(a, @intCast(i));
+    for (roots.items) |root| {
+        if (seq[root] != std.math.maxInt(u32)) continue;
+        try dfs.append(a, root);
+        while (dfs.pop()) |node| {
+            if (seq[node] != std.math.maxInt(u32)) continue;
+            seq[node] = next_seq;
+            next_seq += 1;
+            // Push in reverse so the first input is visited first.
+            var k = preds[node].items.len;
+            while (k > 0) {
+                k -= 1;
+                const p = preds[node].items[k];
+                if (seq[p] == std.math.maxInt(u32)) try dfs.append(a, p);
+            }
         }
     }
 
-    // Coordinates: layers left to right, big layers wrapped into several columns, each centered
-    // vertically. y grows up, so rows go down from 0.
-    var x: f32 = 0;
+    var layers = try a.alloc(std.ArrayList(u32), num_layers);
+    for (layers) |*l| l.* = .empty;
+    for (0..n) |i| try layers[layer[i]].append(a, @intCast(i));
     for (layers) |l| {
-        var col_start: usize = 0;
-        while (col_start < l.items.len) : (col_start += max_per_column) {
-            const col = l.items[col_start..@min(l.items.len, col_start + max_per_column)];
-            var col_w: f32 = 0;
-            var col_h: f32 = 0;
-            for (col) |ni| {
-                col_w = @max(col_w, g.nodes.items[ni].w);
-                col_h += g.nodes.items[ni].h + node_gap;
+        std.mem.sort(u32, l.items, seq, struct {
+            fn lt(sq: []u32, x: u32, y: u32) bool {
+                return sq[x] < sq[y];
             }
-            var y: f32 = col_h / 2;
-            for (col) |ni| {
-                const node = &g.nodes.items[ni];
-                y -= node.h;
-                node.x = x;
-                node.y = y;
-                y -= node_gap;
-            }
-            x += col_w + layer_gap;
+        }.lt);
+        for (l.items, 0..) |ni, pos| g.nodes.items[ni].order = @floatFromInt(pos);
+    }
+
+    // Coordinates: columns left to right. Rows (`top`, growing downwards) are assigned from the
+    // rightmost column: each node goes at the height of its successors (centered on them), and
+    // overlaps push it down, never reorder it, so a node's inputs line up with it.
+    var x_of_layer = try a.alloc(f32, num_layers);
+    var x: f32 = 0;
+    for (layers, 0..) |l, li| {
+        var col_w: f32 = 0;
+        for (l.items) |ni| col_w = @max(col_w, g.nodes.items[ni].w);
+        x_of_layer[li] = x;
+        x += col_w + layer_gap;
+    }
+    const top = try a.alloc(f32, n);
+    @memset(top, 0);
+    // Right to left, each node level with its successors; then left to right, each node level
+    // with its predecessors (so consumers spread out to match their inputs); a few times.
+    for (0..4) |sweep| {
+        const right_to_left = sweep % 2 == 0;
+        for (0..num_layers) |step| {
+            const li = if (right_to_left) num_layers - 1 - step else step;
+            placeColumn(g, layers[li].items, layer, @intCast(li), top, right_to_left);
         }
+    }
+    for (g.nodes.items, 0..) |*node, ni| {
+        node.x = x_of_layer[layer[ni]];
+        // y grows up.
+        node.y = -top[ni] - node.h;
     }
 }
 
@@ -1295,4 +1346,38 @@ test "builds every view from a snapshot" {
     try std.testing.expect(life.positioned);
     const site = life.nodes.items[life.find(keyOf(.{ "site", "a.zig:3: f", "command_encoder" })).?];
     try std.testing.expect(site.problem); // 10 per-frame encoders alive: leak
+}
+
+test "layout keeps a node's inputs together, level with it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var g: Graph = .{};
+    const c1 = try g.addNode(a, .{ .key = 100, .label = "consumer 1", .color = .bind_group });
+    const c2 = try g.addNode(a, .{ .key = 200, .label = "consumer 2", .color = .bind_group });
+    // Inputs inserted interleaved: 1, 2, 1, 2, 1, 2.
+    var inputs: [2][3]u32 = undefined;
+    for (0..3) |k| for (0..2) |c| {
+        inputs[c][k] = try g.addNode(a, .{ .key = 10 * c + k, .label = "input", .color = .buffer });
+    };
+    for (0..2) |c| for (inputs[c]) |in| try g.addEdge(a, .{ .from = in, .to = if (c == 0) c1 else c2 });
+    for (g.nodes.items) |*n| sizeNode(n);
+    try layout(a, &g);
+
+    for (0..2) |c| {
+        const consumer = g.nodes.items[if (c == 0) c1 else c2];
+        var min_order: f32 = std.math.inf(f32);
+        var max_order: f32 = -std.math.inf(f32);
+        var center: f32 = 0;
+        for (inputs[c]) |in| {
+            const n = g.nodes.items[in];
+            try std.testing.expect(n.x < consumer.x); // to its left
+            min_order = @min(min_order, n.order);
+            max_order = @max(max_order, n.order);
+            center += (n.y + n.h / 2) / 3;
+        }
+        // Contiguous in their column, and centered on their consumer.
+        try std.testing.expectEqual(2, max_order - min_order);
+        try std.testing.expectApproxEqAbs(consumer.y + consumer.h / 2, center, consumer.h);
+    }
 }

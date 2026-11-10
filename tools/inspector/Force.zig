@@ -57,6 +57,7 @@ const Input = struct {
     adj: []u32,
     edge_count: u32,
     alpha: f32,
+    gen: u64,
 };
 
 const Pin = struct { index: u32, pos: [2]f32, pinned: bool };
@@ -76,6 +77,11 @@ positions_seq: u64 = 0,
 /// The simulation's current alpha (1 when it starts, decaying until it stops).
 alpha: f32 = 0,
 
+/// The graph handed over by the latest `setGraph`, and the one `positions` were computed for:
+/// positions of an older graph don't apply to the current one's nodes.
+graph_gen: u64 = 0,
+positions_gen: u64 = 0,
+
 // App thread only.
 taken_seq: u64 = 0,
 
@@ -86,6 +92,8 @@ const Gpu = struct {
     count: u32,
     edge_count: u32,
     alpha: f32,
+    /// The `graph_gen` of the graph simulated.
+    gen: u64,
     pipeline: *gpu.ComputePipeline,
     layout: *gpu.BindGroupLayout,
     params: *gpu.Buffer,
@@ -165,7 +173,8 @@ pub fn setGraph(f: *Force, g: *const Model.Graph, alpha: f32) !void {
     f.mutex.lockUncancelable(f.io);
     defer f.mutex.unlock(f.io);
     if (f.pending) |old| f.freeInput(old);
-    f.pending = .{ .nodes = nodes, .offsets = offsets, .adj = adj, .edge_count = @intCast(g.edges.items.len), .alpha = alpha };
+    f.graph_gen += 1;
+    f.pending = .{ .nodes = nodes, .offsets = offsets, .adj = adj, .edge_count = @intCast(g.edges.items.len), .alpha = alpha, .gen = f.graph_gen };
     f.pins.clearRetainingCapacity();
     f.alpha = alpha;
 }
@@ -198,7 +207,7 @@ pub fn running(f: *Force) bool {
 pub fn takePositions(f: *Force, g: *Model.Graph, skip: ?u32) bool {
     f.mutex.lockUncancelable(f.io);
     defer f.mutex.unlock(f.io);
-    if (f.positions_seq == f.taken_seq or f.positions.items.len != g.nodes.items.len) return false;
+    if (f.positions_seq == f.taken_seq or f.positions_gen != f.graph_gen or f.positions.items.len != g.nodes.items.len) return false;
     f.taken_seq = f.positions_seq;
     for (g.nodes.items, f.positions.items, 0..) |*n, p, i| {
         if (skip == @as(u32, @intCast(i))) continue;
@@ -291,6 +300,7 @@ pub fn step(f: *Force, device: *gpu.Device, queue: *gpu.Queue) void {
         f.positions.clearRetainingCapacity();
         for (nodes) |n| f.positions.append(f.allocator, n.pos) catch break;
         f.positions_seq += 1;
+        f.positions_gen = g.gen;
         f.alpha = g.alpha;
     }
     g.readback.unmap();
@@ -350,6 +360,7 @@ fn upload(f: *Force, device: *gpu.Device, queue: *gpu.Queue, in: Input) !void {
         .count = count,
         .edge_count = in.edge_count,
         .alpha = in.alpha,
+        .gen = in.gen,
         .pipeline = pipeline,
         .layout = layout,
         .params = params,
