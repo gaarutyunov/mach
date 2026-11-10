@@ -31,7 +31,7 @@ pub const mach_systems = .{
     .appTick,
     .tick,
     .render,
-    .setupPipeline,
+    .setupGpu,
     .beginFrame,
     .endFrame,
     .deinit,
@@ -60,6 +60,8 @@ player_id: mach.ObjectID = undefined,
 pipeline_id: ?mach.ObjectID = null,
 /// The sprite sheet, released on exit (the sprite pipeline holds its own reference to it).
 texture: ?*gpu.Texture = null,
+/// Set by the render thread once it loaded `texture`, see setupGpu.
+gpu_ready: std.atomic.Value(bool) = .init(false),
 
 pub fn init(
     core: *mach.Core,
@@ -93,19 +95,21 @@ pub fn init(
     };
 }
 
-pub fn setupPipeline(
-    core: *mach.Core,
-    app: *App,
-    sprite: *gfx.Sprite,
-    ctx: mach.Context,
-) !void {
+/// Loads our texture. Runs once on the render thread, where all GPU work happens; the app thread
+/// creates the pipeline using it once `gpu_ready` is set (see setupPipeline).
+pub fn setupGpu(core: *mach.Core, app: *App, ctx: mach.Context) !void {
     ctx.schedule.params(RenderParams).needs_setup = false;
     const window = core.windows.getValue(core.window);
-
-    // Create a sprite rendering pipeline
     app.texture = try loadTexture(window.device, window.queue, app.allocator);
+    app.gpu_ready.store(true, .release);
+}
+
+/// Creates our pipeline and sprites. Runs on the app thread, which owns them: the render thread
+/// only reads their snapshot.
+fn setupPipeline(app: *App, sprite: *gfx.Sprite) !void {
+    // Create a sprite rendering pipeline
     app.pipeline_id = try sprite.pipelines.new(.{
-        .window = core.window,
+        .window = app.window,
         .texture = app.texture.?,
     });
 
@@ -170,7 +174,10 @@ pub fn appTick(
     app.direction = direction;
     app.spawning = spawning;
 
-    if (app.pipeline_id == null) return;
+    if (app.pipeline_id == null) {
+        if (!app.gpu_ready.load(.acquire)) return;
+        try setupPipeline(app, sprite);
+    }
     const player_id = app.player_id;
     const pipeline_id = app.pipeline_id.?;
     var player = sprite.objects.getValue(player_id);
@@ -230,7 +237,7 @@ pub const RenderParams = struct {
 /// Runs on the render thread. Each system takes what it needs from the schedule's context, and
 /// the finalizers of what was put there run when the schedule ends, if not removed before that.
 pub const render = mach.scheduleWith(RenderParams, .{
-    .{ App, .setupPipeline, .needs_setup },
+    .{ App, .setupGpu, .needs_setup },
     .{ App, .beginFrame },
     .{ gfx.Sprite, .render },
     .{ App, .endFrame },

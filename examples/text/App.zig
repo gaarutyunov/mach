@@ -31,6 +31,8 @@ pub const mach_systems = .{
     .appTick,
     .tick,
     .render,
+    .beginFrame,
+    .endFrame,
     .deinit,
 };
 
@@ -87,16 +89,16 @@ pub fn init(
     };
 }
 
+/// Creates our pipeline and objects. Runs on the app thread, which owns them: the render thread
+/// only reads their snapshot.
 fn setupPipeline(
     app: *App,
     text: *gfx.Text,
-    core: *mach.Core,
     allocator: std.mem.Allocator,
 ) !void {
-    // Create a text rendering pipeline
+    // Create a text rendering pipeline. It renders into the `.render_pass` of the render schedule.
     app.pipeline_id = try text.pipelines.new(.{
-        .window = core.window,
-        .render_pass = undefined,
+        .window = app.window,
     });
 
     // Create a text style
@@ -137,6 +139,7 @@ pub fn appTick(
     const allocator = ctx.allocator;
     const label = @tagName(mach_module) ++ ".tick";
     _ = label;
+    if (app.pipeline_id == null) try setupPipeline(app, text, allocator);
 
     var direction = app.direction;
     var spawning = app.spawning;
@@ -222,31 +225,27 @@ pub fn appTick(
     app.anim_time += delta_time;
 }
 
-pub fn render(
-    core: *mach.Core,
-    app: *App,
-    text: *gfx.Text,
-    text_mod: mach.Mod(gfx.Text),
-    ctx: mach.Context,
-) !void {
-    if (app.pipeline_id == null) {
-        try setupPipeline(app, text, core, ctx.allocator);
-        return;
-    }
+/// Runs on the render thread, drawing the snapshot of our text objects.
+pub const render = mach.schedule(.{
+    .{ App, .beginFrame },
+    .{ gfx.Text, .render },
+    .{ App, .endFrame },
+});
 
+pub fn beginFrame(core: *mach.Core, ctx: mach.Context) void {
     const label = @tagName(mach_module) ++ ".render";
     const window = core.windows.getValue(core.window);
 
     // Grab the back buffer of the swapchain
     // TODO(core): this wouldn't exist in browser
-    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return;
-    defer back_buffer_view.release();
+    const back_buffer_view = window.swap_chain.getCurrentTextureView() orelse return ctx.schedule.stop();
+    ctx.schedule.put(.back_buffer, back_buffer_view, .{.release});
 
     // Create a command encoder
     const encoder = window.device.createCommandEncoder(&.{ .label = label });
-    defer encoder.release();
+    ctx.schedule.put(.encoder, encoder, .{.release});
 
-    // Begin render pass
+    // Begin render pass: gfx.Text renders into the schedule's `.render_pass`.
     const sky_blue = gpu.Color{ .r = 0.776, .g = 0.988, .b = 1, .a = 1 };
     const color_attachments = [_]gpu.RenderPassColorAttachment{.{
         .view = back_buffer_view,
@@ -258,17 +257,19 @@ pub fn render(
         .label = label,
         .color_attachments = &color_attachments,
     }));
+    ctx.schedule.put(.render_pass, render_pass, .{ .end, .release });
+}
 
-    // Render text
-    text.pipelines.set(app.pipeline_id.?, .render_pass, render_pass);
-    text_mod.call(.render);
+pub fn endFrame(core: *mach.Core, app: *App, ctx: mach.Context) !void {
+    const label = @tagName(mach_module) ++ ".render";
+    const window = core.windows.getValue(core.window);
 
     // Finish render pass
-    render_pass.end();
+    ctx.schedule.remove(.render_pass);
+    const encoder = ctx.schedule.require(.encoder, *gpu.CommandEncoder);
     var command = encoder.finish(&.{ .label = label });
     window.queue.submit(&[_]*gpu.CommandBuffer{command});
     command.release();
-    render_pass.release();
 
     {
         core.windows.lock();

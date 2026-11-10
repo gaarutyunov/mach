@@ -177,6 +177,10 @@ const TextPipelines = mach.Objects(.{ .track_fields = true }, struct {
     /// Which render pass should be used during rendering. If not set, this pipeline renders into
     /// the `.render_pass` of the running schedule, if any and if its `render_group` matches.
     /// Otherwise, this pipeline will not be rendered.
+    ///
+    /// Like other fields, set it on the app thread: the render thread renders from a snapshot.
+    /// For a pass created each frame by the render thread, put it in the render schedule's
+    /// `.render_pass` instead.
     render_pass: ?*gpu.RenderPassEncoder = null,
 
     /// Which render passes of the running schedule this pipeline renders into: those whose
@@ -629,11 +633,9 @@ pub fn render(text: *Text, core: *mach.Core, ctx: mach.Context) !void {
         if (pipeline.window == null) continue;
         std.debug.assert(pipeline.built_index != null);
 
-        // render_pass is a transient GPU resource set by the render thread each frame
-        // directly on the app-side pipelines — read it from there, not the snapshot.
-        // The app may have deleted the pipeline since the snapshot.
-        const app_render_pass = if (text.pipelines.isAlive(pipeline_id)) text.pipelines.get(pipeline_id, .render_pass) else null;
-        const render_pass = app_render_pass orelse blk: {
+        // From the snapshot, like everything the render thread reads: the app-side pipelines
+        // belong to the app thread.
+        const render_pass = pipeline.render_pass orelse blk: {
             if (pipeline.render_group != render_group) continue;
             break :blk scheduled_pass orelse continue;
         };
