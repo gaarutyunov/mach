@@ -167,9 +167,6 @@ const TextObjects = mach.Objects(.{ .track_fields = true }, struct {
     /// Managed text state. When non-null, this text object's segments are managed by
     /// createFmt/setFmt and will be freed by cleanup().
     managed: ?Managed = null,
-
-    /// Internal text object state.
-    built: ?BuiltText = null,
 });
 
 /// A text pipeline renders all text objects in its `.render_list`
@@ -288,6 +285,10 @@ built_pipelines: std.ArrayList(?BuiltPipeline) = .empty,
 // than freed and re-allocated on each `copyFrom`.
 cached_render_lists: std.ArrayList(std.ArrayList(mach.ObjectID)) = .empty,
 
+/// The glyphs built (shaped and placed) for each text, by text ID. Only used by the render thread,
+/// which must never write to the app-side `objects`: the app thread may free them meanwhile.
+render_built: std.AutoHashMapUnmanaged(mach.ObjectID, BuiltText) = .empty,
+
 // Tracks render-side deep-copied segments so they can be freed next frame.
 render_segments: ?[][]Segment = null,
 
@@ -318,6 +319,9 @@ pub fn deinit(text: *Text) void {
     for (text.cached_render_lists.items) |*list| list.deinit(text.allocator);
     text.cached_render_lists.deinit(text.allocator);
     text.cp_transforms.deinit(text.allocator);
+    var built_it = text.render_built.valueIterator();
+    while (built_it.next()) |b| b.glyphs.deinit(text.allocator);
+    text.render_built.deinit(text.allocator);
     if (text.glyph_update_buffer) |*b| b.deinit(text.allocator);
     text.glyph_update_buffer = null;
     if (text.font_once) |*f| f.deinit(text.allocator);
@@ -483,10 +487,6 @@ pub fn cleanup(text: *Text) void {
             var segments = managed.segments;
             segments.deinit(text.allocator);
         }
-        if (text.objects.get(text_id, .built)) |built| {
-            var glyphs = built.glyphs;
-            glyphs.deinit(text.allocator);
-        }
         text.objects.free(text_id);
     }
 }
@@ -631,7 +631,9 @@ pub fn render(text: *Text, core: *mach.Core, ctx: mach.Context) !void {
 
         // render_pass is a transient GPU resource set by the render thread each frame
         // directly on the app-side pipelines — read it from there, not the snapshot.
-        const render_pass = text.pipelines.get(pipeline_id, .render_pass) orelse blk: {
+        // The app may have deleted the pipeline since the snapshot.
+        const app_render_pass = if (text.pipelines.isAlive(pipeline_id)) text.pipelines.get(pipeline_id, .render_pass) else null;
+        const render_pass = app_render_pass orelse blk: {
             if (pipeline.render_group != render_group) continue;
             break :blk scheduled_pass orelse continue;
         };
@@ -672,6 +674,25 @@ pub fn render(text: *Text, core: *mach.Core, ctx: mach.Context) !void {
 
         // TODO(text): need a way to specify order of rendering with multiple pipelines
         renderPipeline(text, core, pipeline_id, render_pass);
+    }
+
+    // Drop the built glyphs of texts which were deleted.
+    var i: usize = 0;
+    while (i < text.render_built.count()) {
+        var it = text.render_built.iterator();
+        var stale: ?mach.ObjectID = null;
+        var n: usize = 0;
+        while (it.next()) |entry| : (n += 1) {
+            if (n < i) continue;
+            if (!text.render_objects.isAlive(entry.key_ptr.*)) {
+                stale = entry.key_ptr.*;
+                break;
+            }
+        }
+        const id = stale orelse break;
+        var removed = text.render_built.fetchRemove(id).?.value;
+        removed.glyphs.deinit(text.allocator);
+        i = n;
     }
 }
 
@@ -878,15 +899,16 @@ fn updatePipelineBuffers(
 
         // If the text has been built before, and nothing about it has changed, then we can just use
         // what we built already.
-        if (t.built != null and !text.render_objects.anyUpdated(text_id)) {
-            for (t.built.?.glyphs.items) |*glyph| glyph.text_index = i;
-            try glyphs.appendSlice(text.allocator, t.built.?.glyphs.items);
+        const prev_built = text.render_built.getPtr(text_id);
+        if (prev_built != null and !text.render_objects.anyUpdated(text_id)) {
+            for (prev_built.?.glyphs.items) |*glyph| glyph.text_index = i;
+            try glyphs.appendSlice(text.allocator, prev_built.?.glyphs.items);
             i += 1;
             continue;
         }
 
         // Where we will store the built glyphs for this text entity.
-        var built_text = if (t.built) |bt| bt else BuiltText{
+        var built_text = if (prev_built) |bt| bt.* else BuiltText{
             // TODO(text): better default allocations
             .glyphs = try std.ArrayList(Glyph).initCapacity(text.allocator, 64),
         };
@@ -986,11 +1008,7 @@ fn updatePipelineBuffers(
                 origin_x += glyph.advance.x();
             }
         }
-        // Update the text entity's built form on both render and app side, so that copyFrom
-        // preserves it (same pattern as built_index on pipelines).
-        t.built = built_text;
-        text.render_objects.setValueRaw(text_id, t);
-        text.objects.setRaw(text_id, .built, built_text);
+        try text.render_built.put(text.allocator, text_id, built_text);
 
         // Add to the entire set of glyphs for this pipeline
         try glyphs.appendSlice(text.allocator, built_text.glyphs.items);

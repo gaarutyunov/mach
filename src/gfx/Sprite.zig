@@ -417,7 +417,9 @@ pub fn render(sprite: *Sprite, core: *mach.Core, ctx: mach.Context) !void {
 
         // render_pass is a transient GPU resource set by the render thread each frame
         // directly on the app-side pipelines — read it from there, not the snapshot.
-        const render_pass = sprite.pipelines.get(pipeline_id, .render_pass) orelse blk: {
+        // The app may have deleted the pipeline since the snapshot.
+        const app_render_pass = if (sprite.pipelines.isAlive(pipeline_id)) sprite.pipelines.get(pipeline_id, .render_pass) else null;
+        const render_pass = app_render_pass orelse blk: {
             if (pipeline.render_group != render_group) continue;
             break :blk scheduled_pass orelse continue;
         };

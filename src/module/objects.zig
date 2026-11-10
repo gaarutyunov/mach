@@ -622,6 +622,18 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
             return any_updated;
         }
 
+        /// Whether the given object is from this pool of objects and alive (not freed, nor marked for
+        /// deletion). Unlike `is`, never panics: for IDs which may be stale, e.g. ones from a
+        /// render snapshot while the app thread deletes objects.
+        pub fn isAlive(objs: *const @This(), id: ObjectID) bool {
+            const unpacked: PackedID = @bitCast(id);
+            if (unpacked.type_id != objs.internal.type_id) return false;
+            if (unpacked.index >= objs.internal.generation.items.len) return false;
+            if (objs.internal.generation.items[unpacked.index] != unpacked.generation) return false;
+            if (objs.internal.freed.isSet(unpacked.index)) return false;
+            return !objs.internal.pending_delete.isSet(unpacked.index);
+        }
+
         /// Tells if the given object is from this pool of objects. If it is, then it must also be
         /// alive/valid or else a panic will occur.
         pub fn is(objs: *const @This(), id: ObjectID) bool {
