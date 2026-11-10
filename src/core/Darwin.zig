@@ -179,14 +179,20 @@ const MACHView = objc.objc.DefineClass(struct {
             } });
             return;
         }
-        const mouse_location = event.locationInWindow();
+        n.core.pushEvent(.{ .mouse_motion = .{
+            .window_id = n.window_id,
+            .pos = windowPosition(n, event),
+        } });
+    }
+
+    /// The event's position in window units, with the origin at the top-left like on other
+    /// platforms (AppKit's is at the bottom-left).
+    fn windowPosition(n: *NativeState, event: *objc.app_kit.Event) Position {
+        const location = event.locationInWindow();
         n.core.windows.lockShared();
         const window_height: f32 = @floatFromInt(n.core.windows.get(n.window_id, .height));
         n.core.windows.unlockShared();
-        n.core.pushEvent(.{ .mouse_motion = .{
-            .window_id = n.window_id,
-            .pos = .{ .x = mouse_location.x, .y = window_height - mouse_location.y },
-        } });
+        return .{ .x = location.x, .y = window_height - location.y };
     }
 
     /// Pushes a `mouse_press` event. Shared by `mouseDown:`, `rightMouseDown:`, `otherMouseDown:`.
@@ -194,7 +200,7 @@ const MACHView = objc.objc.DefineClass(struct {
         n.core.pushEvent(.{ .mouse_press = .{
             .window_id = n.window_id,
             .button = @fromBackingInt(@intCast(event.buttonNumber())),
-            .pos = .{ .x = event.locationInWindow().x, .y = event.locationInWindow().y },
+            .pos = windowPosition(n, event),
             .mods = machModifierFromModifierFlag(event.modifierFlags()),
         } });
     }
@@ -204,7 +210,7 @@ const MACHView = objc.objc.DefineClass(struct {
         n.core.pushEvent(.{ .mouse_release = .{
             .window_id = n.window_id,
             .button = @fromBackingInt(@intCast(event.buttonNumber())),
-            .pos = .{ .x = event.locationInWindow().x, .y = event.locationInWindow().y },
+            .pos = windowPosition(n, event),
             .mods = machModifierFromModifierFlag(event.modifierFlags()),
         } });
     }
@@ -731,6 +737,7 @@ const RenderLoop = struct {
 
     /// Render thread entry point.
     fn renderThreadFn(self: *RenderLoop) void {
+        mach.module_threads.setName("render");
         while (self.running.load(.acquire)) {
             // Wait for the app to signal snapshotEnd() and indicate a frame is ready for drawing.
             self.core.frame_ready.waitUncancelable(self.io);

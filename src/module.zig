@@ -30,6 +30,9 @@ const SystemTrace = trace.SystemTrace;
 const MemoryPlot = trace.MemoryPlot;
 
 const log = @import("module/log.zig");
+pub const dataflow = @import("module/dataflow.zig");
+pub const threads = @import("module/threads.zig");
+const inspect = @import("module/inspect.zig");
 pub const logFn = log.logFn;
 const ContextLog = log.ContextLog;
 
@@ -53,6 +56,7 @@ pub fn startThread(
     const run = struct {
         fn run(c: *Core, f: FunctionID, m: Mod(Core)) void {
             tracy.setThreadName(@tagName(kind));
+            threads.setName(@tagName(kind));
             while (c.state.load(.acquire) == .running) {
                 m.run(f);
             }
@@ -570,6 +574,12 @@ pub fn Modules(module_lists: anytype) type {
                         @compileError("mach: function " ++ debug_name ++ " has an invalid argument(" ++ arg_name ++ ") type: " ++ @typeName(arg_type));
                     }
 
+                    const prev_system = dataflow.current_system;
+                    dataflow.current_system = debug_name;
+                    defer dataflow.current_system = prev_system;
+                    const span_start = threads.systemBegin(m.modules.io);
+                    defer threads.systemEnd(m.modules.io, debug_name, span_start);
+
                     const Ret = @typeInfo(F).@"fn".return_type orelse void;
                     switch (@typeInfo(Ret)) {
                         // TODO: define error handling of runnable functions
@@ -619,8 +629,26 @@ pub fn Modules(module_lists: anytype) type {
                             return m2.memoryStats(out);
                         }
                     }).memoryStats,
+                    ._set_schedule_param = (struct {
+                        fn set(modules_ptr: *anyopaque, schedule_name: []const u8, field: []const u8, value: bool) bool {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            return inspect.setScheduleParam(m2, schedule_name, field, value);
+                        }
+                    }).set,
+                    ._inspect = (struct {
+                        fn inspectFn(modules_ptr: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            return inspect.write(m2, w);
+                        }
+                    }).inspectFn,
                 },
             }
+        }
+
+        /// Writes the modules' structure and state as JSON object members (`"modules":[...]`, ...)
+        /// for the inspector, see `mach.dvx.Inspector`.
+        pub fn writeInspect(m: *@This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            return inspect.write(m, w);
         }
 
         /// Returns the allocator for the given module (its override, or the global allocator).
@@ -1087,4 +1115,7 @@ test {
     _ = @import("module/schedule.zig");
     _ = @import("module/objects.zig");
     _ = @import("module/trace.zig");
+    _ = @import("module/inspect.zig");
+    _ = @import("module/dataflow.zig");
+    _ = @import("module/threads.zig");
 }

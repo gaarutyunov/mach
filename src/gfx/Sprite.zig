@@ -12,9 +12,59 @@ const Sprite = @This();
 
 pub const mach_module = .mach_gfx_sprite;
 
-pub const mach_systems = .{ .init, .cleanup, .snapshot, .render };
+pub const mach_systems = .{ .init, .cleanup, .snapshot, .render, .deinit };
 
-// TODO(sprite): currently not handling deinit properly
+const shader_source = @embedFile("sprite.wgsl");
+/// Comptime reflection of sprite.wgsl, see `mach.wgsl`.
+const shader = mach.wgsl.Shader("sprite.wgsl", shader_source);
+
+/// Sprite's `@group(0)` layout: sprite.wgsl's bindings, plus textures 6-8 for custom shaders doing
+/// multi-texturing. Checked against sprite.wgsl at comptime, and against custom shaders by
+/// `checkShader`.
+pub const layout_entries = [_]gpu.BindGroupLayout.Entry{
+    gpu.BindGroupLayout.Entry.initBuffer(0, .{ .vertex = true }, .uniform, false, 0),
+    gpu.BindGroupLayout.Entry.initBuffer(1, .{ .vertex = true }, .read_only_storage, false, 0),
+    gpu.BindGroupLayout.Entry.initBuffer(2, .{ .vertex = true }, .read_only_storage, false, 0),
+    gpu.BindGroupLayout.Entry.initBuffer(3, .{ .vertex = true }, .read_only_storage, false, 0),
+    gpu.BindGroupLayout.Entry.initSampler(4, .{ .fragment = true }, .filtering),
+    gpu.BindGroupLayout.Entry.initTexture(5, .{ .fragment = true }, .float, .dimension_2d, false),
+    gpu.BindGroupLayout.Entry.initTexture(6, .{ .fragment = true }, .float, .dimension_2d, false),
+    gpu.BindGroupLayout.Entry.initTexture(7, .{ .fragment = true }, .float, .dimension_2d, false),
+    gpu.BindGroupLayout.Entry.initTexture(8, .{ .fragment = true }, .float, .dimension_2d, false),
+};
+
+comptime {
+    checkShader(shader);
+    shader.checkHostType("uniforms", Uniforms);
+    shader.checkHostType("sprite_transforms", gpu.Mat4x4);
+    shader.checkHostType("sprite_uv_transforms", gpu.Mat4x4);
+    shader.checkHostType("sprite_sizes", gpu.Vec2);
+    shader.checkColorTargets("fragMain", 1);
+}
+
+/// Checks at comptime that a custom pipeline `.shader` (a `mach.wgsl.Shader`) works with Sprite:
+/// its `@group(0)` bindings match Sprite's (`layout_entries`), its `uniforms` match Sprite's,
+/// its entry points are `vertMain` and `fragMain`, and it writes a single color target.
+/// `@group(1)` is the pipeline's `.user_bind_group_layout`, see `mach.wgsl.Shader.layoutEntries`.
+///
+/// ```
+/// const clouds = mach.wgsl.Shader("clouds.wgsl", @embedFile("clouds.wgsl"));
+/// comptime gfx.Sprite.checkShader(clouds);
+/// ```
+pub fn checkShader(comptime S: type) void {
+    comptime {
+        S.checkLayout(0, &layout_entries);
+        if (@hasDecl(S, "binding")) {
+            for (S.bindings) |b| {
+                if (b.group == 0 and std.mem.eql(u8, b.name, "uniforms")) S.checkHostType("uniforms", Uniforms);
+            }
+        }
+        _ = S.vertexEntry("vertMain");
+        _ = S.fragmentEntry("fragMain");
+        S.checkColorTargets("fragMain", 1);
+        if (S.num_groups > 2) @compileError(S.file_name ++ ": gfx.Sprite pipelines only have @group(0) (Sprite's) and @group(1) (.user_bind_group_layout)");
+    }
+}
 
 const Uniforms = extern struct {
     /// The view * orthographic projection matrix
@@ -32,7 +82,10 @@ const BuiltPipeline = struct {
     texture3: ?*gpu.Texture,
     texture4: ?*gpu.Texture,
     bind_group: *gpu.BindGroup,
-    bind_group_layout: ?*gpu.BindGroupLayout,
+    bind_group_layout: *gpu.BindGroupLayout,
+    /// Whether Sprite created the bind group layout (else it's the pipeline's `.bind_group_layout`),
+    /// in which case it may recreate the bind group when growing the storage buffers.
+    owns_bind_group_layout: bool,
     user_bind_group_layout: ?*gpu.BindGroupLayout,
     uniforms: *gpu.Buffer,
 
@@ -50,7 +103,8 @@ const BuiltPipeline = struct {
         if (p.texture3) |tex| tex.release();
         if (p.texture4) |tex| tex.release();
         p.bind_group.release();
-        if (p.bind_group_layout) |l| l.release();
+        // Created, or referenced in rebuildPipeline.
+        p.bind_group_layout.release();
         if (p.user_bind_group_layout) |l| l.release();
         p.uniforms.release();
         p.transforms.release();
@@ -83,6 +137,10 @@ const Pipelines = mach.Objects(.{ .track_fields = true }, struct {
     /// Which render pass should be used during rendering. If not set, this pipeline renders into
     /// the `.render_pass` of the running schedule, if any and if its `render_group` matches.
     /// Otherwise, this pipeline will not be rendered.
+    ///
+    /// Like other fields, set it on the app thread: the render thread renders from a snapshot.
+    /// For a pass created each frame by the render thread, put it in the render schedule's
+    /// `.render_pass` instead.
     render_pass: ?*gpu.RenderPassEncoder = null,
 
     /// Which render passes of the running schedule this pipeline renders into: those whose
@@ -220,6 +278,28 @@ pub fn init(sprite: *Sprite, ctx: mach.Context) !void {
     };
 }
 
+/// Releases the GPU resources of every built pipeline and frees internal buffers. Call it on exit
+/// (e.g. from `core.on_exit`, once rendering has stopped), before `mach.Core` releases the device:
+///
+/// ```
+/// pub fn deinit(app: *App, sprite_mod: mach.Mod(gfx.Sprite)) void {
+///     app.app_thread.join();
+///     sprite_mod.call(.deinit);
+/// }
+/// ```
+pub fn deinit(sprite: *Sprite) void {
+    for (sprite.built_pipelines.items) |*maybe| {
+        if (maybe.*) |*built| built.deinit();
+        maybe.* = null;
+    }
+    sprite.built_pipelines.deinit(sprite.allocator);
+    for (sprite.cached_render_lists.items) |*list| list.deinit(sprite.allocator);
+    sprite.cached_render_lists.deinit(sprite.allocator);
+    sprite.cp_transforms.deinit(sprite.allocator);
+    sprite.cp_uv_transforms.deinit(sprite.allocator);
+    sprite.cp_sizes.deinit(sprite.allocator);
+}
+
 /// Cleans up sprite objects that have been marked for deletion via `delete()`.
 ///
 /// Each deleted sprite is removed from any pipeline's `.render_list` it appears in.
@@ -339,9 +419,9 @@ pub fn render(sprite: *Sprite, core: *mach.Core, ctx: mach.Context) !void {
         if (pipeline.window == null) continue;
         std.debug.assert(pipeline.built_index != null);
 
-        // render_pass is a transient GPU resource set by the render thread each frame
-        // directly on the app-side pipelines — read it from there, not the snapshot.
-        const render_pass = sprite.pipelines.get(pipeline_id, .render_pass) orelse blk: {
+        // From the snapshot, like everything the render thread reads: the app-side pipelines
+        // belong to the app thread.
+        const render_pass = pipeline.render_pass orelse blk: {
             if (pipeline.render_group != render_group) continue;
             break :blk scheduled_pass orelse continue;
         };
@@ -450,17 +530,7 @@ fn rebuildPipeline(
     const bind_group_layout = pipeline.bind_group_layout orelse device.createBindGroupLayout(
         &gpu.BindGroupLayout.Descriptor.init(.{
             .label = label,
-            .entries = &.{
-                gpu.BindGroupLayout.Entry.initBuffer(0, .{ .vertex = true }, .uniform, false, 0),
-                gpu.BindGroupLayout.Entry.initBuffer(1, .{ .vertex = true }, .read_only_storage, false, 0),
-                gpu.BindGroupLayout.Entry.initBuffer(2, .{ .vertex = true }, .read_only_storage, false, 0),
-                gpu.BindGroupLayout.Entry.initBuffer(3, .{ .vertex = true }, .read_only_storage, false, 0),
-                gpu.BindGroupLayout.Entry.initSampler(4, .{ .fragment = true }, .filtering),
-                gpu.BindGroupLayout.Entry.initTexture(5, .{ .fragment = true }, .float, .dimension_2d, false),
-                gpu.BindGroupLayout.Entry.initTexture(6, .{ .fragment = true }, .float, .dimension_2d, false),
-                gpu.BindGroupLayout.Entry.initTexture(7, .{ .fragment = true }, .float, .dimension_2d, false),
-                gpu.BindGroupLayout.Entry.initTexture(8, .{ .fragment = true }, .float, .dimension_2d, false),
-            },
+            .entries = &layout_entries,
         }),
     );
 
@@ -504,7 +574,7 @@ fn rebuildPipeline(
         },
     };
 
-    const shader_module = pipeline.shader orelse device.createShaderModuleWGSL("sprite.wgsl", @embedFile("sprite.wgsl"));
+    const shader_module = pipeline.shader orelse device.createShaderModuleWGSL(shader.file_name, shader_source);
     defer shader_module.release();
 
     const color_target = pipeline.color_target_state orelse gpu.ColorTargetState{
@@ -514,7 +584,7 @@ fn rebuildPipeline(
     };
     const fragment = pipeline.fragment_state orelse gpu.FragmentState.init(.{
         .module = shader_module,
-        .entry_point = "fragMain",
+        .entry_point = shader.fragmentEntry("fragMain"),
         .targets = &.{color_target},
     });
 
@@ -535,7 +605,7 @@ fn rebuildPipeline(
         .layout = pipeline_layout,
         .vertex = gpu.VertexState{
             .module = shader_module,
-            .entry_point = "vertMain",
+            .entry_point = shader.vertexEntry("vertMain"),
         },
     });
 
@@ -547,7 +617,8 @@ fn rebuildPipeline(
         .texture3 = pipeline.texture3,
         .texture4 = pipeline.texture4,
         .bind_group = bind_group,
-        .bind_group_layout = if (owns_bind_group_layout) bind_group_layout else null,
+        .bind_group_layout = bind_group_layout,
+        .owns_bind_group_layout = owns_bind_group_layout,
         .user_bind_group_layout = pipeline.user_bind_group_layout,
         .uniforms = uniforms,
         .transforms = transforms,
@@ -592,7 +663,7 @@ fn updatePipelineBuffers(
     const count: u32 = @intCast(sprite.cp_transforms.items.len);
 
     // Grow GPU storage buffers and recreate bind group if needed.
-    if (count > built.buffer_cap and built.bind_group_layout != null) {
+    if (count > built.buffer_cap and built.owns_bind_group_layout) {
         var new_cap = built.buffer_cap;
         while (new_cap < count) new_cap *= 2;
 
@@ -632,7 +703,7 @@ fn updatePipelineBuffers(
         built.bind_group = device.createBindGroup(
             &gpu.BindGroup.Descriptor.init(.{
                 .label = label,
-                .layout = built.bind_group_layout.?,
+                .layout = built.bind_group_layout,
                 .entries = &.{
                     gpu.BindGroup.Entry.initBuffer(0, built.uniforms, 0, @sizeOf(Uniforms), @sizeOf(Uniforms)),
                     gpu.BindGroup.Entry.initBuffer(1, built.transforms, 0, @sizeOf(gpu.Mat4x4) * new_cap, @sizeOf(gpu.Mat4x4)),

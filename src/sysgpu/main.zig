@@ -4,6 +4,8 @@ const build_options = @import("build-options");
 pub const sysgpu = @import("sysgpu/main.zig");
 pub const shader = @import("shader.zig");
 const utils = @import("utils.zig");
+/// GPU object tracking and API usage checks, see `-Dgpu_track`.
+pub const track = @import("track.zig");
 
 const backend_type: sysgpu.BackendType = switch (build_options.sysgpu_backend) {
     .webgpu => .webgpu,
@@ -55,6 +57,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn adapterCreateDevice(adapter_raw: *sysgpu.Adapter, descriptor: ?*const sysgpu.Device.Descriptor) ?*sysgpu.Device {
         const adapter: *impl.Adapter = @ptrCast(@alignCast(adapter_raw));
         const device = adapter.createDevice(descriptor) catch return null;
+        track.acquired(.device, device, if (descriptor) |d| d.label else null, .none);
         if (descriptor) |desc| {
             device.lost_cb = desc.device_lost_callback;
             device.lost_cb_userdata = desc.device_lost_userdata;
@@ -104,11 +107,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn adapterReference(adapter_raw: *sysgpu.Adapter) void {
+        track.referenced(adapter_raw);
         const adapter: *impl.Adapter = @ptrCast(@alignCast(adapter_raw));
         adapter.manager.reference();
     }
 
     pub inline fn adapterRelease(adapter_raw: *sysgpu.Adapter) void {
+        if (!track.released(adapter_raw)) return;
         const adapter: *impl.Adapter = @ptrCast(@alignCast(adapter_raw));
         adapter.manager.release();
     }
@@ -120,11 +125,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn bindGroupReference(bind_group_raw: *sysgpu.BindGroup) void {
+        track.referenced(bind_group_raw);
         const bind_group: *impl.BindGroup = @ptrCast(@alignCast(bind_group_raw));
         bind_group.manager.reference();
     }
 
     pub inline fn bindGroupRelease(bind_group_raw: *sysgpu.BindGroup) void {
+        if (!track.released(bind_group_raw)) return;
         const bind_group: *impl.BindGroup = @ptrCast(@alignCast(bind_group_raw));
         bind_group.manager.release();
     }
@@ -136,11 +143,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn bindGroupLayoutReference(bind_group_layout_raw: *sysgpu.BindGroupLayout) void {
+        track.referenced(bind_group_layout_raw);
         const bind_group_layout: *impl.BindGroupLayout = @ptrCast(@alignCast(bind_group_layout_raw));
         bind_group_layout.manager.reference();
     }
 
     pub inline fn bindGroupLayoutRelease(bind_group_layout_raw: *sysgpu.BindGroupLayout) void {
+        if (!track.released(bind_group_layout_raw)) return;
         const bind_group_layout: *impl.BindGroupLayout = @ptrCast(@alignCast(bind_group_layout_raw));
         bind_group_layout.manager.release();
     }
@@ -186,11 +195,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn bufferReference(buffer_raw: *sysgpu.Buffer) void {
+        track.referenced(buffer_raw);
         const buffer: *impl.Buffer = @ptrCast(@alignCast(buffer_raw));
         buffer.manager.reference();
     }
 
     pub inline fn bufferRelease(buffer_raw: *sysgpu.Buffer) void {
+        if (!track.released(buffer_raw)) return;
         const buffer: *impl.Buffer = @ptrCast(@alignCast(buffer_raw));
         buffer.manager.release();
     }
@@ -202,11 +213,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn commandBufferReference(command_buffer_raw: *sysgpu.CommandBuffer) void {
+        track.referenced(command_buffer_raw);
         const command_buffer: *impl.CommandBuffer = @ptrCast(@alignCast(command_buffer_raw));
         command_buffer.manager.reference();
     }
 
     pub inline fn commandBufferRelease(command_buffer_raw: *sysgpu.CommandBuffer) void {
+        if (!track.released(command_buffer_raw)) return;
         const command_buffer: *impl.CommandBuffer = @ptrCast(@alignCast(command_buffer_raw));
         command_buffer.manager.release();
     }
@@ -214,12 +227,20 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn commandEncoderBeginComputePass(command_encoder_raw: *sysgpu.CommandEncoder, descriptor: ?*const sysgpu.ComputePassDescriptor) *sysgpu.ComputePassEncoder {
         const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
         const compute_pass = command_encoder.beginComputePass(descriptor orelse &.{}) catch @panic("api error");
+        track.passBegan(.compute_pass_encoder, compute_pass, command_encoder_raw, if (descriptor) |d| d.label else null, &.{});
         return @ptrCast(compute_pass);
     }
 
     pub inline fn commandEncoderBeginRenderPass(command_encoder_raw: *sysgpu.CommandEncoder, descriptor: *const sysgpu.RenderPassDescriptor) *sysgpu.RenderPassEncoder {
         const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
         const render_pass = command_encoder.beginRenderPass(descriptor) catch @panic("api error");
+        if (track.enabled) {
+            var attachments: [9]?*const anyopaque = @splat(null);
+            const colors = if (descriptor.color_attachments) |c| c[0..@min(descriptor.color_attachment_count, 8)] else &.{};
+            for (colors, 0..) |c, i| attachments[i] = c.view;
+            attachments[colors.len] = if (descriptor.depth_stencil_attachment) |d| d.view else null;
+            track.passBegan(.render_pass_encoder, render_pass, command_encoder_raw, descriptor.label, attachments[0 .. colors.len + 1]);
+        }
         return @ptrCast(render_pass);
     }
 
@@ -244,12 +265,13 @@ pub const Impl = sysgpu.Interface(struct {
         command_encoder.copyBufferToTexture(source, destination, copy_size) catch @panic("api error");
     }
 
-    pub inline fn commandEncoderCopyTextureToBuffer(command_encoder: *sysgpu.CommandEncoder, source: *const sysgpu.ImageCopyTexture, destination: *const sysgpu.ImageCopyBuffer, copy_size: *const sysgpu.Extent3D) void {
-        _ = command_encoder;
-        _ = source;
-        _ = destination;
-        _ = copy_size;
-        @panic("unimplemented");
+    pub inline fn commandEncoderCopyTextureToBuffer(command_encoder_raw: *sysgpu.CommandEncoder, source: *const sysgpu.ImageCopyTexture, destination: *const sysgpu.ImageCopyBuffer, copy_size: *const sysgpu.Extent3D) void {
+        if (comptime !@hasDecl(impl.CommandEncoder, "copyTextureToBuffer")) {
+            @panic("unimplemented");
+        } else {
+            const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
+            command_encoder.copyTextureToBuffer(source, destination, copy_size) catch @panic("api error");
+        }
     }
 
     pub inline fn commandEncoderCopyTextureToTexture(command_encoder_raw: *sysgpu.CommandEncoder, source: *const sysgpu.ImageCopyTexture, destination: *const sysgpu.ImageCopyTexture, copy_size: *const sysgpu.Extent3D) void {
@@ -269,6 +291,8 @@ pub const Impl = sysgpu.Interface(struct {
         const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
         const command_buffer = command_encoder.finish(descriptor orelse &.{}) catch @panic("api error");
         command_buffer.manager.reference();
+        track.acquired(.command_buffer, command_buffer, if (descriptor) |d| d.label else null, .none);
+        track.edge(command_buffer, command_encoder_raw, .encoder, 0);
         return @ptrCast(command_buffer);
     }
 
@@ -314,6 +338,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn commandEncoderWriteBuffer(command_encoder_raw: *sysgpu.CommandEncoder, buffer_raw: *sysgpu.Buffer, buffer_offset: u64, data: [*]const u8, size: u64) void {
         const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
         const buffer: *impl.Buffer = @ptrCast(@alignCast(buffer_raw));
+        track.uploaded(buffer_raw, size);
         command_encoder.writeBuffer(buffer, buffer_offset, @ptrCast(data), size) catch @panic("api error");
     }
 
@@ -325,17 +350,20 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn commandEncoderReference(command_encoder_raw: *sysgpu.CommandEncoder) void {
+        track.referenced(command_encoder_raw);
         const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
         command_encoder.manager.reference();
     }
 
     pub inline fn commandEncoderRelease(command_encoder_raw: *sysgpu.CommandEncoder) void {
+        if (!track.released(command_encoder_raw)) return;
         const command_encoder: *impl.CommandEncoder = @ptrCast(@alignCast(command_encoder_raw));
         command_encoder.manager.release();
     }
 
     pub inline fn computePassEncoderDispatchWorkgroups(compute_pass_encoder_raw: *sysgpu.ComputePassEncoder, workgroup_count_x: u32, workgroup_count_y: u32, workgroup_count_z: u32) void {
         const compute_pass_encoder: *impl.ComputePassEncoder = @ptrCast(@alignCast(compute_pass_encoder_raw));
+        track.passDraw(compute_pass_encoder_raw);
         compute_pass_encoder.dispatchWorkgroups(workgroup_count_x, workgroup_count_y, workgroup_count_z) catch @panic("api error");
     }
 
@@ -371,6 +399,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn computePassEncoderSetBindGroup(compute_pass_encoder_raw: *sysgpu.ComputePassEncoder, group_index: u32, group_raw: *sysgpu.BindGroup, dynamic_offset_count: usize, dynamic_offsets: ?[*]const u32) void {
         const compute_pass_encoder: *impl.ComputePassEncoder = @ptrCast(@alignCast(compute_pass_encoder_raw));
         const group: *impl.BindGroup = @ptrCast(@alignCast(group_raw));
+        track.passSetBindGroup(compute_pass_encoder_raw, group_index, group_raw);
         compute_pass_encoder.setBindGroup(group_index, group, dynamic_offset_count, dynamic_offsets) catch @panic("api error");
     }
 
@@ -383,6 +412,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn computePassEncoderSetPipeline(compute_pass_encoder_raw: *sysgpu.ComputePassEncoder, pipeline_raw: *sysgpu.ComputePipeline) void {
         const compute_pass_encoder: *impl.ComputePassEncoder = @ptrCast(@alignCast(compute_pass_encoder_raw));
         const pipeline: *impl.ComputePipeline = @ptrCast(@alignCast(pipeline_raw));
+        track.passSetPipeline(compute_pass_encoder_raw, pipeline_raw);
         compute_pass_encoder.setPipeline(pipeline) catch @panic("api error");
     }
 
@@ -394,11 +424,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn computePassEncoderReference(compute_pass_encoder_raw: *sysgpu.ComputePassEncoder) void {
+        track.referenced(compute_pass_encoder_raw);
         const compute_pass_encoder: *impl.ComputePassEncoder = @ptrCast(@alignCast(compute_pass_encoder_raw));
         compute_pass_encoder.manager.reference();
     }
 
     pub inline fn computePassEncoderRelease(compute_pass_encoder_raw: *sysgpu.ComputePassEncoder) void {
+        if (!track.released(compute_pass_encoder_raw)) return;
         const compute_pass_encoder: *impl.ComputePassEncoder = @ptrCast(@alignCast(compute_pass_encoder_raw));
         compute_pass_encoder.manager.release();
     }
@@ -407,6 +439,8 @@ pub const Impl = sysgpu.Interface(struct {
         const compute_pipeline: *impl.ComputePipeline = @ptrCast(@alignCast(compute_pipeline_raw));
         const layout = compute_pipeline.getBindGroupLayout(group_index);
         layout.manager.reference();
+        track.acquired(.bind_group_layout, layout, null, .none);
+        track.edge(compute_pipeline_raw, layout, .layout, @intCast(group_index + 1));
         return @ptrCast(layout);
     }
 
@@ -417,42 +451,52 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn computePipelineReference(compute_pipeline_raw: *sysgpu.ComputePipeline) void {
+        track.referenced(compute_pipeline_raw);
         const compute_pipeline: *impl.ComputePipeline = @ptrCast(@alignCast(compute_pipeline_raw));
         compute_pipeline.manager.reference();
     }
 
     pub inline fn computePipelineRelease(compute_pipeline_raw: *sysgpu.ComputePipeline) void {
+        if (!track.released(compute_pipeline_raw)) return;
         const compute_pipeline: *impl.ComputePipeline = @ptrCast(@alignCast(compute_pipeline_raw));
         compute_pipeline.manager.release();
     }
 
     pub inline fn deviceCreateBindGroup(device_raw: *sysgpu.Device, descriptor: *const sysgpu.BindGroup.Descriptor) *sysgpu.BindGroup {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
+        if (!track.checkBindGroup(descriptor)) std.debug.panic("mach: invalid bind group '{s}', see the error(gpu) message(s) above", .{if (descriptor.label) |l| std.mem.span(l) else ""});
         const group = device.createBindGroup(descriptor) catch @panic("api error");
+        track.bindGroupCreated(group, descriptor);
         return @ptrCast(group);
     }
 
     pub inline fn deviceCreateBindGroupLayout(device_raw: *sysgpu.Device, descriptor: *const sysgpu.BindGroupLayout.Descriptor) *sysgpu.BindGroupLayout {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const layout = device.createBindGroupLayout(descriptor) catch @panic("api error");
+        track.bindGroupLayoutCreated(layout, descriptor);
         return @ptrCast(layout);
     }
 
     pub inline fn deviceCreateBuffer(device_raw: *sysgpu.Device, descriptor: *const sysgpu.Buffer.Descriptor) *sysgpu.Buffer {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const buffer = device.createBuffer(descriptor) catch @panic("api error");
+        track.acquired(.buffer, buffer, descriptor.label, .{ .buffer = .{ .usage = descriptor.usage } });
+        track.setBytes(buffer, descriptor.size);
         return @ptrCast(buffer);
     }
 
     pub inline fn deviceCreateCommandEncoder(device_raw: *sysgpu.Device, descriptor: ?*const sysgpu.CommandEncoder.Descriptor) *sysgpu.CommandEncoder {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const command_encoder = device.createCommandEncoder(descriptor orelse &.{}) catch @panic("api error");
+        track.acquired(.command_encoder, command_encoder, if (descriptor) |d| d.label else null, .none);
         return @ptrCast(command_encoder);
     }
 
     pub inline fn deviceCreateComputePipeline(device_raw: *sysgpu.Device, descriptor: *const sysgpu.ComputePipeline.Descriptor) *sysgpu.ComputePipeline {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
+        if (!track.checkPipeline(.compute_pipeline, descriptor.label, descriptor.layout, &.{ null, null, descriptor.compute.module })) std.debug.panic("mach: invalid compute pipeline '{s}', see the error(gpu) message(s) above", .{if (descriptor.label) |l| std.mem.span(l) else ""});
         const pipeline = device.createComputePipeline(descriptor) catch @panic("api error");
+        track.pipelineCreated(.compute_pipeline, pipeline, descriptor.label, descriptor.layout, &.{ null, null, descriptor.compute.module });
         return @ptrCast(pipeline);
     }
 
@@ -490,6 +534,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn deviceCreatePipelineLayout(device_raw: *sysgpu.Device, pipeline_layout_descriptor: *const sysgpu.PipelineLayout.Descriptor) *sysgpu.PipelineLayout {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const layout = device.createPipelineLayout(pipeline_layout_descriptor) catch @panic("api error");
+        track.pipelineLayoutCreated(layout, pipeline_layout_descriptor);
         return @ptrCast(layout);
     }
 
@@ -507,7 +552,9 @@ pub const Impl = sysgpu.Interface(struct {
 
     pub inline fn deviceCreateRenderPipeline(device_raw: *sysgpu.Device, descriptor: *const sysgpu.RenderPipeline.Descriptor) *sysgpu.RenderPipeline {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
+        if (!track.checkPipeline(.render_pipeline, descriptor.label, descriptor.layout, &.{ descriptor.vertex.module, if (descriptor.fragment) |f| f.module else null, null })) std.debug.panic("mach: invalid render pipeline '{s}', see the error(gpu) message(s) above", .{if (descriptor.label) |l| std.mem.span(l) else ""});
         const render_pipeline = device.createRenderPipeline(descriptor) catch @panic("api error");
+        track.pipelineCreated(.render_pipeline, render_pipeline, descriptor.label, descriptor.layout, &.{ descriptor.vertex.module, if (descriptor.fragment) |f| f.module else null, null });
         return @ptrCast(render_pipeline);
     }
 
@@ -522,6 +569,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn deviceCreateSampler(device_raw: *sysgpu.Device, descriptor: ?*const sysgpu.Sampler.Descriptor) *sysgpu.Sampler {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const sampler = device.createSampler(descriptor orelse &sysgpu.Sampler.Descriptor{}) catch @panic("api error");
+        track.acquired(.sampler, sampler, if (descriptor) |d| d.label else null, .none);
         return @ptrCast(sampler);
     }
 
@@ -552,12 +600,15 @@ pub const Impl = sysgpu.Interface(struct {
             };
 
             const shader_module = device.createShaderModuleAir(air, descriptor.label orelse "<ShaderModule label not specified>") catch @panic("api error");
+            track.shaderModuleCreated(shader_module, descriptor.label, air);
             return @ptrCast(shader_module);
         } else if (utils.findChained(sysgpu.ShaderModule.SPIRVDescriptor, descriptor.next_in_chain.generic)) |spirv_descriptor| {
             const shader_module = device.createShaderModuleSpirv(spirv_descriptor.code, spirv_descriptor.code_size) catch @panic("api error");
+            track.shaderModuleCreated(shader_module, descriptor.label, null);
             return @ptrCast(shader_module);
         } else if (utils.findChained(sysgpu.ShaderModule.HLSLDescriptor, descriptor.next_in_chain.generic)) |hlsl_descriptor| {
             const shader_module = device.createShaderModuleHLSL(hlsl_descriptor.code[0..hlsl_descriptor.code_size]) catch @panic("api error");
+            track.shaderModuleCreated(shader_module, descriptor.label, null);
             return @ptrCast(shader_module);
         } else if (utils.findChained(sysgpu.ShaderModule.MSLDescriptor, descriptor.next_in_chain.generic)) |msl_descriptor| {
             const shader_module = device.createShaderModuleMSL(
@@ -565,6 +616,7 @@ pub const Impl = sysgpu.Interface(struct {
                 msl_descriptor.code[0..msl_descriptor.code_size],
                 msl_descriptor.workgroup_size,
             ) catch @panic("api error");
+            track.shaderModuleCreated(shader_module, descriptor.label, null);
             return @ptrCast(shader_module);
         }
 
@@ -575,12 +627,22 @@ pub const Impl = sysgpu.Interface(struct {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const surface: *impl.Surface = @ptrCast(@alignCast(surface_raw.?));
         const swapchain = device.createSwapChain(surface, descriptor) catch @panic("api error");
+        track.acquired(.swap_chain, swapchain, descriptor.label, .none);
+        track.edge(swapchain, surface, .surface, 0);
         return @ptrCast(swapchain);
     }
 
     pub inline fn deviceCreateTexture(device_raw: *sysgpu.Device, descriptor: *const sysgpu.Texture.Descriptor) *sysgpu.Texture {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const texture = device.createTexture(descriptor) catch @panic("api error");
+        track.acquired(.texture, texture, descriptor.label, .{ .texture = .{
+            .width = descriptor.size.width,
+            .height = descriptor.size.height,
+            .depth = descriptor.size.depth_or_array_layers,
+            .format = descriptor.format,
+            .mips = descriptor.mip_level_count,
+            .usage = descriptor.usage,
+        } });
         return @ptrCast(texture);
     }
 
@@ -605,6 +667,7 @@ pub const Impl = sysgpu.Interface(struct {
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         const queue = device.getQueue() catch @panic("api error");
         queue.manager.reference();
+        track.acquired(.queue, queue, "queue", .none);
         return @ptrCast(queue);
     }
 
@@ -685,11 +748,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn deviceReference(device_raw: *sysgpu.Device) void {
+        track.referenced(device_raw);
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         device.manager.reference();
     }
 
     pub inline fn deviceRelease(device_raw: *sysgpu.Device) void {
+        if (!track.deviceReleased(device_raw)) return;
         const device: *impl.Device = @ptrCast(@alignCast(device_raw));
         device.manager.release();
     }
@@ -718,6 +783,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn instanceCreateSurface(instance_raw: *sysgpu.Instance, descriptor: *const sysgpu.Surface.Descriptor) *sysgpu.Surface {
         const instance: *impl.Instance = @ptrCast(@alignCast(instance_raw));
         const surface = instance.createSurface(descriptor) catch @panic("api error");
+        track.acquired(.surface, surface, descriptor.label, .none);
         return @ptrCast(surface);
     }
 
@@ -740,11 +806,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn instanceReference(instance_raw: *sysgpu.Instance) void {
+        track.referenced(instance_raw);
         const instance: *impl.Instance = @ptrCast(@alignCast(instance_raw));
         instance.manager.reference();
     }
 
     pub inline fn instanceRelease(instance_raw: *sysgpu.Instance) void {
+        if (!track.released(instance_raw)) return;
         const instance: *impl.Instance = @ptrCast(@alignCast(instance_raw));
         instance.manager.release();
     }
@@ -756,11 +824,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn pipelineLayoutReference(pipeline_layout_raw: *sysgpu.PipelineLayout) void {
+        track.referenced(pipeline_layout_raw);
         const pipeline_layout: *impl.PipelineLayout = @ptrCast(@alignCast(pipeline_layout_raw));
         pipeline_layout.manager.reference();
     }
 
     pub inline fn pipelineLayoutRelease(pipeline_layout_raw: *sysgpu.PipelineLayout) void {
+        if (!track.released(pipeline_layout_raw)) return;
         const pipeline_layout: *impl.PipelineLayout = @ptrCast(@alignCast(pipeline_layout_raw));
         pipeline_layout.manager.release();
     }
@@ -822,26 +892,31 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn queueSubmit(queue_raw: *sysgpu.Queue, command_count: usize, commands_raw: [*]const *const sysgpu.CommandBuffer) void {
         const queue: *impl.Queue = @ptrCast(@alignCast(queue_raw));
         const commands: []const *impl.CommandBuffer = @ptrCast(commands_raw[0..command_count]);
+        if (track.enabled) for (commands_raw[0..command_count]) |c| track.used(c, "submit");
         queue.submit(commands) catch @panic("api error");
     }
 
     pub inline fn queueWriteBuffer(queue_raw: *sysgpu.Queue, buffer_raw: *sysgpu.Buffer, buffer_offset: u64, data: *const anyopaque, size: usize) void {
         const queue: *impl.Queue = @ptrCast(@alignCast(queue_raw));
         const buffer: *impl.Buffer = @ptrCast(@alignCast(buffer_raw));
+        track.uploaded(buffer_raw, size);
         queue.writeBuffer(buffer, buffer_offset, @ptrCast(data), size) catch @panic("api error");
     }
 
     pub inline fn queueWriteTexture(queue_raw: *sysgpu.Queue, destination: *const sysgpu.ImageCopyTexture, data: *const anyopaque, data_size: usize, data_layout: *const sysgpu.Texture.DataLayout, write_size: *const sysgpu.Extent3D) void {
         const queue: *impl.Queue = @ptrCast(@alignCast(queue_raw));
+        track.uploaded(destination.texture, data_size);
         queue.writeTexture(destination, @ptrCast(data), data_size, data_layout, write_size) catch @panic("api error");
     }
 
     pub inline fn queueReference(queue_raw: *sysgpu.Queue) void {
+        track.referenced(queue_raw);
         const queue: *impl.Queue = @ptrCast(@alignCast(queue_raw));
         queue.manager.reference();
     }
 
     pub inline fn queueRelease(queue_raw: *sysgpu.Queue) void {
+        if (!track.released(queue_raw)) return;
         const queue: *impl.Queue = @ptrCast(@alignCast(queue_raw));
         queue.manager.release();
     }
@@ -975,11 +1050,13 @@ pub const Impl = sysgpu.Interface(struct {
 
     pub inline fn renderPassEncoderDraw(render_pass_encoder_raw: *sysgpu.RenderPassEncoder, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) void {
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
+        track.passDraw(render_pass_encoder_raw);
         render_pass_encoder.draw(vertex_count, instance_count, first_vertex, first_instance) catch @panic("api error");
     }
 
     pub inline fn renderPassEncoderDrawIndexed(render_pass_encoder_raw: *sysgpu.RenderPassEncoder, index_count: u32, instance_count: u32, first_index: u32, base_vertex: i32, first_instance: u32) void {
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
+        track.passDraw(render_pass_encoder_raw);
         render_pass_encoder.drawIndexed(index_count, instance_count, first_index, base_vertex, first_instance) catch @panic("api error");
     }
 
@@ -1040,6 +1117,7 @@ pub const Impl = sysgpu.Interface(struct {
     ) void {
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
         const group: *impl.BindGroup = @ptrCast(@alignCast(group_raw));
+        track.passSetBindGroup(render_pass_encoder_raw, group_index, group_raw);
         render_pass_encoder.setBindGroup(group_index, group, dynamic_offset_count, dynamic_offsets) catch @panic("api error");
     }
 
@@ -1052,6 +1130,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn renderPassEncoderSetIndexBuffer(render_pass_encoder_raw: *sysgpu.RenderPassEncoder, buffer_raw: *sysgpu.Buffer, format: sysgpu.IndexFormat, offset: u64, size: u64) void {
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
         const buffer: *impl.Buffer = @ptrCast(@alignCast(buffer_raw));
+        track.passSetBuffer(render_pass_encoder_raw, buffer_raw, .index_buffer, 0);
         render_pass_encoder.setIndexBuffer(buffer, format, offset, size) catch @panic("api error");
     }
 
@@ -1064,6 +1143,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn renderPassEncoderSetPipeline(render_pass_encoder_raw: *sysgpu.RenderPassEncoder, pipeline_raw: *sysgpu.RenderPipeline) void {
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
         const pipeline: *impl.RenderPipeline = @ptrCast(@alignCast(pipeline_raw));
+        track.passSetPipeline(render_pass_encoder_raw, pipeline_raw);
         render_pass_encoder.setPipeline(pipeline) catch @panic("api error");
     }
 
@@ -1081,6 +1161,7 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn renderPassEncoderSetVertexBuffer(render_pass_encoder_raw: *sysgpu.RenderPassEncoder, slot: u32, buffer_raw: *sysgpu.Buffer, offset: u64, size: u64) void {
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
         const buffer: *impl.Buffer = @ptrCast(@alignCast(buffer_raw));
+        track.passSetBuffer(render_pass_encoder_raw, buffer_raw, .vertex_buffer, slot);
         render_pass_encoder.setVertexBuffer(slot, buffer, offset, size) catch @panic("api error");
     }
 
@@ -1097,11 +1178,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn renderPassEncoderReference(render_pass_encoder_raw: *sysgpu.RenderPassEncoder) void {
+        track.referenced(render_pass_encoder_raw);
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
         render_pass_encoder.manager.reference();
     }
 
     pub inline fn renderPassEncoderRelease(render_pass_encoder_raw: *sysgpu.RenderPassEncoder) void {
+        if (!track.released(render_pass_encoder_raw)) return;
         const render_pass_encoder: *impl.RenderPassEncoder = @ptrCast(@alignCast(render_pass_encoder_raw));
         render_pass_encoder.manager.release();
     }
@@ -1110,6 +1193,8 @@ pub const Impl = sysgpu.Interface(struct {
         const render_pipeline: *impl.RenderPipeline = @ptrCast(@alignCast(render_pipeline_raw));
         const layout: *impl.BindGroupLayout = render_pipeline.getBindGroupLayout(group_index);
         layout.manager.reference();
+        track.acquired(.bind_group_layout, layout, null, .none);
+        track.edge(render_pipeline_raw, layout, .layout, @intCast(group_index + 1));
         return @ptrCast(layout);
     }
 
@@ -1120,11 +1205,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn renderPipelineReference(render_pipeline_raw: *sysgpu.RenderPipeline) void {
+        track.referenced(render_pipeline_raw);
         const render_pipeline: *impl.RenderPipeline = @ptrCast(@alignCast(render_pipeline_raw));
         render_pipeline.manager.reference();
     }
 
     pub inline fn renderPipelineRelease(render_pipeline_raw: *sysgpu.RenderPipeline) void {
+        if (!track.released(render_pipeline_raw)) return;
         const render_pipeline: *impl.RenderPipeline = @ptrCast(@alignCast(render_pipeline_raw));
         render_pipeline.manager.release();
     }
@@ -1136,11 +1223,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn samplerReference(sampler_raw: *sysgpu.Sampler) void {
+        track.referenced(sampler_raw);
         const sampler: *impl.Sampler = @ptrCast(@alignCast(sampler_raw));
         sampler.manager.reference();
     }
 
     pub inline fn samplerRelease(sampler_raw: *sysgpu.Sampler) void {
+        if (!track.released(sampler_raw)) return;
         const sampler: *impl.Sampler = @ptrCast(@alignCast(sampler_raw));
         sampler.manager.release();
     }
@@ -1159,11 +1248,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn shaderModuleReference(shader_module_raw: *sysgpu.ShaderModule) void {
+        track.referenced(shader_module_raw);
         const shader_module: *impl.ShaderModule = @ptrCast(@alignCast(shader_module_raw));
         shader_module.manager.reference();
     }
 
     pub inline fn shaderModuleRelease(shader_module_raw: *sysgpu.ShaderModule) void {
+        if (!track.released(shader_module_raw)) return;
         const shader_module: *impl.ShaderModule = @ptrCast(@alignCast(shader_module_raw));
         shader_module.manager.release();
     }
@@ -1232,11 +1323,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn surfaceReference(surface_raw: *sysgpu.Surface) void {
+        track.referenced(surface_raw);
         const surface: *impl.Surface = @ptrCast(@alignCast(surface_raw));
         surface.manager.reference();
     }
 
     pub inline fn surfaceRelease(surface_raw: *sysgpu.Surface) void {
+        if (!track.released(surface_raw)) return;
         const surface: *impl.Surface = @ptrCast(@alignCast(surface_raw));
         surface.manager.release();
     }
@@ -1258,20 +1351,27 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn swapChainGetCurrentTextureView(swap_chain_raw: *sysgpu.SwapChain) ?*sysgpu.TextureView {
         const swap_chain: *impl.SwapChain = @ptrCast(@alignCast(swap_chain_raw));
         const texture_view = swap_chain.getCurrentTextureView() catch @panic("api error");
+        if (texture_view) |view| {
+            track.acquired(.texture_view, view, "swap chain view", .none);
+            track.edge(view, swap_chain, .swap_chain, 0);
+        }
         return @ptrCast(texture_view);
     }
 
     pub inline fn swapChainPresent(swap_chain_raw: *sysgpu.SwapChain) void {
         const swap_chain: *impl.SwapChain = @ptrCast(@alignCast(swap_chain_raw));
         swap_chain.present() catch @panic("api error");
+        track.presented();
     }
 
     pub inline fn swapChainReference(swap_chain_raw: *sysgpu.SwapChain) void {
+        track.referenced(swap_chain_raw);
         const swap_chain: *impl.SwapChain = @ptrCast(@alignCast(swap_chain_raw));
         swap_chain.manager.reference();
     }
 
     pub inline fn swapChainRelease(swap_chain_raw: *sysgpu.SwapChain) void {
+        if (!track.released(swap_chain_raw)) return;
         const swap_chain: *impl.SwapChain = @ptrCast(@alignCast(swap_chain_raw));
         swap_chain.manager.release();
     }
@@ -1279,6 +1379,8 @@ pub const Impl = sysgpu.Interface(struct {
     pub inline fn textureCreateView(texture_raw: *sysgpu.Texture, descriptor: ?*const sysgpu.TextureView.Descriptor) *sysgpu.TextureView {
         const texture: *impl.Texture = @ptrCast(@alignCast(texture_raw));
         const texture_view = texture.createView(descriptor orelse &sysgpu.TextureView.Descriptor{}) catch @panic("api error");
+        track.acquired(.texture_view, texture_view, if (descriptor) |d| d.label else null, .none);
+        track.edge(texture_view, texture, .view_of, 0);
         return @ptrCast(texture_view);
     }
 
@@ -1334,11 +1436,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn textureReference(texture_raw: *sysgpu.Texture) void {
+        track.referenced(texture_raw);
         const texture: *impl.Texture = @ptrCast(@alignCast(texture_raw));
         texture.manager.reference();
     }
 
     pub inline fn textureRelease(texture_raw: *sysgpu.Texture) void {
+        if (!track.released(texture_raw)) return;
         const texture: *impl.Texture = @ptrCast(@alignCast(texture_raw));
         texture.manager.release();
     }
@@ -1350,11 +1454,13 @@ pub const Impl = sysgpu.Interface(struct {
     }
 
     pub inline fn textureViewReference(texture_view_raw: *sysgpu.TextureView) void {
+        track.referenced(texture_view_raw);
         const texture_view: *impl.TextureView = @ptrCast(@alignCast(texture_view_raw));
         texture_view.manager.reference();
     }
 
     pub inline fn textureViewRelease(texture_view_raw: *sysgpu.TextureView) void {
+        if (!track.released(texture_view_raw)) return;
         const texture_view: *impl.TextureView = @ptrCast(@alignCast(texture_view_raw));
         texture_view.manager.release();
     }

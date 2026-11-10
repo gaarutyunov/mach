@@ -55,6 +55,7 @@ pub const main = mach.schedule(.{
 pub const deinit = mach.schedule(.{
     .{ mach.Audio, .deinit },
     .{ App, .deinit2 },
+    .{ gfx.Sprite, .deinit },
 });
 
 app_thread: mach.Thread,
@@ -130,6 +131,8 @@ pub fn deinit2(
     app: *App,
 ) void {
     app.app_thread.join();
+    // The sprite pipeline holds its own reference, released by gfx.Sprite.deinit.
+    app.sprite_texture.release();
 }
 
 /// Called on the high-priority audio OS thread when the audio driver needs more audio samples, so

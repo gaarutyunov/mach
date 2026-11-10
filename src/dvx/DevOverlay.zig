@@ -39,7 +39,7 @@ const DevOverlay = @This();
 
 pub const mach_module = .mach_dvx_dev_overlay;
 
-pub const mach_systems = .{ .init, .update, .snapshot, .render, .beginPass };
+pub const mach_systems = .{ .init, .update, .snapshot, .render, .beginPass, .deinit };
 
 /// Draws the overlay on top of the frame. Chain it into the window's render schedule, once the
 /// frame has been drawn and any render pass ended, with these schedule values provided:
@@ -138,6 +138,15 @@ pub fn init(overlay: *DevOverlay, ctx: mach.Context) void {
         .refresh_timer = time.Timer.start(ctx.io),
         .visible = if (!enabled) false else if (std.c.getenv("MACH_DEV_OVERLAY")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false,
     };
+}
+
+/// Releases the overlay's GPU resources. Call it on exit, once rendering has stopped, before
+/// `mach.Core` releases the device (the sprite pipeline drawing the panel holds its own reference
+/// until `gfx.Sprite.deinit`).
+pub fn deinit(overlay: *DevOverlay) void {
+    if (!enabled) return;
+    if (overlay.gpu_ready.load(.acquire)) overlay.bg_texture.release();
+    overlay.gpu_ready.store(false, .release);
 }
 
 /// Sets the window the overlay is drawn on. Call before the first `update`.

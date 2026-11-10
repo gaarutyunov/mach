@@ -3,6 +3,7 @@ const std = @import("std");
 const mach = @import("../main.zig");
 const module = @import("../module.zig");
 const Graph = @import("../graph.zig").Graph;
+const threads = @import("threads.zig");
 const Modules = module.Modules;
 
 /// An ID representing a mach object. This is an opaque identifier which effectively encodes:
@@ -135,7 +136,9 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Returns `false` if the calling thread would have to block to acquire it.
         /// Otherwise, returns `true` and the caller should `unlock()` the Mutex to release it.
         pub fn tryLock(objs: *@This()) bool {
-            return objs.internal.mu.tryLock(objs.internal.io);
+            const locked = objs.internal.mu.tryLock(objs.internal.io);
+            if (locked) threads.listLocked(objs);
+            return locked;
         }
 
         /// Acquires the mutex, blocking the caller's thread until it can.
@@ -143,11 +146,13 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Once acquired, call `unlock()` on the Mutex to release it.
         pub fn lock(objs: *@This()) void {
             objs.internal.mu.lockUncancelable(objs.internal.io);
+            threads.listLocked(objs);
         }
 
         /// Releases the mutex which was previously acquired with `lock()` or `tryLock()`.
         /// It is undefined behavior if the mutex is unlocked from a different thread that it was locked from.
         pub fn unlock(objs: *@This()) void {
+            threads.listUnlocked(objs);
             objs.internal.mu.unlock(objs.internal.io);
         }
 
@@ -156,7 +161,9 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Returns `false` if the calling thread would have to block to acquire it.
         /// Otherwise, returns `true` and the caller should call `unlockShared()` to release it.
         pub fn tryLockShared(objs: *@This()) bool {
-            return objs.internal.mu.tryLockShared(objs.internal.io);
+            const locked = objs.internal.mu.tryLockShared(objs.internal.io);
+            if (locked) threads.listLocked(objs);
+            return locked;
         }
 
         /// Acquires a shared (read) lock, blocking the caller's thread until it can.
@@ -165,15 +172,18 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Once acquired, call `unlockShared()` on the Mutex to release it.
         pub fn lockShared(objs: *@This()) void {
             objs.internal.mu.lockSharedUncancelable(objs.internal.io);
+            threads.listLocked(objs);
         }
 
         /// Releases the shared (reader) lock which was previously acquired with `lockShared()` or
         /// `tryLockShared()`.
         pub fn unlockShared(objs: *@This()) void {
+            threads.listUnlocked(objs);
             objs.internal.mu.unlockShared(objs.internal.io);
         }
 
         pub fn new(objs: *@This(), value: T) std.mem.Allocator.Error!ObjectID {
+            threads.listAccess(objs, true);
             const allocator = objs.internal.allocator;
             const data = &objs.internal.data;
             const freed = &objs.internal.freed;
@@ -272,6 +282,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Unlike setAll(), this method does not respect any mach.Objects tracking
         /// options, so changes made to an object through this method will not be tracked.
         pub fn setValueRaw(objs: *@This(), id: ObjectID, value: T) void {
+            threads.listAccess(objs, true);
             const data = &objs.internal.data;
 
             const unpacked = objs.validateAndUnpack(id, "setValueRaw");
@@ -283,6 +294,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Unlike setAllRaw, this method respects mach.Objects tracking
         /// and changes made to an object through this method will be tracked.
         pub fn setValue(objs: *@This(), id: ObjectID, value: T) void {
+            threads.listAccess(objs, true);
             const data = &objs.internal.data;
 
             const unpacked = objs.validateAndUnpack(id, "setValue");
@@ -300,6 +312,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Unlike set(), this method does not respect any mach.Objects tracking
         /// options, so changes made to an object through this method will not be tracked.
         pub fn setRaw(objs: *@This(), id: ObjectID, comptime field_name: std.meta.FieldEnum(T), value: @FieldType(T, @tagName(field_name))) void {
+            threads.listAccess(objs, true);
             const data = &objs.internal.data;
             const unpacked = objs.validateAndUnpack(id, "setRaw");
 
@@ -311,6 +324,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// Unlike setAllRaw, this method respects mach.Objects tracking
         /// and changes made to an object through this method will be tracked.
         pub fn set(objs: *@This(), id: ObjectID, comptime field_name: std.meta.FieldEnum(T), value: @FieldType(T, @tagName(field_name))) void {
+            threads.listAccess(objs, true);
             const data = &objs.internal.data;
             const unpacked = objs.validateAndUnpack(id, "set");
 
@@ -324,6 +338,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
 
         /// Get a single field.
         pub fn get(objs: *@This(), id: ObjectID, comptime field_name: std.meta.FieldEnum(T)) @FieldType(T, @tagName(field_name)) {
+            threads.listAccess(objs, false);
             const data = &objs.internal.data;
 
             const unpacked = objs.validateAndUnpack(id, "get");
@@ -332,6 +347,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
 
         /// Get all fields.
         pub fn getValue(objs: *@This(), id: ObjectID) T {
+            threads.listAccess(objs, false);
             const data = &objs.internal.data;
 
             const unpacked = objs.validateAndUnpack(id, "getValue");
@@ -387,6 +403,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// If `require_free = true`, it is a @compileError to invoke this method on the set and
         /// free() must be used instead.
         pub fn delete(objs: *@This(), id: ObjectID) void {
+            threads.listAccess(objs, true);
             if (options.require_free) @compileError("delete() cannot be used when require_free is set; use free() instead");
             const unpacked = objs.validateAndUnpack(id, "delete");
             objs.internal.pending_delete.set(unpacked.index);
@@ -411,6 +428,7 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// In debug builds, calling free() on an object which has children in the graph results in
         /// a panic.
         pub fn free(objs: *@This(), id: ObjectID) void {
+            threads.listAccess(objs, true);
             const unpacked = objs.validateAndUnpack(id, "free");
             const data = &objs.internal.data;
             const freed = &objs.internal.freed;
@@ -622,6 +640,18 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
             return any_updated;
         }
 
+        /// Whether the given object is from this pool of objects and alive (not freed, nor marked for
+        /// deletion). Unlike `is`, never panics: for IDs which may be stale, e.g. ones from a
+        /// render snapshot while the app thread deletes objects.
+        pub fn isAlive(objs: *const @This(), id: ObjectID) bool {
+            const unpacked: PackedID = @bitCast(id);
+            if (unpacked.type_id != objs.internal.type_id) return false;
+            if (unpacked.index >= objs.internal.generation.items.len) return false;
+            if (objs.internal.generation.items[unpacked.index] != unpacked.generation) return false;
+            if (objs.internal.freed.isSet(unpacked.index)) return false;
+            return !objs.internal.pending_delete.isSet(unpacked.index);
+        }
+
         /// Tells if the given object is from this pool of objects. If it is, then it must also be
         /// alive/valid or else a panic will occur.
         pub fn is(objs: *const @This(), id: ObjectID) bool {
@@ -694,6 +724,8 @@ pub fn Objects(options: ObjectsOptions, comptime T: type) type {
         /// rather than resizing to fit only what is needed, under the assumption that capacity
         /// may be needed in the next copy.
         pub fn copyFrom(dst: *@This(), src: *const @This()) std.mem.Allocator.Error!void {
+            threads.listAccess(dst, true);
+            threads.listAccess(src, false);
             // allocator, io, and mu fields are not copied.
             const allocator = dst.internal.allocator;
 
