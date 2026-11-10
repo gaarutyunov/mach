@@ -125,7 +125,26 @@ pub const Color = enum(u8) {
     grid,
     pass,
     warn,
+    // Connected components, see `colorByComponent`.
+    comp0,
+    comp1,
+    comp2,
+    comp3,
+    comp4,
+    comp5,
+    comp6,
+    comp7,
+    comp8,
+    comp9,
+    comp10,
+    comp11,
+    /// Nodes without any edge.
+    comp_single,
 };
+
+pub const num_component_colors = 12;
+
+pub const Component = struct { color: Color, size: u32 };
 
 pub const View = enum {
     systems,
@@ -680,6 +699,73 @@ fn buildLifetimes(a: std.mem.Allocator, s: *const Snapshot, g: *Graph, opt: Opti
         });
         y -= row_h + 2;
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coloring
+
+/// Colors nodes by connected component (edges taken as undirected), the largest components first.
+/// Returns the components with their color and size, largest first (nodes without edges are left
+/// out and colored `comp_single`).
+pub fn colorByComponent(a: std.mem.Allocator, g: *Graph) ![]Component {
+    const n = g.nodes.items.len;
+    const parent = try a.alloc(u32, n);
+    for (parent, 0..) |*p, i| p.* = @intCast(i);
+    const find = struct {
+        fn find(ps: []u32, x0: u32) u32 {
+            var x = x0;
+            while (ps[x] != x) {
+                ps[x] = ps[ps[x]];
+                x = ps[x];
+            }
+            return x;
+        }
+    }.find;
+    for (g.edges.items) |e| {
+        const ra = find(parent, e.from);
+        const rb = find(parent, e.to);
+        if (ra != rb) parent[ra] = rb;
+    }
+    const sizes = try a.alloc(u32, n);
+    @memset(sizes, 0);
+    for (0..n) |i| sizes[find(parent, @intCast(i))] += 1;
+
+    // Roots of components with more than one node, largest first.
+    var roots: std.ArrayList(u32) = .empty;
+    for (0..n) |i| if (parent[i] == i and sizes[i] > 1) try roots.append(a, @intCast(i));
+    std.mem.sort(u32, roots.items, sizes, struct {
+        fn lt(sz: []u32, x: u32, y: u32) bool {
+            return sz[x] > sz[y] or (sz[x] == sz[y] and x < y);
+        }
+    }.lt);
+    const color_of_root = try a.alloc(Color, n);
+    @memset(color_of_root, .comp_single);
+    var out: std.ArrayList(Component) = .empty;
+    for (roots.items, 0..) |r, k| {
+        const c: Color = @fromBackingInt(@intCast(@backingInt(Color.comp0) + k % num_component_colors));
+        color_of_root[r] = c;
+        try out.append(a, .{ .color = c, .size = sizes[r] });
+    }
+    for (g.nodes.items, 0..) |*node, i| node.color = color_of_root[find(parent, @intCast(i))];
+    return out.items;
+}
+
+test "colorByComponent" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var g: Graph = .{};
+    for (0..6) |i| _ = try g.addNode(a, .{ .key = i, .label = "n", .color = .system });
+    try g.addEdge(a, .{ .from = 0, .to = 1 });
+    try g.addEdge(a, .{ .from = 1, .to = 2 });
+    try g.addEdge(a, .{ .from = 3, .to = 4 });
+    const comps = try colorByComponent(a, &g);
+    try std.testing.expectEqual(2, comps.len);
+    try std.testing.expectEqual(3, comps[0].size);
+    try std.testing.expectEqual(Color.comp0, g.nodes.items[0].color);
+    try std.testing.expectEqual(Color.comp0, g.nodes.items[2].color);
+    try std.testing.expectEqual(Color.comp1, g.nodes.items[4].color);
+    try std.testing.expectEqual(Color.comp_single, g.nodes.items[5].color);
 }
 
 // ---------------------------------------------------------------------------------------------

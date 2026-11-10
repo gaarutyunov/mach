@@ -23,6 +23,7 @@ const gpu = mach.gpu;
 const gfx = mach.gfx;
 const math = mach.math;
 const Model = @import("Model.zig");
+const Force = @import("Force.zig");
 
 const vec2 = math.vec2;
 const vec3 = math.vec3;
@@ -107,6 +108,20 @@ const palette = blk: {
         .grid => .{ 30, 33, 42, 255 },
         .pass => .{ 120, 60, 60, 255 },
         .warn => .{ 220, 150, 50, 255 },
+        // Distinct hues for connected components.
+        .comp0 => .{ 46, 110, 190, 255 },
+        .comp1 => .{ 196, 92, 40, 255 },
+        .comp2 => .{ 52, 140, 74, 255 },
+        .comp3 => .{ 150, 60, 160, 255 },
+        .comp4 => .{ 170, 140, 30, 255 },
+        .comp5 => .{ 30, 140, 150, 255 },
+        .comp6 => .{ 180, 60, 90, 255 },
+        .comp7 => .{ 100, 110, 30, 255 },
+        .comp8 => .{ 90, 80, 180, 255 },
+        .comp9 => .{ 140, 90, 50, 255 },
+        .comp10 => .{ 60, 120, 120, 255 },
+        .comp11 => .{ 130, 130, 140, 255 },
+        .comp_single => .{ 56, 60, 70, 255 },
     };
     break :blk colors;
 };
@@ -180,6 +195,17 @@ selected: ?u32 = null,
 show_problems: bool = true,
 needs_fit: bool = true,
 exported: bool = false,
+/// How graph views are laid out: a force simulation on the GPU (`G` toggles), or columns.
+layout_mode: enum { gravity, columns } = .gravity,
+/// How nodes are colored (`C` cycles).
+color_mode: enum { kind, component } = .kind,
+/// Connected components of the current graph, for the legend in `.component` color mode.
+components: []const Model.Component = &.{},
+force: Force,
+/// Fit the view once the force simulation settles.
+fit_on_settle: bool = false,
+/// The zoom edges were last sized for.
+edges_zoom: f32 = 0,
 
 // Camera: the world position at the window's center, and pixels per world unit.
 cam_x: f32 = 0,
@@ -204,6 +230,8 @@ ui_texts: std.ArrayList(mach.ObjectID) = .empty,
 /// The problem shown on each line of the problems panel, for clicks.
 problem_lines: std.ArrayList(u32) = .empty,
 problems_panel: [4]f32 = .{ 0, 0, 0, 0 },
+/// Other panels (x, y, w, h in window units, y down), which swallow clicks.
+panels: std.ArrayList([4]f32) = .empty,
 
 pub fn init(core: *mach.Core, app: *App, app_mod: mach.Mod(App), core_mod: mach.Mod(mach.Core), ctx: mach.Context) !void {
     core.on_exit = app_mod.id.deinit;
@@ -222,7 +250,11 @@ pub fn init(core: *mach.Core, app: *App, app_mod: mach.Mod(App), core_mod: mach.
         it.deinit();
     }
     const view: Model.View = if (std.c.getenv("MACH_INSPECTOR_VIEW")) |v| std.meta.stringToEnum(Model.View, std.mem.span(v)) orelse .gpu else .gpu;
+    const color_component = if (std.c.getenv("MACH_INSPECTOR_COLOR")) |v| std.mem.eql(u8, std.mem.span(v), "component") else false;
+    const columns = if (std.c.getenv("MACH_INSPECTOR_LAYOUT")) |v| std.mem.eql(u8, std.mem.span(v), "columns") else false;
     app.* = .{
+        .color_mode = if (color_component) .component else .kind,
+        .layout_mode = if (columns) .columns else .gravity,
         .screenshot_path = if (std.c.getenv("MACH_INSPECTOR_SCREENSHOT")) |p| std.mem.span(p) else null,
         .view = view,
         .allocator = ctx.allocator,
@@ -230,6 +262,7 @@ pub fn init(core: *mach.Core, app: *App, app_mod: mach.Mod(App), core_mod: mach.
         .window = window,
         .path = path,
         .reload_timer = mach.time.Timer.start(ctx.io),
+        .force = Force.init(ctx.allocator, ctx.io),
         .snapshot_arena = .init(ctx.allocator),
         .graph_arena = .init(ctx.allocator),
         .app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app),
@@ -238,6 +271,9 @@ pub fn init(core: *mach.Core, app: *App, app_mod: mach.Mod(App), core_mod: mach.
 
 pub fn deinit(app: *App, sprite_mod: mach.Mod(gfx.Sprite), text_mod: mach.Mod(gfx.Text)) void {
     app.app_thread.join();
+    // On the render thread, which owns the simulation's GPU resources.
+    app.force.releaseGpu();
+    app.force.deinit();
     sprite_mod.call(.deinit);
     text_mod.call(.deinit);
     // The sprite pipelines hold their own reference to it.
@@ -290,6 +326,15 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                     app.show_problems = !app.show_problems;
                     dirty_ui = true;
                 },
+                .g => {
+                    app.layout_mode = if (app.layout_mode == .gravity) .columns else .gravity;
+                    app.needs_fit = true;
+                    dirty_scene = true;
+                },
+                .c => {
+                    app.color_mode = if (app.color_mode == .kind) .component else .kind;
+                    dirty_scene = true;
+                },
                 .l => {
                     app.moved.clearRetainingCapacity();
                     app.needs_fit = true;
@@ -329,6 +374,7 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                     n.x += dx / app.zoom;
                     n.y -= dy / app.zoom;
                     try app.moved.put(app.allocator, n.key, .{ n.x, n.y });
+                    if (app.simulating()) app.force.pin(i, .{ n.x + n.w / 2, n.y + n.h / 2 }, true);
                     try app.placeNode(sprite, text, i);
                 },
             }
@@ -346,6 +392,12 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
         },
         .mouse_release => |ev| {
             if (ev.button != .left) continue;
+            // Let the simulation take over the dragged node again.
+            if (app.drag == .node and app.drag_moved and app.simulating()) {
+                const i = app.drag.node;
+                const n = app.graph.nodes.items[i];
+                app.force.pin(i, .{ n.x + n.w / 2, n.y + n.h / 2 }, false);
+            }
             if (!app.drag_moved) {
                 // A click: select what's under the cursor, or deselect.
                 const wx, const wy = app.toWorld(app.mouse_x, app.mouse_y);
@@ -388,13 +440,40 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
         }
     }
 
+    if (app.simulating() and !dirty_scene) {
+        const dragged: ?u32 = switch (app.drag) {
+            .node => |i| i,
+            else => null,
+        };
+        if (app.force.takePositions(&app.graph, dragged)) {
+            try app.placeAll(sprite, text);
+            if (app.fit_on_settle and !app.force.running()) {
+                app.fit_on_settle = false;
+                app.fit();
+                dirty_camera = true;
+            }
+        }
+    }
+
     if (dirty_scene) {
         try app.rebuildScene(sprite, text);
         dirty_ui = true;
         dirty_camera = true;
     }
     if (dirty_ui) try app.rebuildUi(sprite, text);
-    if (dirty_camera or dirty_ui) app.applyCamera(sprite, text);
+    if (dirty_camera or dirty_ui) {
+        app.applyCamera(sprite, text);
+        // Edge thickness depends on the zoom.
+        if (app.zoom != app.edges_zoom) {
+            app.edges_zoom = app.zoom;
+            for (0..app.graph.edges.items.len) |ei| app.placeEdge(sprite, @intCast(ei));
+        }
+    }
+}
+
+/// Whether the current graph is laid out by the force simulation.
+fn simulating(app: *const App) bool {
+    return app.layout_mode == .gravity and !app.graph.positioned and app.graph.nodes.items.len > 0;
 }
 
 fn setView(app: *App, view: Model.View, dirty: *bool) void {
@@ -580,6 +659,14 @@ fn rebuildScene(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
             n.y = pos[1];
         }
     }
+    app.components = &.{};
+    if (app.color_mode == .component and !app.graph.positioned) {
+        app.components = try Model.colorByComponent(app.graph_arena.allocator(), &app.graph);
+    }
+    if (app.simulating()) {
+        try app.force.setGraph(&app.graph);
+        if (app.needs_fit) app.fit_on_settle = true;
+    }
 
     var sprite_ids: std.ArrayList(mach.ObjectID) = .empty;
     defer sprite_ids.deinit(app.allocator);
@@ -613,7 +700,7 @@ fn rebuildScene(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     try appendToRenderList(sprite, app.allocator, app.world_sprites, sprite_ids.items);
     try appendToRenderList(text, app.allocator, app.world_text, text_ids.items);
 
-    for (0..app.graph.nodes.items.len) |i| try app.placeNode(sprite, text, @intCast(i));
+    try app.placeAll(sprite, text);
     if (app.needs_fit) {
         app.fit();
         app.needs_fit = false;
@@ -621,17 +708,27 @@ fn rebuildScene(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     app.scene_ready.store(true, .release);
 }
 
+/// Positions every node and edge.
+fn placeAll(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
+    for (0..app.graph.nodes.items.len) |i| app.placeNodeOnly(sprite, text, @intCast(i));
+    for (0..app.graph.edges.items.len) |ei| app.placeEdge(sprite, @intCast(ei));
+}
+
 /// Positions a node's sprites and text, and the edges touching it.
 fn placeNode(app: *App, sprite: *gfx.Sprite, text: *gfx.Text, i: u32) !void {
+    app.placeNodeOnly(sprite, text, i);
+    for (app.graph.edges.items, 0..) |e, ei| {
+        if (e.from == i or e.to == i) app.placeEdge(sprite, @intCast(ei));
+    }
+}
+
+fn placeNodeOnly(app: *App, sprite: *gfx.Sprite, text: *gfx.Text, i: u32) void {
     const n = app.graph.nodes.items[i];
     const s = app.node_sprites.items[i];
     const bw: f32 = if (app.selected == i or n.problem) 3 else 1;
     sprite.objects.set(s.border, .transform, rectTransform(n.x - bw, n.y - bw, n.w + 2 * bw, n.h + 2 * bw, 0.5));
     sprite.objects.set(s.fill, .transform, rectTransform(n.x, n.y, n.w, n.h, 0.4));
     text.objects.set(s.text, .transform, Mat4x4.translate(vec3(n.x + Model.pad, n.y + n.h - Model.pad / 2 - Model.font_size * 0.85, 0)));
-    for (app.graph.edges.items, 0..) |e, ei| {
-        if (e.from == i or e.to == i) app.placeEdge(sprite, @intCast(ei));
-    }
 }
 
 fn placeEdge(app: *App, sprite: *gfx.Sprite, ei: u32) void {
@@ -654,10 +751,12 @@ fn placeEdge(app: *App, sprite: *gfx.Sprite, ei: u32) void {
     const hi = app.edgeTouchesSelection(e);
     const color: Model.Color = if (hi) .edge_hi else if (app.selected != null) .edge_dim else e.color;
     const s = app.edge_sprites.items[ei];
-    const thickness: f32 = if (hi) 2.5 else 1.5;
+    // Constant on screen, whatever the zoom.
+    const thickness: f32 = (if (hi) @as(f32, 2.5) else 1.5) / app.zoom;
     sprite.objects.set(s.line, .transform, lineTransform(x0, y0, x1, y1, thickness, 0.9));
     sprite.objects.set(s.line, .uv_transform, uvFor(color));
-    sprite.objects.set(s.head, .transform, rectTransform(x1 - 4, y1 - 4, 8, 8, 0.8));
+    const head = @min(8, 8 / app.zoom);
+    sprite.objects.set(s.head, .transform, rectTransform(x1 - head / 2, y1 - head / 2, head, head, 0.8));
     sprite.objects.set(s.head, .uv_transform, uvFor(color));
 }
 
@@ -724,6 +823,7 @@ fn addPanelText(app: *App, text: *gfx.Text, lines: *const Lines, x: f32, y: f32)
 
 fn addPanel(app: *App, sprite: *gfx.Sprite, x: f32, y: f32, w: f32, h: f32, color: Model.Color) !void {
     // UI coordinates: y is negative going down the window.
+    try app.panels.append(app.allocator, .{ x, y, w, h });
     const id = try newRect(sprite, rectTransform(x, -y - h, w, h, 0.5), color);
     try app.ui_objects.append(app.allocator, id);
     try appendToRenderList(sprite, app.allocator, app.ui_sprites, &.{id});
@@ -737,6 +837,7 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     app.ui_texts.clearRetainingCapacity();
     app.problem_lines.clearRetainingCapacity();
     app.problems_panel = .{ 0, 0, 0, 0 };
+    app.panels.clearRetainingCapacity();
 
     const s = app.snapshot;
     const problems = if (s) |snap| snap.gpu.problems else &.{};
@@ -744,8 +845,12 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     // Top bar.
     try app.addPanel(sprite, 0, 0, app.win_w, top_bar_h, .panel);
     var top: Lines = .{};
-    top.add(.title, "[1] Systems   [2] Objects   [3] GPU   [4] Lifetimes      view: {s}      [P] problems: {d}   [H] released: {s}   [F] fit   [L] relayout   [R] reload", .{
-        app.view.title(), problems.len, if (app.options.show_released) "shown" else "hidden",
+    top.add(.title, "[1] Systems  [2] Objects  [3] GPU  [4] Lifetimes   view: {s}   [G] layout: {s}   [C] color: {s}   [P] problems: {d}   [H] released: {s}   [F] fit  [L] relayout  [R] reload", .{
+        app.view.title(),
+        if (app.layout_mode == .gravity) "gravity" else "columns",
+        if (app.color_mode == .kind) "type" else "component",
+        problems.len,
+        if (app.options.show_released) "shown" else "hidden",
     });
     if (s) |snap| {
         var live: usize = 0;
@@ -809,13 +914,24 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
         .objects => &.{ .{ .module, "module" }, .{ .list, "mach.Objects list" }, .{ .object, "object" }, .{ .texture, "GPU object" } },
         .gpu, .lifetimes => &.{ .{ .shader, "shader" }, .{ .pipeline, "pipeline" }, .{ .layout, "layout" }, .{ .bind_group, "bind group" }, .{ .buffer, "buffer" }, .{ .texture, "texture / view" }, .{ .sampler, "sampler" }, .{ .released, "released" }, .{ .problem, "problem" } },
     };
+    var comp_legend: [Model.num_component_colors + 1]struct { Model.Color, []const u8 } = undefined;
+    var comp_names: [Model.num_component_colors + 1][40]u8 = undefined;
+    const shown_legend = if (app.color_mode == .component and app.components.len > 0) blk: {
+        const n = @min(app.components.len, Model.num_component_colors);
+        for (app.components[0..n], 0..) |c, k| {
+            const name = std.fmt.bufPrint(&comp_names[k], "component {d}: {d} nodes", .{ k + 1, c.size }) catch "component";
+            comp_legend[k] = .{ c.color, name };
+        }
+        comp_legend[n] = .{ .comp_single, "unconnected" };
+        break :blk comp_legend[0 .. n + 1];
+    } else legend;
     var lg: Lines = .{};
-    for (legend) |item| lg.add(.dim, "{s}", .{item[1]});
-    const lx = app.win_w - 170;
-    const ly = if (app.selected != null) app.win_h - @as(f32, @floatFromInt(legend.len)) * ui_line_h - 20 else top_bar_h + 10;
+    for (shown_legend) |item| lg.add(.dim, "{s}", .{item[1]});
+    const lx = app.win_w - 210;
+    const ly = if (app.selected != null) app.win_h - @as(f32, @floatFromInt(shown_legend.len)) * ui_line_h - 20 else top_bar_h + 10;
     if (app.selected == null or ly > top_bar_h + 300) {
-        try app.addPanel(sprite, lx - 10, ly - 6, 170, @as(f32, @floatFromInt(legend.len)) * ui_line_h + 12, .panel);
-        for (legend, 0..) |item, i| {
+        try app.addPanel(sprite, lx - 10, ly - 6, 210, @as(f32, @floatFromInt(shown_legend.len)) * ui_line_h + 12, .panel);
+        for (shown_legend, 0..) |item, i| {
             try app.addPanel(sprite, lx, ly + @as(f32, @floatFromInt(i)) * ui_line_h + 4, 10, 10, item[0]);
         }
         try app.addPanelText(text, &lg, lx + 18, -ly);
@@ -831,6 +947,9 @@ fn clickUi(app: *App, dirty_scene: *bool, dirty_camera: *bool) bool {
         const index = line / 2;
         if (index < app.problem_lines.items.len) app.showGpuObject(app.problem_lines.items[index], dirty_scene, dirty_camera);
         return true;
+    }
+    for (app.panels.items) |r| {
+        if (app.mouse_x >= r[0] and app.mouse_x <= r[0] + r[2] and app.mouse_y >= r[1] and app.mouse_y <= r[1] + r[3]) return true;
     }
     return false;
 }
@@ -871,6 +990,7 @@ pub fn beginFrame(core: *mach.Core, app: *App, ctx: mach.Context) void {
         app.createPalette(window.device, window.queue);
         return ctx.schedule.stop();
     }
+    app.force.step(window.device, window.queue);
     // Give the app thread time to hand the scene over to the renderer.
     if (app.screenshot_path != null and app.shot_timer == null and app.scene_ready.load(.acquire)) app.shot_timer = mach.time.Timer.start(app.io);
     const take_shot = if (app.shot_timer) |*t| t.read() > 1.5 and app.shot_texture == null else false;
