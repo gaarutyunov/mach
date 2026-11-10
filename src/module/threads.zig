@@ -89,6 +89,8 @@ fn current() ?*Thread {
 /// Names the calling thread, e.g. "app" or "render".
 pub fn setName(name: []const u8) void {
     if (!enabled) return;
+    // Cheap enough to call every time a callback runs on a thread owned by someone else.
+    if (me) |t| if (std.mem.eql(u8, t.name_buf[0..t.name_len], name)) return;
     const t = current() orelse return;
     const len = @min(name.len, t.name_buf.len);
     @memcpy(t.name_buf[0..len], name[0..len]);

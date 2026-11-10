@@ -340,6 +340,8 @@ fn writeFn(audio_opaque: ?*anyopaque, output: []u8) void {
         // Run the audio tick function, which should fill the audio.output buffer with more audio
         // samples.
         audio.driver_needs_num_samples = @divExact(output.len, format_size);
+        // The driver's thread (e.g. CoreAudio's), named for tools like the inspector.
+        mach.module_threads.setName("audio");
         audio.mod.call(.tick);
 
         // Check if we now have enough data in our audio.output buffer. If we do, then we're done.

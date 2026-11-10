@@ -241,10 +241,18 @@ fn readCommands(inspector: *Inspector, stream: std.Io.net.Stream) void {
 }
 
 fn appName() []const u8 {
-    const args = mach.process_args orelse return "mach app";
-    var it = args.iterate();
-    const exe = it.next() orelse return "mach app";
-    return std.fs.path.basename(exe);
+    if (mach.process_args) |args| {
+        var it = args.iterate();
+        if (it.next()) |exe| return std.fs.path.basename(exe);
+    }
+    // Custom entrypoints may not set mach.process_args.
+    if (builtin.os.tag.isDarwin()) {
+        const getprogname = struct {
+            extern "c" fn getprogname() [*:0]const u8;
+        }.getprogname;
+        return std.mem.span(getprogname());
+    }
+    return "mach app";
 }
 
 fn pid() i64 {
