@@ -6,7 +6,8 @@ const mach = @import("mach");
 /// sends every `std.log` message to Tracy (with `-Dtracy`).
 pub const std_options: std.Options = if (@hasDecl(app, "std_options")) app.std_options else .{ .logFn = mach.logFn };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
+    mach.process_args = init.args;
     var io_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
     const io = io_threaded.io();
 

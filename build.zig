@@ -47,6 +47,8 @@ pub fn build(b: *std.Build) !void {
     const sysgpu_backend = b.option(SysgpuBackend, "sysgpu_backend", "sysgpu API backend") orelse .default;
     const tracy_enable = b.option(bool, "tracy", "Enable Tracy profiling (system zones, per-module memory, logs)") orelse false;
     const dev_overlay_enable = b.option(bool, "dev_overlay", "Include the dev overlay (mach.dvx.DevOverlay); defaults to Debug builds only") orelse (optimize == .debug);
+    const gpu_track_enable = b.option(bool, "gpu_track", "Track GPU object lifetimes and check API usage (mach.sysgpu.track); defaults to Debug builds only") orelse (optimize == .debug);
+    const inspector_enable = b.option(bool, "inspector", "Include the inspector exporter (mach.dvx.Inspector, set MACH_INSPECT=1 to use); defaults to Debug builds only") orelse (optimize == .debug);
     const metrics_enable = b.option(bool, "metrics", "Calculate metrics (mach.dvx.metrics), shown by the dev overlay") orelse false;
 
     const build_examples = b.option(bool, "examples", "build/install examples specifically");
@@ -74,6 +76,8 @@ pub fn build(b: *std.Build) !void {
     build_options.addOption(bool, "tracy", tracy_enable);
     build_options.addOption(bool, "metrics", metrics_enable);
     build_options.addOption(bool, "dev_overlay", dev_overlay_enable);
+    build_options.addOption(bool, "gpu_track", gpu_track_enable);
+    build_options.addOption(bool, "inspector", inspector_enable);
 
     var examples = [_]Example{
         .{ .name = "core-custom-entrypoint", .deps = &.{} },
@@ -268,6 +272,33 @@ pub fn build(b: *std.Build) !void {
         &examples,
     );
 
+    // The inspector tool: an interactive graph of a running app's snapshots (see
+    // mach.dvx.Inspector). Not part of Mach's runtime.
+    if (want_mach) {
+        const inspector_app = b.createModule(.{ .root_source_file = b.path("tools/inspector/App.zig") });
+        inspector_app.addImport("mach", module);
+        const inspector_exe = addExecutable(b, .{
+            .name = "mach-inspector",
+            .app = inspector_app,
+            .target = target,
+            .optimize = optimize,
+        });
+        const install_inspector = b.addInstallArtifact(inspector_exe, .{});
+        b.getInstallStep().dependOn(&install_inspector.step);
+        const run_inspector = b.addRunArtifact(inspector_exe);
+        run_inspector.step.dependOn(&install_inspector.step);
+        // `zig build inspector -- path/to/mach-inspect.json`
+        run_inspector.addPassthruArgs();
+        b.step("inspector", "Run the inspector: zig build inspector -- mach-inspect.json").dependOn(&run_inspector.step);
+
+        const inspector_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/inspector/Model.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(inspector_tests).step);
+    }
+
     if (want_mach and want_examples) {
         for (examples) |example| b.getInstallStep().dependOn(example.install_step);
     }
@@ -297,7 +328,7 @@ pub fn build(b: *std.Build) !void {
 
     // Static check that GPU resources acquired in a function get released.
     {
-        const lint = addGpuLint(b, b, &.{ "src/gfx", "src/dvx", "examples", "editor/init-project" });
+        const lint = addGpuLint(b, b, &.{ "src/gfx", "src/dvx", "examples", "editor/init-project", "tools" });
         b.step("lint-gpu", "Check that GPU resources get released").dependOn(&lint.step);
         test_step.dependOn(&lint.step);
     }

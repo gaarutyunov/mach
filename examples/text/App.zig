@@ -284,8 +284,10 @@ pub fn render(
 pub fn deinit(
     app: *App,
     text: *gfx.Text,
+    text_mod: mach.Mod(gfx.Text),
 ) void {
     app.app_thread.join();
-    // Cleanup here, if desired.
     if (app.pipeline_id != null) text.objects.delete(app.player_id);
+    // Release GPU resources before mach.Core releases the device.
+    text_mod.call(.deinit);
 }

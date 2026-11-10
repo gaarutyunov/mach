@@ -1660,6 +1660,31 @@ pub const CommandEncoder = struct {
         );
     }
 
+    pub fn copyTextureToBuffer(
+        encoder: *CommandEncoder,
+        source: *const sysgpu.ImageCopyTexture,
+        destination: *const sysgpu.ImageCopyBuffer,
+        copy_size: *const sysgpu.Extent3D,
+    ) !void {
+        const mtl_encoder = try encoder.getBlitEncoder();
+        const source_texture: *Texture = @ptrCast(@alignCast(source.texture));
+        const destination_buffer: *Buffer = @ptrCast(@alignCast(destination.buffer));
+
+        try encoder.reference_tracker.referenceBuffer(destination_buffer);
+
+        mtl_encoder.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            source_texture.mtl_texture,
+            source.origin.z,
+            source.mip_level,
+            mtl.Origin.init(source.origin.x, source.origin.y, source.origin.z),
+            mtl.Size.init(copy_size.width, copy_size.height, copy_size.depth_or_array_layers),
+            destination_buffer.mtl_buffer,
+            destination.layout.offset,
+            destination.layout.bytes_per_row,
+            destination.layout.bytes_per_row * destination.layout.rows_per_image,
+        );
+    }
+
     pub fn copyTextureToTexture(
         encoder: *CommandEncoder,
         source: *const sysgpu.ImageCopyTexture,

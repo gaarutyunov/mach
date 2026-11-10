@@ -30,6 +30,8 @@ const SystemTrace = trace.SystemTrace;
 const MemoryPlot = trace.MemoryPlot;
 
 const log = @import("module/log.zig");
+pub const dataflow = @import("module/dataflow.zig");
+const inspect = @import("module/inspect.zig");
 pub const logFn = log.logFn;
 const ContextLog = log.ContextLog;
 
@@ -570,6 +572,10 @@ pub fn Modules(module_lists: anytype) type {
                         @compileError("mach: function " ++ debug_name ++ " has an invalid argument(" ++ arg_name ++ ") type: " ++ @typeName(arg_type));
                     }
 
+                    const prev_system = dataflow.current_system;
+                    dataflow.current_system = debug_name;
+                    defer dataflow.current_system = prev_system;
+
                     const Ret = @typeInfo(F).@"fn".return_type orelse void;
                     switch (@typeInfo(Ret)) {
                         // TODO: define error handling of runnable functions
@@ -619,8 +625,20 @@ pub fn Modules(module_lists: anytype) type {
                             return m2.memoryStats(out);
                         }
                     }).memoryStats,
+                    ._inspect = (struct {
+                        fn inspectFn(modules_ptr: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            return inspect.write(m2, w);
+                        }
+                    }).inspectFn,
                 },
             }
+        }
+
+        /// Writes the modules' structure and state as JSON object members (`"modules":[...]`, ...)
+        /// for the inspector, see `mach.dvx.Inspector`.
+        pub fn writeInspect(m: *@This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            return inspect.write(m, w);
         }
 
         /// Returns the allocator for the given module (its override, or the global allocator).
@@ -1087,4 +1105,6 @@ test {
     _ = @import("module/schedule.zig");
     _ = @import("module/objects.zig");
     _ = @import("module/trace.zig");
+    _ = @import("module/inspect.zig");
+    _ = @import("module/dataflow.zig");
 }

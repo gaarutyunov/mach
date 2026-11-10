@@ -11,9 +11,22 @@ const Text = @This();
 
 pub const mach_module = .mach_gfx_text;
 
-pub const mach_systems = .{ .init, .cleanup, .snapshot, .render };
+pub const mach_systems = .{ .init, .cleanup, .snapshot, .render, .deinit };
 
 // TODO(text): currently not handling deinit properly
+
+const shader_source = @embedFile("text.wgsl");
+/// Comptime reflection of text.wgsl: the layout, bind groups and host structs below are derived
+/// from or checked against it, see `mach.wgsl`.
+const shader = mach.wgsl.Shader("text.wgsl", shader_source);
+
+comptime {
+    shader.checkHostType("uniforms", Uniforms);
+    shader.checkHostType("glyphs", Glyph);
+    shader.checkHostType("transforms", gpu.Mat4x4);
+    shader.checkHostType("colors", gpu.Vec4);
+    shader.checkColorTargets("fragMain", 1);
+}
 
 const Uniforms = extern struct {
     /// The view * orthographic projection matrix
@@ -28,7 +41,10 @@ const BuiltPipeline = struct {
     texture_sampler: *gpu.Sampler,
     texture: *gpu.Texture,
     bind_group: *gpu.BindGroup,
-    bind_group_layout: ?*gpu.BindGroupLayout,
+    bind_group_layout: *gpu.BindGroupLayout,
+    /// Whether Text created the bind group layout (else it's the pipeline's `.bind_group_layout`),
+    /// in which case it may recreate the bind group when growing the storage buffers.
+    owns_bind_group_layout: bool,
     uniforms: *gpu.Buffer,
     texture_atlas: gfx.Atlas,
     regions: RegionMap = .{},
@@ -44,7 +60,8 @@ const BuiltPipeline = struct {
         p.texture_sampler.release();
         p.texture.release();
         p.bind_group.release();
-        if (p.bind_group_layout) |l| l.release();
+        // Created, or referenced in rebuildPipeline.
+        p.bind_group_layout.release();
         p.uniforms.release();
         p.texture_atlas.deinit(allocator);
         p.regions.deinit(allocator);
@@ -287,6 +304,32 @@ pub fn init(text: *Text, ctx: mach.Context) !void {
         .render_objects = text.render_objects,
         .render_pipelines = text.render_pipelines,
     };
+}
+
+/// Releases the GPU resources of every built pipeline and frees internal buffers. Call it on exit
+/// (e.g. from `core.on_exit`, once rendering has stopped), before `mach.Core` releases the device,
+/// like `gfx.Sprite.deinit`.
+pub fn deinit(text: *Text) void {
+    for (text.built_pipelines.items) |*maybe| {
+        if (maybe.*) |*built| built.deinit(text.allocator);
+        maybe.* = null;
+    }
+    text.built_pipelines.deinit(text.allocator);
+    for (text.cached_render_lists.items) |*list| list.deinit(text.allocator);
+    text.cached_render_lists.deinit(text.allocator);
+    text.cp_transforms.deinit(text.allocator);
+    if (text.glyph_update_buffer) |*b| b.deinit(text.allocator);
+    text.glyph_update_buffer = null;
+    if (text.font_once) |*f| f.deinit(text.allocator);
+    text.font_once = null;
+    if (text.render_segments) |old| {
+        for (old) |segments| {
+            for (segments) |seg| text.allocator.free(@constCast(seg.text));
+            text.allocator.free(segments);
+        }
+        text.allocator.free(old);
+    }
+    text.render_segments = null;
 }
 
 /// Creates a managed text object with formatted segments. Each element of `specs` is a
@@ -709,17 +752,8 @@ fn rebuildPipeline(
     });
     const owns_bind_group_layout = pipeline.bind_group_layout == null;
     const bind_group_layout = pipeline.bind_group_layout orelse device.createBindGroupLayout(
-        &gpu.BindGroupLayout.Descriptor.init(.{
-            .label = label,
-            .entries = &.{
-                gpu.BindGroupLayout.Entry.initBuffer(0, .{ .vertex = true }, .uniform, false, 0),
-                gpu.BindGroupLayout.Entry.initBuffer(1, .{ .vertex = true }, .read_only_storage, false, 0),
-                gpu.BindGroupLayout.Entry.initBuffer(2, .{ .vertex = true }, .read_only_storage, false, 0),
-                gpu.BindGroupLayout.Entry.initBuffer(3, .{ .vertex = true }, .read_only_storage, false, 0),
-                gpu.BindGroupLayout.Entry.initSampler(4, .{ .fragment = true }, .filtering),
-                gpu.BindGroupLayout.Entry.initTexture(5, .{ .fragment = true }, .float, .dimension_2d, false),
-            },
-        }),
+        // Derived from text.wgsl at comptime.
+        &shader.layoutDescriptor(0, label),
     );
 
     const texture_view = texture.createView(&gpu.TextureView.Descriptor{ .label = label });
@@ -729,14 +763,14 @@ fn rebuildPipeline(
         &gpu.BindGroup.Descriptor.init(.{
             .label = label,
             .layout = bind_group_layout,
-            .entries = &.{
-                gpu.BindGroup.Entry.initBuffer(0, uniforms, 0, @sizeOf(Uniforms), @sizeOf(Uniforms)),
-                gpu.BindGroup.Entry.initBuffer(1, transforms, 0, @sizeOf(gpu.Mat4x4) * initial_buffer_cap, @sizeOf(gpu.Mat4x4)),
-                gpu.BindGroup.Entry.initBuffer(2, colors, 0, @sizeOf(gpu.Vec4) * initial_buffer_cap, @sizeOf(gpu.Vec4)),
-                gpu.BindGroup.Entry.initBuffer(3, glyphs, 0, @sizeOf(Glyph) * initial_buffer_cap, @sizeOf(Glyph)),
-                gpu.BindGroup.Entry.initSampler(4, texture_sampler),
-                gpu.BindGroup.Entry.initTextureView(5, texture_view),
-            },
+            .entries = &shader.bindGroupEntries(0, .{
+                .uniforms = .{ .buffer = uniforms, .size = @sizeOf(Uniforms) },
+                .transforms = .{ .buffer = transforms, .size = @sizeOf(gpu.Mat4x4) * initial_buffer_cap },
+                .colors = .{ .buffer = colors, .size = @sizeOf(gpu.Vec4) * initial_buffer_cap },
+                .glyphs = .{ .buffer = glyphs, .size = @sizeOf(Glyph) * initial_buffer_cap },
+                .glyphSampler = texture_sampler,
+                .glyphTexture = texture_view,
+            }),
         }),
     );
 
@@ -753,7 +787,7 @@ fn rebuildPipeline(
         },
     };
 
-    const shader_module = pipeline.shader orelse device.createShaderModuleWGSL("text.wgsl", @embedFile("text.wgsl"));
+    const shader_module = pipeline.shader orelse device.createShaderModuleWGSL(shader.file_name, shader_source);
     defer shader_module.release();
 
     const color_target = pipeline.color_target_state orelse gpu.ColorTargetState{
@@ -763,7 +797,7 @@ fn rebuildPipeline(
     };
     const fragment = pipeline.fragment_state orelse gpu.FragmentState.init(.{
         .module = shader_module,
-        .entry_point = "fragMain",
+        .entry_point = shader.fragmentEntry("fragMain"),
         .targets = &.{color_target},
     });
 
@@ -779,7 +813,7 @@ fn rebuildPipeline(
         .layout = pipeline_layout,
         .vertex = gpu.VertexState{
             .module = shader_module,
-            .entry_point = "vertMain",
+            .entry_point = shader.vertexEntry("vertMain"),
         },
     });
 
@@ -788,7 +822,8 @@ fn rebuildPipeline(
         .texture_sampler = texture_sampler,
         .texture = texture,
         .bind_group = bind_group,
-        .bind_group_layout = if (owns_bind_group_layout) bind_group_layout else null,
+        .bind_group_layout = bind_group_layout,
+        .owns_bind_group_layout = owns_bind_group_layout,
         .uniforms = uniforms,
         .transforms = transforms,
         .colors = colors,
@@ -969,7 +1004,7 @@ fn updatePipelineBuffers(
 
     // Grow GPU storage buffers and recreate bind group if needed.
     const needed: u32 = @intCast(@max(i, glyphs.items.len));
-    if (needed > built.buffer_cap and built.bind_group_layout != null) {
+    if (needed > built.buffer_cap and built.owns_bind_group_layout) {
         var new_cap = built.buffer_cap;
         while (new_cap < needed) new_cap *= 2;
 
@@ -1003,15 +1038,15 @@ fn updatePipelineBuffers(
         built.bind_group = device.createBindGroup(
             &gpu.BindGroup.Descriptor.init(.{
                 .label = label,
-                .layout = built.bind_group_layout.?,
-                .entries = &.{
-                    gpu.BindGroup.Entry.initBuffer(0, built.uniforms, 0, @sizeOf(Uniforms), @sizeOf(Uniforms)),
-                    gpu.BindGroup.Entry.initBuffer(1, built.transforms, 0, @sizeOf(gpu.Mat4x4) * new_cap, @sizeOf(gpu.Mat4x4)),
-                    gpu.BindGroup.Entry.initBuffer(2, built.colors, 0, @sizeOf(gpu.Vec4) * new_cap, @sizeOf(gpu.Vec4)),
-                    gpu.BindGroup.Entry.initBuffer(3, built.glyphs, 0, @sizeOf(Glyph) * new_cap, @sizeOf(Glyph)),
-                    gpu.BindGroup.Entry.initSampler(4, built.texture_sampler),
-                    gpu.BindGroup.Entry.initTextureView(5, texture_view),
-                },
+                .layout = built.bind_group_layout,
+                .entries = &shader.bindGroupEntries(0, .{
+                    .uniforms = .{ .buffer = built.uniforms, .size = @sizeOf(Uniforms) },
+                    .transforms = .{ .buffer = built.transforms, .size = @sizeOf(gpu.Mat4x4) * new_cap },
+                    .colors = .{ .buffer = built.colors, .size = @sizeOf(gpu.Vec4) * new_cap },
+                    .glyphs = .{ .buffer = built.glyphs, .size = @sizeOf(Glyph) * new_cap },
+                    .glyphSampler = built.texture_sampler,
+                    .glyphTexture = texture_view,
+                }),
             }),
         );
         built.buffer_cap = new_cap;

@@ -8,6 +8,10 @@ const log = std.log.scoped(.mach);
 
 pub const is_debug = builtin.mode == .debug;
 
+/// The process's command line arguments, set by Mach's entrypoint before the app's main schedule
+/// runs (null with a custom entrypoint which doesn't set it).
+pub var process_args: ?std.process.Args = null;
+
 // Core
 pub const Core = if (build_options.want_core) @import("Core.zig") else struct {};
 
@@ -21,6 +25,9 @@ pub const time = @import("time/main.zig");
 pub const sysaudio = if (build_options.want_sysaudio) @import("sysaudio/main.zig") else struct {};
 pub const sysgpu = if (build_options.want_sysgpu) @import("sysgpu/main.zig") else struct {};
 pub const gpu = if (build_options.want_sysgpu) @import("sysgpu/main.zig").sysgpu else struct {};
+/// Compile-time WGSL reflection: derive and check bind group layouts, bind groups, host structs
+/// and entry points against a shader.
+pub const wgsl = if (build_options.want_sysgpu) @import("wgsl.zig") else struct {};
 
 const module = @import("module.zig");
 pub const Context = module.Context;
@@ -95,6 +102,7 @@ test {
     _ = gpu;
     _ = sysaudio;
     _ = sysgpu;
+    _ = wgsl;
     _ = gfx;
     _ = dvx;
     _ = Audio;

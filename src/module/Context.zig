@@ -48,6 +48,7 @@ schedule: ScheduleContext = .{},
 _modules: *anyopaque,
 _report_memory: *const fn (modules: *anyopaque) void,
 _memory_stats: *const fn (modules: *anyopaque, out: []ModuleMemory) []ModuleMemory,
+_inspect: *const fn (modules: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void,
 _log: *const fn (level: std.log.Level, system_name: []const u8, msg: []const u8) void,
 _log_enabled: *const fn (level: std.log.Level) bool,
 
@@ -60,6 +61,12 @@ pub fn reportMemory(ctx: Context) void {
 /// the filled part. Lock-free, so it can be called from any thread, e.g. every frame.
 pub fn memoryStats(ctx: Context, out: []ModuleMemory) []ModuleMemory {
     return ctx._memory_stats(ctx._modules, out);
+}
+
+/// Writes the structure and state of all modules as JSON object members, for the inspector (see
+/// `mach.dvx.Inspector`). Must be called from a system, on the thread mutating the objects.
+pub fn inspect(ctx: Context, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    return ctx._inspect(ctx._modules, w);
 }
 
 /// Messages longer than this are truncated.

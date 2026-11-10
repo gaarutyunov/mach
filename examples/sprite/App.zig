@@ -19,6 +19,7 @@ const App = @This();
 pub const Modules = mach.Modules(.{
     mach.Core,
     mach.gfx.Sprite,
+    mach.dvx.Inspector,
     App,
 });
 
@@ -39,6 +40,7 @@ pub const mach_systems = .{
 pub const main = mach.schedule(.{
     .{ mach.Core, .init },
     .{ gfx.Sprite, .init },
+    .{ mach.dvx.Inspector, .init },
     .{ App, .init },
     .{ mach.Core, .main },
 });
@@ -56,6 +58,8 @@ direction: Vec2 = vec2(0, 0),
 spawning: bool = false,
 player_id: mach.ObjectID = undefined,
 pipeline_id: ?mach.ObjectID = null,
+/// The sprite sheet, released on exit (the sprite pipeline holds its own reference to it).
+texture: ?*gpu.Texture = null,
 
 pub fn init(
     core: *mach.Core,
@@ -99,9 +103,10 @@ pub fn setupPipeline(
     const window = core.windows.getValue(core.window);
 
     // Create a sprite rendering pipeline
+    app.texture = try loadTexture(window.device, window.queue, app.allocator);
     app.pipeline_id = try sprite.pipelines.new(.{
         .window = core.window,
-        .texture = try loadTexture(window.device, window.queue, app.allocator),
+        .texture = app.texture.?,
     });
 
     // Create our player sprite
@@ -118,6 +123,7 @@ pub fn setupPipeline(
 
 pub const tick = mach.schedule(.{
     .{ App, .appTick },
+    .{ mach.dvx.Inspector, .tick },
     .{ gfx.Sprite, .cleanup },
     .{ mach.Core, .snapshotStart },
     .{ gfx.Sprite, .snapshot },
@@ -283,10 +289,13 @@ pub fn endFrame(core: *mach.Core, app: *App, ctx: mach.Context) !void {
 pub fn deinit(
     app: *App,
     sprite: *gfx.Sprite,
+    sprite_mod: mach.Mod(gfx.Sprite),
 ) void {
     app.app_thread.join();
-    // Cleanup here, if desired.
     if (app.pipeline_id != null) sprite.objects.delete(app.player_id);
+    // Release GPU resources before mach.Core releases the device.
+    sprite_mod.call(.deinit);
+    if (app.texture) |t| t.release();
 }
 
 // TODO(sprite): don't require users to copy / write this helper themselves

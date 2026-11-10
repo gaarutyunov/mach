@@ -53,6 +53,7 @@ const Context = @import("Context.zig");
 const Modules = module.Modules;
 const Mod = module.Mod;
 const schedule = @import("schedule.zig").schedule;
+const dataflow = @import("dataflow.zig");
 
 /// The running schedule's frame on this thread, if any. Systems reach it via `ctx.schedule`.
 pub threadlocal var current_frame: ?*Frame = null;
@@ -290,12 +291,14 @@ pub fn put(s: ScheduleContext, comptime key: @EnumLiteral(), value: anytype, com
     };
     @as(*T, @ptrCast(@alignCast(&slot.value))).* = value;
     frame.len += 1;
+    dataflow.record(@tagName(key), @typeName(T), .put);
 }
 
 /// Returns the value of this key from the innermost schedule having it, or null. Panics if it
 /// has a different type than `T`.
 pub fn get(s: ScheduleContext, comptime key: @EnumLiteral(), comptime T: type) ?T {
     const hash = comptime keyHash(key);
+    dataflow.record(@tagName(key), @typeName(T), .get);
     var maybe_frame = s.frame;
     while (maybe_frame) |frame| : (maybe_frame = frame.parent) {
         if (frame.find(hash)) |index| return slotValue(T, key, &frame.slots[index]).*;
@@ -323,6 +326,7 @@ pub fn has(s: ScheduleContext, comptime key: @EnumLiteral()) bool {
 pub fn remove(s: ScheduleContext, comptime key: @EnumLiteral()) void {
     const frame = s.frame orelse return;
     const index = frame.find(comptime keyHash(key)) orelse return;
+    dataflow.record(@tagName(key), frame.slots[index].type_name, .remove);
     frame.slots[index].runFinalizers();
     frame.removeAt(index);
 }
@@ -332,6 +336,7 @@ pub fn remove(s: ScheduleContext, comptime key: @EnumLiteral()) void {
 pub fn take(s: ScheduleContext, comptime key: @EnumLiteral(), comptime T: type) ?T {
     const frame = s.frame orelse return null;
     const index = frame.find(comptime keyHash(key)) orelse return null;
+    dataflow.record(@tagName(key), @typeName(T), .take);
     const value = slotValue(T, key, &frame.slots[index]).*;
     frame.removeAt(index);
     return value;

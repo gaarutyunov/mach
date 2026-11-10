@@ -88,8 +88,9 @@ pub fn init(
     };
 }
 
-pub fn deinit(app: *App) void {
+pub fn deinit(app: *App, sprite_mod: mach.Mod(gfx.Sprite)) void {
     app.app_thread.join();
+    sprite_mod.call(.deinit);
     app.texture_atlas.deinit(app.allocator);
     app.texture.release();
     _ = c.FT_Done_Face(app.face);
