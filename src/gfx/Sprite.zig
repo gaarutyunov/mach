@@ -19,8 +19,9 @@ const shader_source = @embedFile("sprite.wgsl");
 const shader = mach.wgsl.Shader("sprite.wgsl", shader_source);
 
 /// Sprite's `@group(0)` layout: sprite.wgsl's bindings, plus textures 6-8 for custom shaders doing
-/// multi-texturing. Checked against sprite.wgsl at comptime.
-const layout_entries = [_]gpu.BindGroupLayout.Entry{
+/// multi-texturing. Checked against sprite.wgsl at comptime, and against custom shaders by
+/// `checkShader`.
+pub const layout_entries = [_]gpu.BindGroupLayout.Entry{
     gpu.BindGroupLayout.Entry.initBuffer(0, .{ .vertex = true }, .uniform, false, 0),
     gpu.BindGroupLayout.Entry.initBuffer(1, .{ .vertex = true }, .read_only_storage, false, 0),
     gpu.BindGroupLayout.Entry.initBuffer(2, .{ .vertex = true }, .read_only_storage, false, 0),
@@ -33,12 +34,36 @@ const layout_entries = [_]gpu.BindGroupLayout.Entry{
 };
 
 comptime {
-    shader.checkLayout(0, &layout_entries);
+    checkShader(shader);
     shader.checkHostType("uniforms", Uniforms);
     shader.checkHostType("sprite_transforms", gpu.Mat4x4);
     shader.checkHostType("sprite_uv_transforms", gpu.Mat4x4);
     shader.checkHostType("sprite_sizes", gpu.Vec2);
     shader.checkColorTargets("fragMain", 1);
+}
+
+/// Checks at comptime that a custom pipeline `.shader` (a `mach.wgsl.Shader`) works with Sprite:
+/// its `@group(0)` bindings match Sprite's (`layout_entries`), its `uniforms` match Sprite's,
+/// its entry points are `vertMain` and `fragMain`, and it writes a single color target.
+/// `@group(1)` is the pipeline's `.user_bind_group_layout`, see `mach.wgsl.Shader.layoutEntries`.
+///
+/// ```
+/// const clouds = mach.wgsl.Shader("clouds.wgsl", @embedFile("clouds.wgsl"));
+/// comptime gfx.Sprite.checkShader(clouds);
+/// ```
+pub fn checkShader(comptime S: type) void {
+    comptime {
+        S.checkLayout(0, &layout_entries);
+        if (@hasDecl(S, "binding")) {
+            for (S.bindings) |b| {
+                if (b.group == 0 and std.mem.eql(u8, b.name, "uniforms")) S.checkHostType("uniforms", Uniforms);
+            }
+        }
+        _ = S.vertexEntry("vertMain");
+        _ = S.fragmentEntry("fragMain");
+        S.checkColorTargets("fragMain", 1);
+        if (S.num_groups > 2) @compileError(S.file_name ++ ": gfx.Sprite pipelines only have @group(0) (Sprite's) and @group(1) (.user_bind_group_layout)");
+    }
 }
 
 const Uniforms = extern struct {
