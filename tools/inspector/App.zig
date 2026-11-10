@@ -129,6 +129,7 @@ const palette = blk: {
         .comp10 => .{ 60, 120, 120, 255 },
         .comp11 => .{ 130, 130, 140, 255 },
         .comp_single => .{ 56, 60, 70, 255 },
+        .comp_hub => .{ 200, 200, 210, 255 },
     };
     break :blk colors;
 };
@@ -358,6 +359,10 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                 .g => {
                     app.layout_mode = if (app.layout_mode == .gravity) .columns else .gravity;
                     app.needs_fit = true;
+                    dirty_scene = true;
+                },
+                .k => {
+                    app.options.show_copies = !app.options.show_copies;
                     dirty_scene = true;
                 },
                 .c => {
@@ -913,10 +918,11 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     // Top bar.
     try app.addPanel(sprite, 0, 0, app.win_w, top_bar_h, .panel);
     var top: Lines = .{};
-    top.add(.title, "[1] Systems [2] Objects [3] GPU [4] Lifetimes [5] Threads [6] Timeline   view: {s}   [G] layout: {s}   [C] color: {s}   [P] problems: {d}   [H] released: {s}   [F] fit  [L] relayout  [R] reload", .{
+    top.add(.title, "[1] Systems [2] Objects [3] GPU [4] Lifetimes [5] Threads [6] Timeline   view: {s}   [G] layout: {s}   [C] color: {s}   [K] render copies: {s}   [P] problems: {d}   [H] released: {s}   [F] fit  [L] relayout  [R] reload", .{
         app.view.title(),
         if (app.layout_mode == .gravity) "gravity" else "columns",
         if (app.color_mode == .kind) "type" else "component",
+        if (app.options.show_copies) "shown" else "hidden",
         problems.len,
         if (app.options.show_released) "shown" else "hidden",
     });
@@ -993,7 +999,7 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
         .timeline => &.{ .{ .comp0, "thread lane" }, .{ .comp3, "system run (by system)" } },
         .gpu, .lifetimes => &.{ .{ .shader, "shader" }, .{ .pipeline, "pipeline" }, .{ .layout, "layout" }, .{ .bind_group, "bind group" }, .{ .buffer, "buffer" }, .{ .texture, "texture / view" }, .{ .sampler, "sampler" }, .{ .released, "released" }, .{ .problem, "problem" } },
     };
-    var comp_legend: [Model.num_component_colors + 1]struct { Model.Color, []const u8 } = undefined;
+    var comp_legend: [Model.num_component_colors + 2]struct { Model.Color, []const u8 } = undefined;
     var comp_names: [Model.num_component_colors + 1][40]u8 = undefined;
     const shown_legend = if (app.color_mode == .component and app.components.len > 0) blk: {
         const n = @min(app.components.len, Model.num_component_colors);
@@ -1002,7 +1008,8 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
             comp_legend[k] = .{ c.color, name };
         }
         comp_legend[n] = .{ .comp_single, "unconnected" };
-        break :blk comp_legend[0 .. n + 1];
+        comp_legend[n + 1] = .{ .comp_hub, "shared hub (not joining)" };
+        break :blk comp_legend[0 .. n + 2];
     } else legend;
     var lg: Lines = .{};
     for (shown_legend) |item| lg.add(.dim, "{s}", .{item[1]});

@@ -85,6 +85,12 @@ const PackedID = packed struct(u64) {
     index: u32,
 };
 
+/// Whether `id` could be an object ID: its type ID is one of a registered `mach.Objects` list.
+fn isObjectId(m: anytype, id: u64) bool {
+    const unpacked: PackedID = @bitCast(id);
+    return unpacked.type_id < m.name_ids.len;
+}
+
 /// Writes `"modules":[...],"objects":[...],"relations":[...],"dataflow":[...]` (without braces).
 pub fn write(m: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
     @setEvalBranchQuota(100_000);
@@ -189,11 +195,13 @@ pub fn write(m: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
                         if (@hasField(@TypeOf(value), rname)) {
                             const v = @field(value, rname);
                             if (RT == u64 or RT == ?u64) {
-                                if (@as(?u64, v)) |ref| {
+                                // Only values which look like object IDs (of a registered
+                                // list), not e.g. hashes.
+                                if (@as(?u64, v)) |ref| if (isObjectId(m, ref)) {
                                     if (ri > 0) try w.writeAll(",");
                                     ri += 1;
                                     try w.print("{{\"field\":\"{s}\",\"id\":{d}}}", .{ rname, ref });
-                                }
+                                };
                             } else if (RT == std.ArrayList(u64)) {
                                 for (v.items[0..@min(v.items.len, 64)]) |ref| {
                                     if (ri > 0) try w.writeAll(",");

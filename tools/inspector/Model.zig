@@ -189,6 +189,8 @@ pub const Color = enum(u8) {
     comp11,
     /// Nodes without any edge.
     comp_single,
+    /// Shared hubs (e.g. the window everything draws into), not joining components.
+    comp_hub,
 };
 
 pub const num_component_colors = 12;
@@ -243,6 +245,9 @@ pub const Toggle = struct { schedule: []const u8, field: []const u8, value: bool
 pub const Edge = struct {
     from: u32,
     to: u32,
+    /// Containment (a module has a list, a list has an object) rather than a relation: not
+    /// counted for connected components.
+    structural: bool = false,
     color: Color = .edge,
     label: []const u8 = "",
 };
@@ -328,6 +333,9 @@ pub const Options = struct {
     show_released: bool = false,
     /// Most objects per `mach.Objects` list shown in the objects view.
     max_objects: usize = 16,
+    /// Show the render thread's snapshot copies of lists (e.g. gfx.Sprite's render_objects), which
+    /// mirror the originals.
+    show_copies: bool = false,
 };
 
 pub fn build(a: std.mem.Allocator, s: *const Snapshot, view: View, opt: Options) !Graph {
@@ -621,9 +629,15 @@ fn buildObjects(a: std.mem.Allocator, s: *const Snapshot, g: *Graph, opt: Option
             const gi = try gpuNode(a, s, g, &gpu_by_ptr, f.ptr) orelse continue;
             try g.addEdge(a, .{ .from = mi, .to = gi, .label = f.field, .color = .texture });
         }
-        for (m.lists) |l| {
+        for (m.lists, 0..) |l, list_index| {
+            // A list sharing an earlier list's type ID is its snapshot copy for the render thread.
+            const is_copy = for (m.lists[0..list_index]) |prev| {
+                if (prev.type_id == l.type_id) break true;
+            } else false;
+            if (is_copy and !opt.show_copies) continue;
             var d: std.Io.Writer.Allocating = .init(a);
             const w = &d.writer;
+            if (is_copy) try w.writeAll("the render thread's snapshot copy of a list\n");
             try w.print("{s}.{s}: mach.Objects\n{d} live, {d} slots, capacity {d}\nfields:\n", .{ m.name, l.name, l.live, l.slots, l.capacity });
             for (l.fields) |f| try w.print("  {s}: {s}{s}\n", .{ f.name, f.type, if (f.gpu) "  (GPU)" else "" });
             const li = try g.addNode(a, .{
@@ -633,15 +647,15 @@ fn buildObjects(a: std.mem.Allocator, s: *const Snapshot, g: *Graph, opt: Option
                 .color = .list,
                 .details = d.written(),
             });
-            try g.addEdge(a, .{ .from = mi, .to = li });
+            try g.addEdge(a, .{ .from = mi, .to = li, .structural = true });
             for (l.objects, 0..) |o, oi| {
                 if (oi == opt.max_objects) {
                     const more = try g.addNode(a, .{ .key = keyOf(.{ "more", m.name, l.name }), .label = try std.fmt.allocPrint(a, "+{d} more", .{l.live - opt.max_objects}), .color = .dim });
-                    try g.addEdge(a, .{ .from = li, .to = more });
+                    try g.addEdge(a, .{ .from = li, .to = more, .structural = true });
                     break;
                 }
                 const ni = try objectNode(a, g, l, o, m.name);
-                try g.addEdge(a, .{ .from = li, .to = ni });
+                try g.addEdge(a, .{ .from = li, .to = ni, .structural = true });
                 // References by ID resolve to the first list having it (render copies of a list,
                 // such as gfx.Sprite's render_objects, share the IDs of the original).
                 const gop = try by_id.getOrPut(a, o.id);
@@ -651,6 +665,7 @@ fn buildObjects(a: std.mem.Allocator, s: *const Snapshot, g: *Graph, opt: Option
     }
     // Relations between objects and to GPU objects.
     for (s.modules) |m| for (m.lists) |l| for (l.objects) |o| {
+        // Objects of hidden lists (copies) have no node.
         const from = g.find(keyOf(.{ "obj", m.name, l.name, o.id })) orelse continue;
         for (o.refs) |r| {
             const id = r.id orelse continue;
@@ -946,8 +961,29 @@ fn buildTimeline(a: std.mem.Allocator, s: *const Snapshot, g: *Graph) !void {
 /// Colors nodes by connected component (edges taken as undirected), the largest components first.
 /// Returns the components with their color and size, largest first (nodes without edges are left
 /// out and colored `comp_single`).
+///
+/// Containment edges don't count, nor do hubs: nodes related to a large part of the graph (e.g.
+/// the window every pipeline draws into, holding the device and queue), which would otherwise
+/// merge everything into one component. Hubs are colored `comp_hub`.
 pub fn colorByComponent(a: std.mem.Allocator, g: *Graph) ![]Component {
     const n = g.nodes.items.len;
+    const degree = try a.alloc(u32, n);
+    @memset(degree, 0);
+    var related: u32 = 0;
+    // Incoming relations: a hub is what many others point to.
+    const in_degree = try a.alloc(u32, n);
+    @memset(in_degree, 0);
+    for (g.edges.items) |e| {
+        if (e.structural) continue;
+        degree[e.from] += 1;
+        degree[e.to] += 1;
+        in_degree[e.to] += 1;
+    }
+    for (degree) |d| {
+        if (d > 0) related += 1;
+    }
+    const hub = try a.alloc(bool, n);
+    for (in_degree, hub) |d, *h| h.* = d >= 4 and d * 6 >= related;
     const parent = try a.alloc(u32, n);
     for (parent, 0..) |*p, i| p.* = @intCast(i);
     const find = struct {
@@ -961,13 +997,16 @@ pub fn colorByComponent(a: std.mem.Allocator, g: *Graph) ![]Component {
         }
     }.find;
     for (g.edges.items) |e| {
+        if (e.structural or hub[e.from] or hub[e.to]) continue;
         const ra = find(parent, e.from);
         const rb = find(parent, e.to);
         if (ra != rb) parent[ra] = rb;
     }
     const sizes = try a.alloc(u32, n);
     @memset(sizes, 0);
-    for (0..n) |i| sizes[find(parent, @intCast(i))] += 1;
+    for (0..n) |i| {
+        if (!hub[i]) sizes[find(parent, @intCast(i))] += 1;
+    }
 
     // Roots of components with more than one node, largest first.
     var roots: std.ArrayList(u32) = .empty;
@@ -985,7 +1024,7 @@ pub fn colorByComponent(a: std.mem.Allocator, g: *Graph) ![]Component {
         color_of_root[r] = c;
         try out.append(a, .{ .color = c, .size = sizes[r] });
     }
-    for (g.nodes.items, 0..) |*node, i| node.color = color_of_root[find(parent, @intCast(i))];
+    for (g.nodes.items, 0..) |*node, i| node.color = if (hub[i]) .comp_hub else color_of_root[find(parent, @intCast(i))];
     return out.items;
 }
 
@@ -998,6 +1037,8 @@ test "colorByComponent" {
     try g.addEdge(a, .{ .from = 0, .to = 1 });
     try g.addEdge(a, .{ .from = 1, .to = 2 });
     try g.addEdge(a, .{ .from = 3, .to = 4 });
+    // Containment doesn't connect components.
+    try g.addEdge(a, .{ .from = 2, .to = 3, .structural = true });
     const comps = try colorByComponent(a, &g);
     try std.testing.expectEqual(2, comps.len);
     try std.testing.expectEqual(3, comps[0].size);
