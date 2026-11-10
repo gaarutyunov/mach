@@ -144,14 +144,16 @@ const MACHView = objc.objc.DefineClass(struct {
         } });
     }
 
-    /// The event's position in window units, with the origin at the top-left like on other
-    /// platforms (AppKit's is at the bottom-left).
+    /// The event's position in window units, relative to the top-left of the view rendered into
+    /// (AppKit's origin is at the bottom-left).
     fn windowPosition(n: *NativeState, event: *objc.app_kit.Event) Position {
         const location = event.locationInWindow();
-        // The content's live height: the stored one lags behind resizes (it is applied by the
-        // render thread), and AppKit may have constrained the window to the screen.
-        const content_rect = n.window.contentRectForFrameRect(n.window.frame());
-        return .{ .x = location.x, .y = content_rect.size.height - location.y };
+        // In the coordinates of the view we render into, and flipped with its own height: no
+        // assumptions about title bars, toolbars, or the window's size as mach.Core knows it
+        // (which lags behind resizes, and AppKit may constrain new windows to the screen).
+        const in_view = objc.objc.msgSend(n.view, "convertPoint:fromView:", @TypeOf(location), .{ location, @as(?*anyopaque, null) });
+        const bounds = objc.objc.msgSend(n.view, "bounds", @TypeOf(n.window.frame()), .{});
+        return .{ .x = in_view.x - bounds.origin.x, .y = bounds.size.height - (in_view.y - bounds.origin.y) };
     }
 
     /// Pushes a `mouse_press` event. Shared by `mouseDown:`, `rightMouseDown:`, `otherMouseDown:`.
@@ -1216,6 +1218,8 @@ fn initWindow(
     n.view.as(objc.app_kit.View).setLayer(@ptrCast(layer));
     MACHView.implementation._state.set(n.view, n);
     n.window.setContentView(@ptrCast(n.view));
+    // Follow the window's size (NSViewWidthSizable | NSViewHeightSizable).
+    objc.objc.msgSend(n.view, "setAutoresizingMask:", void, .{@as(c_ulong, 2 | 16)});
 
     // Center the window
     n.window.center();
@@ -1460,11 +1464,20 @@ fn handleResize(n: *NativeState) void {
 
     const core_window = n.core.windows.getValue(n.window_id);
 
-    // Determine the current width / height / pixel density of the window.
-    const frame = n.window.frame();
-    const content_rect = n.window.contentRectForFrameRect(frame);
-    const width: u32 = @intFromFloat(content_rect.size.width);
-    const height: u32 = @intFromFloat(content_rect.size.height);
+    // Make the view we render into fill the window's content area: AppKit may have resized the
+    // window (e.g. constrained a new window to the screen) without resizing the view, leaving
+    // part of it outside the window, and mouse positions and rendering disagreeing.
+    const Rect = @TypeOf(n.window.frame());
+    const content_rect = n.window.contentRectForFrameRect(n.window.frame());
+    var view_frame: Rect = content_rect;
+    view_frame.origin.x = 0;
+    view_frame.origin.y = 0;
+    objc.objc.msgSend(n.view, "setFrame:", void, .{view_frame});
+
+    // Determine the current width / height / pixel density of the window, from the view.
+    const bounds = objc.objc.msgSend(n.view, "bounds", Rect, .{});
+    const width: u32 = @intFromFloat(bounds.size.width);
+    const height: u32 = @intFromFloat(bounds.size.height);
     const pixel_density: f32 = @floatCast(n.window.backingScaleFactor());
 
     // Skip the work if nothing actually changed (handleResize can be called for many reasons.)
