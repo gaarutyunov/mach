@@ -31,6 +31,8 @@ pub const wgsl = if (build_options.want_sysgpu) @import("wgsl.zig") else struct 
 
 const module = @import("module.zig");
 pub const Context = module.Context;
+/// Per-thread recording for the inspector (see `mach.dvx.Inspector`).
+pub const module_threads = module.threads;
 pub const ModuleMemory = module.ModuleMemory;
 pub const FunctionID = module.FunctionID;
 pub const Graph = @import("graph.zig").Graph;

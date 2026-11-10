@@ -737,6 +737,7 @@ const RenderLoop = struct {
 
     /// Render thread entry point.
     fn renderThreadFn(self: *RenderLoop) void {
+        mach.module_threads.setName("render");
         while (self.running.load(.acquire)) {
             // Wait for the app to signal snapshotEnd() and indicate a frame is ready for drawing.
             self.core.frame_ready.waitUncancelable(self.io);

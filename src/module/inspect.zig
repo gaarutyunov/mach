@@ -7,6 +7,7 @@ const schedules = @import("schedule.zig");
 const ScheduleContext = @import("ScheduleContext.zig");
 const Context = @import("Context.zig");
 const dataflow = @import("dataflow.zig");
+const threads = @import("threads.zig");
 
 /// Most objects written per `mach.Objects` list.
 pub const max_objects_per_list = 256;
@@ -87,7 +88,7 @@ const PackedID = packed struct(u64) {
 /// Writes `"modules":[...],"objects":[...],"relations":[...],"dataflow":[...]` (without braces).
 pub fn write(m: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
     @setEvalBranchQuota(100_000);
-    if (!dataflow.enabled) return w.writeAll("\"modules\":[],\"dataflow\":[]");
+    if (!dataflow.enabled) return w.writeAll("\"modules\":[],\"dataflow\":[],\"threads\":[]");
     const ModulesT = @TypeOf(m.*);
     try w.writeAll("\"modules\":[");
     inline for (ModulesT.modules, 0..) |M, mi| {
@@ -146,7 +147,7 @@ pub fn write(m: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
                 if (list_index > 0) try w.writeAll(",");
                 list_index += 1;
                 const objs = &@field(mod, fname);
-                try w.print("{{\"name\":\"{s}\",\"type_id\":{d},\"fields\":[", .{ fname, objs.internal.type_id });
+                try w.print("{{\"name\":\"{s}\",\"type_id\":{d},\"address\":{d},\"fields\":[", .{ fname, objs.internal.type_id, @intFromPtr(objs) });
                 const T = @typeInfo(@TypeOf(FT.getValue)).@"fn".return_type.?;
                 inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types, 0..) |n, FFT, fi| {
                     if (fi > 0) try w.writeAll(",");
@@ -247,4 +248,6 @@ pub fn write(m: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
     }
     try w.writeAll("],\"dataflow\":");
     try dataflow.writeJson(w, writeString);
+    try w.writeAll(",\"threads\":");
+    try threads.writeJson(w, writeString, m.io);
 }

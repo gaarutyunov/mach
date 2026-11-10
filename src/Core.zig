@@ -396,6 +396,8 @@ pub fn renderFrame(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
     {
         core.render_mu.lockUncancelable(io);
         defer core.render_mu.unlock(io);
+        mach.module_threads.renderLock(true);
+        defer mach.module_threads.renderLock(false);
 
         core.windows.lockShared();
         defer core.windows.unlockShared();
@@ -464,12 +466,14 @@ pub fn snapshotStart(core: *Core, io: std.Io) !void {
     }
 
     core.render_mu.lockUncancelable(io);
+    mach.module_threads.renderLock(true);
     Platform.wakeMainThread(core);
     try core.render_graph.copyFrom(core.windows.internal.graph, core.allocator);
 }
 
 /// End submission of a snapshot for rendering the next frame.
 pub fn snapshotEnd(core: *Core, io: std.Io) void {
+    mach.module_threads.renderLock(false);
     core.render_mu.unlock(io);
     core.frame_ready.set(io);
 }
@@ -534,6 +538,7 @@ fn hashValue(hasher: anytype, value: anytype) void {
 /// * On a separate app thread via `mach.AppThread`.
 pub fn main(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
     if (core.on_exit == null) @panic("core.on_exit callback must be set");
+    mach.module_threads.setName("main");
 
     try Platform.tick(core, core_mod, io);
 

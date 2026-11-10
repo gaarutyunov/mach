@@ -31,6 +31,7 @@ const MemoryPlot = trace.MemoryPlot;
 
 const log = @import("module/log.zig");
 pub const dataflow = @import("module/dataflow.zig");
+pub const threads = @import("module/threads.zig");
 const inspect = @import("module/inspect.zig");
 pub const logFn = log.logFn;
 const ContextLog = log.ContextLog;
@@ -55,6 +56,7 @@ pub fn startThread(
     const run = struct {
         fn run(c: *Core, f: FunctionID, m: Mod(Core)) void {
             tracy.setThreadName(@tagName(kind));
+            threads.setName(@tagName(kind));
             while (c.state.load(.acquire) == .running) {
                 m.run(f);
             }
@@ -575,6 +577,8 @@ pub fn Modules(module_lists: anytype) type {
                     const prev_system = dataflow.current_system;
                     dataflow.current_system = debug_name;
                     defer dataflow.current_system = prev_system;
+                    const span_start = threads.systemBegin(m.modules.io);
+                    defer threads.systemEnd(m.modules.io, debug_name, span_start);
 
                     const Ret = @typeInfo(F).@"fn".return_type orelse void;
                     switch (@typeInfo(Ret)) {
@@ -1107,4 +1111,5 @@ test {
     _ = @import("module/trace.zig");
     _ = @import("module/inspect.zig");
     _ = @import("module/dataflow.zig");
+    _ = @import("module/threads.zig");
 }

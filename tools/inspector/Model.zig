@@ -8,7 +8,55 @@ pub const Snapshot = struct {
     gpu_track: bool = false,
     modules: []Module = &.{},
     dataflow: []Flow = &.{},
+    threads: []Thread = &.{},
     gpu: Gpu = .{},
+
+    pub const Thread = struct {
+        name: []const u8,
+        dropped_accesses: u64 = 0,
+        accesses: []ListAccess = &.{},
+        spans: []Span = &.{},
+    };
+    /// Accesses by a system, on a thread, to a `mach.Objects` list (by address).
+    pub const ListAccess = struct {
+        system: []const u8 = "",
+        list: u64,
+        reads: u64 = 0,
+        writes: u64 = 0,
+        own_lock: u64 = 0,
+        render_lock: u64 = 0,
+        write_own_lock: u64 = 0,
+        write_render_lock: u64 = 0,
+        /// When the first and last of these accesses happened, in microseconds before the
+        /// snapshot, or -1 if unknown (outside of systems).
+        first_us: i64 = -1,
+        last_us: i64 = -1,
+
+        /// Whether these accesses and `o` may have happened at the same time.
+        fn overlaps(x: ListAccess, o: ListAccess) bool {
+            if (x.first_us < 0 or o.first_us < 0) return true;
+            // Times count backwards: first_us >= last_us.
+            return !(x.last_us > o.first_us or o.last_us > x.first_us);
+        }
+
+        fn total(a: ListAccess) u64 {
+            return a.reads + a.writes;
+        }
+        fn allOwnLocked(a: ListAccess) bool {
+            return a.own_lock >= a.total();
+        }
+        fn allRenderLocked(a: ListAccess) bool {
+            return a.render_lock >= a.total();
+        }
+        fn writesOwnLocked(a: ListAccess) bool {
+            return a.write_own_lock >= a.writes;
+        }
+        fn writesRenderLocked(a: ListAccess) bool {
+            return a.write_render_lock >= a.writes;
+        }
+    };
+    /// A system run, in microseconds before the snapshot was written.
+    pub const Span = struct { system: []const u8, start_us: i64, end_us: i64, depth: u32 = 0 };
 
     pub const Module = struct {
         name: []const u8,
@@ -40,6 +88,7 @@ pub const Snapshot = struct {
     pub const List = struct {
         name: []const u8,
         type_id: u32 = 0,
+        address: u64 = 0,
         fields: []Field = &.{},
         live: u64 = 0,
         slots: u64 = 0,
@@ -151,6 +200,8 @@ pub const View = enum {
     objects,
     gpu,
     lifetimes,
+    threads,
+    timeline,
 
     pub fn title(v: View) []const u8 {
         return switch (v) {
@@ -158,6 +209,8 @@ pub const View = enum {
             .objects => "Objects",
             .gpu => "GPU",
             .lifetimes => "Lifetimes",
+            .threads => "Threads",
+            .timeline => "Timeline",
         };
     }
 };
@@ -279,6 +332,8 @@ pub fn build(a: std.mem.Allocator, s: *const Snapshot, view: View, opt: Options)
         .objects => try buildObjects(a, s, &g, opt),
         .gpu => try buildGpu(a, s, &g, opt),
         .lifetimes => try buildLifetimes(a, s, &g, opt),
+        .threads => try buildThreads(a, s, &g),
+        .timeline => try buildTimeline(a, s, &g),
     }
     for (g.nodes.items) |*n| {
         if (n.w == 0) sizeNode(n);
@@ -698,6 +753,173 @@ fn buildLifetimes(a: std.mem.Allocator, s: *const Snapshot, g: *Graph, opt: Opti
             .h = row_h,
         });
         y -= row_h + 2;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Threads
+
+/// A likely data race: a write to a list on one thread, and an access to it on another, without a
+/// lock held by both every time.
+pub const Race = struct {
+    list: u64,
+    writer_thread: usize,
+    writer: Snapshot.ListAccess,
+    other_thread: usize,
+    other: Snapshot.ListAccess,
+};
+
+fn locksDescription(acc: Snapshot.ListAccess) []const u8 {
+    if (acc.allOwnLocked() and acc.allRenderLocked()) return "own + render lock";
+    if (acc.allOwnLocked()) return "own lock";
+    if (acc.allRenderLocked()) return "render lock";
+    if (acc.own_lock == 0 and acc.render_lock == 0) return "no lock";
+    return "locked sometimes";
+}
+
+pub fn findRaces(a: std.mem.Allocator, s: *const Snapshot) ![]Race {
+    var out: std.ArrayList(Race) = .empty;
+    for (s.threads, 0..) |t, ti| for (t.accesses) |w| {
+        if (w.writes == 0) continue;
+        for (s.threads, 0..) |o, oi| {
+            if (oi == ti) continue;
+            for (o.accesses) |x| {
+                if (x.list != w.list) continue;
+                // E.g. initialization before the other thread started.
+                if (!w.overlaps(x)) continue;
+                // The writes, and everything the other thread does, under the same lock.
+                const common = (w.writesOwnLocked() and x.allOwnLocked()) or (w.writesRenderLocked() and x.allRenderLocked());
+                if (!common) try out.append(a, .{ .list = w.list, .writer_thread = ti, .writer = w, .other_thread = oi, .other = x });
+            }
+        }
+    };
+    return out.items;
+}
+
+fn listName(a: std.mem.Allocator, s: *const Snapshot, address: u64) ![]const u8 {
+    for (s.modules) |m| for (m.lists) |l| {
+        if (l.address == address) return std.fmt.allocPrint(a, "{s}.{s}", .{ shortModule(m.name), l.name });
+    };
+    return std.fmt.allocPrint(a, "list 0x{x}", .{address});
+}
+
+fn threadColor(i: usize) Color {
+    return @fromBackingInt(@intCast(@backingInt(Color.comp0) + i % num_component_colors));
+}
+
+/// Threads -> the systems they run -> the `mach.Objects` lists those access, with the locks held.
+/// Likely races are red.
+fn buildThreads(a: std.mem.Allocator, s: *const Snapshot, g: *Graph) !void {
+    const races = try findRaces(a, s);
+    for (s.threads, 0..) |t, ti| {
+        var d: std.Io.Writer.Allocating = .init(a);
+        try d.writer.print("thread {s}\n{d} system runs recorded, {d} (system, list) accesses\n", .{ t.name, t.spans.len, t.accesses.len });
+        if (t.dropped_accesses > 0) try d.writer.print("{d} accesses not recorded (table full)\n", .{t.dropped_accesses});
+        _ = try g.addNode(a, .{ .key = keyOf(.{ "thread", t.name }), .label = t.name, .sub = "thread", .color = threadColor(ti), .details = d.written() });
+    }
+    for (s.threads, 0..) |t, ti| {
+        const tn = g.find(keyOf(.{ "thread", t.name })).?;
+        for (t.accesses) |acc| {
+            const sys_name = if (acc.system.len > 0) acc.system else "(outside systems)";
+            const sk = keyOf(.{ "tsys", t.name, sys_name });
+            const sn = g.find(sk) orelse try g.addNode(a, .{
+                .key = sk,
+                .label = sys_name,
+                .sub = try std.fmt.allocPrint(a, "on {s}", .{t.name}),
+                .color = threadColor(ti),
+                .details = try std.fmt.allocPrint(a, "{s}, run on the {s} thread\n", .{ sys_name, t.name }),
+            });
+            try g.addEdge(a, .{ .from = tn, .to = sn, .label = "runs", .color = .edge });
+
+            const lk = keyOf(.{ "list", acc.list });
+            const ln = g.find(lk) orelse try g.addNode(a, .{
+                .key = lk,
+                .label = try listName(a, s, acc.list),
+                .sub = "mach.Objects",
+                .color = .list,
+                .details = try std.fmt.allocPrint(a, "{s}: mach.Objects\n", .{try listName(a, s, acc.list)}),
+            });
+            var racy = false;
+            for (races) |r| {
+                if (r.list == acc.list and ((r.writer_thread == ti and std.mem.eql(u8, r.writer.system, acc.system)) or (r.other_thread == ti and std.mem.eql(u8, r.other.system, acc.system)))) racy = true;
+            }
+            try g.addEdge(a, .{
+                .from = sn,
+                .to = ln,
+                .color = if (racy) .problem else if (acc.writes > 0) .value else .edge,
+                .label = try std.fmt.allocPrint(a, "r {d} w {d}, {s}", .{ acc.reads, acc.writes, locksDescription(acc) }),
+            });
+            const node = &g.nodes.items[ln];
+            node.details = try std.fmt.allocPrint(a, "{s}{s} on {s}: {d} reads, {d} writes, {s}\n", .{ node.details, sys_name, t.name, acc.reads, acc.writes, locksDescription(acc) });
+            if (racy) {
+                g.nodes.items[sn].problem = true;
+                node.problem = true;
+            }
+        }
+    }
+    for (races) |r| {
+        const ln = g.find(keyOf(.{ "list", r.list })) orelse continue;
+        const node = &g.nodes.items[ln];
+        node.details = try std.fmt.allocPrint(a, "{s}PROBLEM likely race: {s} on {s} writes it ({s}) while {s} on {s} accesses it ({s}), with no lock in common\n", .{
+            node.details,
+            if (r.writer.system.len > 0) r.writer.system else "(outside systems)",
+            s.threads[r.writer_thread].name,
+            locksDescription(r.writer),
+            if (r.other.system.len > 0) r.other.system else "(outside systems)",
+            s.threads[r.other_thread].name,
+            locksDescription(r.other),
+        });
+    }
+}
+
+/// One lane per thread, with the systems it ran in the last few milliseconds before the snapshot
+/// (time goes left to right, nested systems below their schedule).
+fn buildTimeline(a: std.mem.Allocator, s: *const Snapshot, g: *Graph) !void {
+    g.positioned = true;
+    const window_us: i64 = 50_000;
+    const width: f32 = 2400;
+    const px_per_us = width / @as(f32, @floatFromInt(window_us));
+    const row_h = line_h + 6;
+    var y: f32 = 0;
+    _ = try g.addNode(a, .{ .key = keyOf(.{"timeline axis"}), .label = "last 50 ms before the snapshot (time goes right); a bar is a system run, nested runs below", .color = .grid, .x = 0, .y = y, .w = width, .h = row_h });
+    y -= row_h + 10;
+    for (s.threads, 0..) |t, ti| {
+        var max_depth: u32 = 0;
+        for (t.spans) |sp| {
+            if (sp.start_us <= window_us) max_depth = @max(max_depth, sp.depth);
+        }
+        const lane_h = @as(f32, @floatFromInt(max_depth + 1)) * (row_h + 2);
+        _ = try g.addNode(a, .{
+            .key = keyOf(.{ "lane", t.name }),
+            .label = t.name,
+            .color = threadColor(ti),
+            .details = try std.fmt.allocPrint(a, "thread {s}\n", .{t.name}),
+            .x = -160,
+            .y = y - lane_h + row_h,
+            .w = 150,
+            .h = lane_h - 2,
+        });
+        var n: usize = 0;
+        for (t.spans) |sp| {
+            if (sp.start_us > window_us) continue;
+            const x0 = width - @as(f32, @floatFromInt(sp.start_us)) * px_per_us;
+            const x1 = width - @as(f32, @floatFromInt(sp.end_us)) * px_per_us;
+            const w = @max(x1 - x0, 1);
+            const duration_us = sp.start_us - sp.end_us;
+            const label = if (w > @as(f32, @floatFromInt(sp.system.len)) * char_w + 2 * pad) sp.system else "";
+            _ = try g.addNode(a, .{
+                .key = keyOf(.{ "span", t.name, n }),
+                .label = label,
+                .color = threadColor(std.hash.Wyhash.hash(0, sp.system) % num_component_colors),
+                .details = try std.fmt.allocPrint(a, "{s} on {s}\ntook {d} us, ended {d} us before the snapshot\n", .{ sp.system, t.name, duration_us, sp.end_us }),
+                .x = x0,
+                .y = y - @as(f32, @floatFromInt(sp.depth)) * (row_h + 2),
+                .w = w,
+                .h = row_h,
+            });
+            n += 1;
+        }
+        y -= lane_h + 12;
     }
 }
 

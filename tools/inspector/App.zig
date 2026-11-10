@@ -312,6 +312,8 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                 .two => app.setView(.objects, &dirty_scene),
                 .three => app.setView(.gpu, &dirty_scene),
                 .four => app.setView(.lifetimes, &dirty_scene),
+                .five => app.setView(.threads, &dirty_scene),
+                .six => app.setView(.timeline, &dirty_scene),
                 .f => {
                     app.fit();
                     dirty_camera = true;
@@ -845,7 +847,7 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     // Top bar.
     try app.addPanel(sprite, 0, 0, app.win_w, top_bar_h, .panel);
     var top: Lines = .{};
-    top.add(.title, "[1] Systems  [2] Objects  [3] GPU  [4] Lifetimes   view: {s}   [G] layout: {s}   [C] color: {s}   [P] problems: {d}   [H] released: {s}   [F] fit  [L] relayout  [R] reload", .{
+    top.add(.title, "[1] Systems [2] Objects [3] GPU [4] Lifetimes [5] Threads [6] Timeline   view: {s}   [G] layout: {s}   [C] color: {s}   [P] problems: {d}   [H] released: {s}   [F] fit  [L] relayout  [R] reload", .{
         app.view.title(),
         if (app.layout_mode == .gravity) "gravity" else "columns",
         if (app.color_mode == .kind) "type" else "component",
@@ -912,6 +914,8 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     const legend: []const struct { Model.Color, []const u8 } = switch (app.view) {
         .systems => &.{ .{ .schedule, "schedule" }, .{ .system, "system" }, .{ .module, "module (state)" }, .{ .value, "schedule value" } },
         .objects => &.{ .{ .module, "module" }, .{ .list, "mach.Objects list" }, .{ .object, "object" }, .{ .texture, "GPU object" } },
+        .threads => &.{ .{ .comp0, "thread / its systems" }, .{ .list, "mach.Objects list" }, .{ .value, "writes" }, .{ .edge, "reads" }, .{ .problem, "likely race" } },
+        .timeline => &.{ .{ .comp0, "thread lane" }, .{ .comp3, "system run (by system)" } },
         .gpu, .lifetimes => &.{ .{ .shader, "shader" }, .{ .pipeline, "pipeline" }, .{ .layout, "layout" }, .{ .bind_group, "bind group" }, .{ .buffer, "buffer" }, .{ .texture, "texture / view" }, .{ .sampler, "sampler" }, .{ .released, "released" }, .{ .problem, "problem" } },
     };
     var comp_legend: [Model.num_component_colors + 1]struct { Model.Color, []const u8 } = undefined;
