@@ -61,47 +61,6 @@ const MACHWindowDelegate = objc.objc.DefineClass(struct {
         return @ptrCast(@alignCast(implementation._state.get(d).?));
     }
 
-    /// Handles a potential window resize, framebuffer resize, or DPI change. Called from the
-    /// windowDidResize and windowDidChangeBackingProperties IMPs.
-    fn handleResize(n: *NativeState) void {
-        n.core.windows.lock();
-        defer n.core.windows.unlock();
-
-        const core_window = n.core.windows.getValue(n.window_id);
-
-        // Determine the current width / height / pixel density of the window.
-        const frame = n.window.frame();
-        const content_rect = n.window.contentRectForFrameRect(frame);
-        const width: u32 = @intFromFloat(content_rect.size.width);
-        const height: u32 = @intFromFloat(content_rect.size.height);
-        const pixel_density: f32 = @floatCast(n.window.backingScaleFactor());
-
-        // Skip the work if nothing actually changed (handleResize can be called for many reasons.)
-        if (core_window.width == width and
-            core_window.height == height and
-            core_window.pixel_density == pixel_density) return;
-
-        const fb_width: u32 = @intFromFloat(@as(f32, @floatFromInt(width)) * pixel_density);
-        const fb_height: u32 = @intFromFloat(@as(f32, @floatFromInt(height)) * pixel_density);
-
-        // Queue a swap chain recreation for the render thread.
-        n.pending_swap_chain_update = .{
-            .width = width,
-            .height = height,
-            .framebuffer_width = fb_width,
-            .framebuffer_height = fb_height,
-            .pixel_density = pixel_density,
-            .vsync_mode = core_window.vsync_mode,
-        };
-
-        n.core.pushEvent(.{ .resize = .{
-            .window_id = n.window_id,
-            .window_size = .{ .width = width, .height = height },
-            .framebuffer_size = .{ .width = fb_width, .height = fb_height },
-            .pixel_density = pixel_density,
-        } });
-    }
-
     pub const methods = struct {
         /// Called by AppKit when the user clicks the window's close button.
         pub fn @"windowShouldClose:"(self: *Self, _: ?*objc.app_kit.Window) bool {
@@ -189,10 +148,10 @@ const MACHView = objc.objc.DefineClass(struct {
     /// platforms (AppKit's is at the bottom-left).
     fn windowPosition(n: *NativeState, event: *objc.app_kit.Event) Position {
         const location = event.locationInWindow();
-        n.core.windows.lockShared();
-        const window_height: f32 = @floatFromInt(n.core.windows.get(n.window_id, .height));
-        n.core.windows.unlockShared();
-        return .{ .x = location.x, .y = window_height - location.y };
+        // The content's live height: the stored one lags behind resizes (it is applied by the
+        // render thread), and AppKit may have constrained the window to the screen.
+        const content_rect = n.window.contentRectForFrameRect(n.window.frame());
+        return .{ .x = location.x, .y = content_rect.size.height - location.y };
     }
 
     /// Pushes a `mouse_press` event. Shared by `mouseDown:`, `rightMouseDown:`, `otherMouseDown:`.
@@ -944,6 +903,11 @@ pub fn run(comptime on_each_update_fn: anytype, args_tuple: std.meta.ArgsTuple(@
 /// Called by Core.tick on the main thread each application tick. Creates new windows, applies
 /// changes (window title, size, vsync, etc.), and handles pending window destruction.
 pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
+    // Windows created this tick, whose actual size to sync once the windows lock is released: AppKit
+    // may constrain a new window to the screen (e.g. a 1440x900 window on a 1440x900 screen, with
+    // the menu bar and title bar) without a resize notification.
+    var created: std.ArrayList(*NativeState) = .empty;
+    defer created.deinit(core.allocator);
     // Window frame changes to apply once the windows lock is released (see below.)
     var pending_frames: std.ArrayList(struct {
         window: *objc.app_kit.Window,
@@ -979,7 +943,10 @@ pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
         const core_window = core.windows.getValue(window_id);
 
         const n = core_window.native orelse {
-            if (core_window.on_render != null) try initWindow(core, core_mod, window_id, io);
+            if (core_window.on_render != null) {
+                try initWindow(core, core_mod, window_id, io);
+                if (core.windows.get(window_id, .native)) |created_n| try created.append(core.allocator, created_n);
+            }
             continue;
         };
 
@@ -1105,6 +1072,7 @@ pub fn tick(core: *Core, core_mod: mach.Mod(Core), io: std.Io) !void {
     // Apply window frame changes now that the windows lock is released, since setFrame
     // synchronously invokes windowDidResize (handleResize) which acquires the lock itself.
     for (pending_frames.items) |p| p.window.setFrame_display_animate(p.frame, true, true);
+    for (created.items) |n| handleResize(n);
 
     // Consider mach.Core exiting/exited state.
     const state = core.state.load(.acquire);
@@ -1482,4 +1450,45 @@ fn machKeyFromKeycode(keycode: c_ushort) Key {
         };
     };
     return if (keycode > 0 and keycode <= table.len) table[keycode - 1] else if (keycode == 0) .a else .unknown;
+}
+
+/// Handles a potential window resize, framebuffer resize, or DPI change. Called from the
+/// windowDidResize and windowDidChangeBackingProperties IMPs.
+fn handleResize(n: *NativeState) void {
+    n.core.windows.lock();
+    defer n.core.windows.unlock();
+
+    const core_window = n.core.windows.getValue(n.window_id);
+
+    // Determine the current width / height / pixel density of the window.
+    const frame = n.window.frame();
+    const content_rect = n.window.contentRectForFrameRect(frame);
+    const width: u32 = @intFromFloat(content_rect.size.width);
+    const height: u32 = @intFromFloat(content_rect.size.height);
+    const pixel_density: f32 = @floatCast(n.window.backingScaleFactor());
+
+    // Skip the work if nothing actually changed (handleResize can be called for many reasons.)
+    if (core_window.width == width and
+        core_window.height == height and
+        core_window.pixel_density == pixel_density) return;
+
+    const fb_width: u32 = @intFromFloat(@as(f32, @floatFromInt(width)) * pixel_density);
+    const fb_height: u32 = @intFromFloat(@as(f32, @floatFromInt(height)) * pixel_density);
+
+    // Queue a swap chain recreation for the render thread.
+    n.pending_swap_chain_update = .{
+        .width = width,
+        .height = height,
+        .framebuffer_width = fb_width,
+        .framebuffer_height = fb_height,
+        .pixel_density = pixel_density,
+        .vsync_mode = core_window.vsync_mode,
+    };
+
+    n.core.pushEvent(.{ .resize = .{
+        .window_id = n.window_id,
+        .window_size = .{ .width = width, .height = height },
+        .framebuffer_size = .{ .width = fb_width, .height = fb_height },
+        .pixel_density = pixel_density,
+    } });
 }
