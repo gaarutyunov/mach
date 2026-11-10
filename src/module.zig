@@ -629,6 +629,12 @@ pub fn Modules(module_lists: anytype) type {
                             return m2.memoryStats(out);
                         }
                     }).memoryStats,
+                    ._set_schedule_param = (struct {
+                        fn set(modules_ptr: *anyopaque, schedule_name: []const u8, field: []const u8, value: bool) bool {
+                            const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));
+                            return inspect.setScheduleParam(m2, schedule_name, field, value);
+                        }
+                    }).set,
                     ._inspect = (struct {
                         fn inspectFn(modules_ptr: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void {
                             const m2: *Modules(module_lists) = @ptrCast(@alignCast(modules_ptr));

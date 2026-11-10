@@ -56,6 +56,7 @@ const Input = struct {
     offsets: []u32,
     adj: []u32,
     edge_count: u32,
+    alpha: f32,
 };
 
 const Pin = struct { index: u32, pos: [2]f32, pinned: bool };
@@ -130,8 +131,9 @@ fn freeInput(f: *Force, p: Input) void {
     f.allocator.free(p.adj);
 }
 
-/// Starts simulating a graph, from its nodes' current positions.
-pub fn setGraph(f: *Force, g: *const Model.Graph) !void {
+/// Starts simulating a graph, from its nodes' current positions, at `alpha` (1 for a new layout,
+/// lower to only settle what changed).
+pub fn setGraph(f: *Force, g: *const Model.Graph, alpha: f32) !void {
     const n = g.nodes.items.len;
     const nodes = try f.allocator.alloc(Node, n);
     errdefer f.allocator.free(nodes);
@@ -163,9 +165,9 @@ pub fn setGraph(f: *Force, g: *const Model.Graph) !void {
     f.mutex.lockUncancelable(f.io);
     defer f.mutex.unlock(f.io);
     if (f.pending) |old| f.freeInput(old);
-    f.pending = .{ .nodes = nodes, .offsets = offsets, .adj = adj, .edge_count = @intCast(g.edges.items.len) };
+    f.pending = .{ .nodes = nodes, .offsets = offsets, .adj = adj, .edge_count = @intCast(g.edges.items.len), .alpha = alpha };
     f.pins.clearRetainingCapacity();
-    f.alpha = 1;
+    f.alpha = alpha;
 }
 
 /// Pins a node at a position (its center), e.g. while it's dragged, and reheats the simulation so
@@ -347,7 +349,7 @@ fn upload(f: *Force, device: *gpu.Device, queue: *gpu.Queue, in: Input) !void {
     f.gpu_state = .{
         .count = count,
         .edge_count = in.edge_count,
-        .alpha = 1,
+        .alpha = in.alpha,
         .pipeline = pipeline,
         .layout = layout,
         .params = params,

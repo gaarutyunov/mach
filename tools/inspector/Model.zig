@@ -227,6 +227,8 @@ pub const Node = struct {
     released: bool = false,
     /// The GPU object it shows, if any (to select it from a problem).
     gpu_id: u32 = 0,
+    /// Bool schedule params which can be toggled in the running app.
+    toggles: []const Toggle = &.{},
     layer: u32 = 0,
     order: f32 = 0,
     x: f32 = 0,
@@ -234,6 +236,9 @@ pub const Node = struct {
     w: f32 = 0,
     h: f32 = 0,
 };
+
+/// A bool param of a schedule (e.g. a condition), with its current value.
+pub const Toggle = struct { schedule: []const u8, field: []const u8, value: bool };
 
 pub const Edge = struct {
     from: u32,
@@ -376,7 +381,19 @@ fn buildSystems(a: std.mem.Allocator, s: *const Snapshot, g: *Graph) !void {
                     } else try w.print("  {s}\n", .{p.kind});
                 }
             }
+            var toggles: std.ArrayList(Toggle) = .empty;
+            for (sys.params) |p| {
+                const is_bool = std.mem.eql(u8, p.type, "bool") or std.mem.indexOf(u8, p.type, "atomic.Value(bool)") != null;
+                const v = p.value orelse continue;
+                if (!is_bool or p.name.len == 0) continue;
+                try toggles.append(a, .{
+                    .schedule = try std.fmt.allocPrint(a, "{s}.{s}", .{ m.name, sys.name }),
+                    .field = p.name,
+                    .value = std.mem.eql(u8, v, "true"),
+                });
+            }
             _ = try g.addNode(a, .{
+                .toggles = toggles.items,
                 .key = systemKey(m.name, sys.name),
                 .label = try std.fmt.allocPrint(a, "{s}.{s}", .{ shortModule(m.name), sys.name }),
                 .sub = if (is_schedule) try std.fmt.allocPrint(a, "schedule, {d} entries", .{sys.entries.len}) else "",

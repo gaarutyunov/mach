@@ -8,8 +8,8 @@ messages pointing at your code.
 |---|---|---|---|
 | `mach.wgsl` | Compile-time WGSL reflection: derives and checks bind group layouts, bind groups, host structs, entry points and vertex buffers against a shader | `src/wgsl.zig` | always (comptime only) |
 | GPU tracker | Records every GPU object's lifetime, refcount, creation/release site and relations; validates bind groups and pipelines against layouts and shader reflection; reports over-releases, use after release and leaks | `src/sysgpu/track.zig` | `-Dgpu_track` (Debug default) |
-| `mach.dvx.Inspector` | Writes JSON snapshots of modules, systems, schedules, schedule dataflow, objects and the tracker's GPU objects | `src/dvx/Inspector.zig` | `-Dinspector` (Debug default) **and** `MACH_INSPECT=1` |
-| `mach-inspector` | Interactive graph viewer built with Mach (gfx.Sprite + gfx.Text). Not part of the runtime | `tools/inspector/` | `zig build inspector` |
+| `mach.dvx.Inspector` | Serves live snapshots of modules, systems, schedules, dataflow, threads, objects and the tracker's GPU objects to the tool, Tracy-style | `src/dvx/Inspector.zig` | `-Dinspector` (Debug default), recording only while a viewer is connected |
+| `mach-inspector` | Interactive graph viewer built with Mach (gfx.Sprite + gfx.Text) that connects to the running app. Not part of the runtime | `tools/inspector/` | `zig build inspector` |
 | `lint-gpu` | Static check that GPU resources acquired in a function get released | `src/dvx/gpu_lint.zig` | `zig build test` / `zig build lint-gpu` |
 
 ## Compile-time shader checks (`mach.wgsl`)
@@ -79,45 +79,60 @@ Source locations are best effort. Zig's debug info on macOS only resolves the in
 frame, so the tracker looks around sysgpu's inline API wrappers for your code. Each site also
 names its caller.
 
-## Snapshots and the viewer
+## The live inspector
 
-1. Register `mach.dvx.Inspector` in your `mach.Modules`. Schedule `.{ mach.dvx.Inspector, .init }`
-   in your init, and `.{ mach.dvx.Inspector, .tick }` on the thread that mutates your objects
-   (the examples/sprite app shows this).
-2. Run your app with `MACH_INSPECT=1`, or `MACH_INSPECT=path.json`. It rewrites
-   `mach-inspect.json` every second (`MACH_INSPECT_INTERVAL`). The file is replaced atomically.
-3. View it: `zig build inspector -- /abs/path/to/mach-inspect.json`, or run
-   `zig-out/bin/mach-inspector path.json`. The viewer reloads whenever the file changes.
+It works like Tracy:
+- **The app serves:** a Debug build with `mach.dvx.Inspector` registered listens on `127.0.0.1:8087`, or the next free port up to 8096. It records nothing until a viewer connects. While one is connected, it streams a snapshot every second.
+- **The tool connects:** run `zig build inspector`. It finds the running app, shows it live, and reconnects when you restart the app.
 
-From a project that depends on Mach: `b.installArtifact(mach_dep.artifact("mach-inspector"))`.
+1. Register `mach.dvx.Inspector` in your `mach.Modules`, and schedule:
+   - `.{ mach.dvx.Inspector, .init }` in your init
+   - `.{ mach.dvx.Inspector, .tick }` on the thread that mutates your objects (usually the app tick)
+   - `.{ mach.dvx.Inspector, .deinit }` on exit
+
+   See `examples/sprite`.
+2. Run your app (a Debug build, or `-Dinspector=true`).
+3. Run `zig build inspector`.
+
+The tool can also act on the app:
+- Select a schedule in the Systems view and click its bool params, such as conditions, to toggle them in the running app.
+- `R` requests a snapshot now.
+- `W` saves the current snapshot as a capture (`mach-capture-<n>.json`). Open it later, with no app running, with `zig build inspector -- mach-capture-<n>.json`.
+
+From a project that depends on Mach:
+
+```zig
+const run_inspector = b.addRunArtifact(mach_dep.artifact("mach-inspector"));
+run_inspector.addPassthruArgs();
+b.step("inspector", "Inspect the running app").dependOn(&run_inspector.step);
+```
 
 ### Views
 
-* **1 Systems**: schedules → their entries (numbered, with conditions); systems → the modules
-  they read, write or call (`mach.Mod`); schedule values (`ctx.schedule.put/get`, recorded at
-  runtime; `mach.Require`) → who puts and who reads them.
-* **2 Objects**: modules → `mach.Objects` lists (live/capacity) → objects → the objects they
-  reference by ID (e.g. `.window`, `.render_list`), parent/child relations, and the GPU objects
-  held in their fields (CPU → GPU).
-* **3 GPU**: textures → views → bind groups → pipelines; bind group layouts → pipeline layouts →
-  pipelines; shaders → pipelines; which bind groups each pipeline is drawn with. Objects the
-  app released but the backend keeps alive are labelled "kept alive by #N". Problems are red.
-* **4 Lifetimes**: a bar per GPU object from the frame it was created to the frame it was
-  released (open bars are still alive), then every creation site with created/released/alive
-  counts. Per-frame objects that pile up are flagged as leaks.
+* **1 Systems**: schedules → their entries (numbered, with conditions); systems → the modules they read, write or call (`mach.Mod`); schedule values (`ctx.schedule.put/get`, recorded while the tool is connected; `mach.Require`) → who puts and who reads them.
+* **2 Objects**: modules → `mach.Objects` lists (live/capacity) → objects → the objects they reference by ID (e.g. `.window`, `.render_list`), parent/child relations, and the GPU objects held in their fields (CPU → GPU).
+* **3 GPU**: textures → views → bind groups → pipelines; bind group layouts → pipeline layouts → pipelines; shaders → pipelines; which bind groups each pipeline is drawn with. Objects the app released but the backend keeps alive are labelled "kept alive by #N". Problems are red.
+* **4 Lifetimes**: a bar per GPU object from the frame it was created to the frame it was released (open bars are still alive), then every creation site with created/released/alive counts. Per-frame objects that pile up are flagged as leaks.
+* **5 Threads**: threads → the systems they run → the `mach.Objects` lists those read and write, with the locks held: the list's own lock and `mach.Core`'s render lock, which the app thread holds while it snapshots and the render thread holds while it renders. Likely races are red: a write on one thread and an access on another, overlapping in time, with no lock covering both.
+* **6 Timeline**: what each thread ran in the last 50 ms.
 
 ### Controls
 
-Drag the background to pan. Scroll or pinch to zoom. Click a node for its details (sites,
-refcount, memory, uploads, layout entries, shader bindings, connections). Drag a node to move
-it; positions persist across reloads.
+Drag the background to pan. Scroll or pinch to zoom. Click a node for its details (sites, refcount, memory, uploads, layout entries, shader bindings, connections, schedule params). Drag a node to move it; positions persist across updates.
 
-Keys: `1`–`4` views, `F` fit, `H` show released objects, `P` problems panel (click a problem to
-jump to its object), `L` relayout, `R` reload, `S` export SVG, `Esc` deselect, arrows pan,
-`+`/`-` zoom.
-
-Automation: `MACH_INSPECTOR_VIEW=gpu`, `MACH_INSPECTOR_SVG=prefix` exports all views,
-`MACH_INSPECTOR_SCREENSHOT=out.ppm` saves a rendered frame and exits.
+Keys:
+- `1`–`6`: switch views
+- `G`: layout, either gravity (columns from left to right, arranged by a GPU force simulation so related nodes line up) or plain columns
+- `C`: coloring, by type or by connected component
+- `F`: fit the view
+- `H`: show released objects
+- `P`: problems panel (click a problem to jump to its object)
+- `L`: relayout
+- `R`: request a snapshot
+- `W`: save a capture
+- `S`: export SVG
+- `Esc`: deselect
+- Arrows pan; `+`/`-` zoom.
 
 ## Snapshot format
 

@@ -31,6 +31,11 @@ pub fn start() void {
     recording.store(true, .release);
 }
 
+pub fn stop() void {
+    if (!enabled) return;
+    recording.store(false, .release);
+}
+
 pub fn isRecording() bool {
     return enabled and recording.load(.monotonic);
 }

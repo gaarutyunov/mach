@@ -251,3 +251,28 @@ pub fn write(m: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(",\"threads\":");
     try threads.writeJson(w, writeString, m.io);
 }
+
+/// Sets a bool (or `std.atomic.Value(bool)`) param of a schedule declared with `mach.scheduleWith`,
+/// by name ("module.schedule" and the field). Returns whether there was such a param.
+pub fn setScheduleParam(m: anytype, schedule_name: []const u8, field: []const u8, value: bool) bool {
+    if (!dataflow.enabled) return false;
+    const ParamsT = @TypeOf(m.schedule_params);
+    inline for (@typeInfo(ParamsT).@"struct".field_names) |name| {
+        if (std.mem.eql(u8, name, schedule_name)) {
+            const params = &@field(m.schedule_params, name);
+            inline for (@typeInfo(@TypeOf(params.*)).@"struct".field_names) |f| {
+                if (std.mem.eql(u8, f, field)) {
+                    const T = @TypeOf(@field(params, f));
+                    if (T == bool) {
+                        @field(params, f) = value;
+                        return true;
+                    } else if (T == std.atomic.Value(bool)) {
+                        @field(params, f).store(value, .release);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}

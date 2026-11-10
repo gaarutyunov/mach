@@ -1,8 +1,9 @@
-//! Mach inspector: an interactive graph of a running Mach program, from the snapshots written by
-//! `mach.dvx.Inspector` (run your app with `MACH_INSPECT=1`), built with Mach itself (gfx.Sprite
-//! and gfx.Text). Not part of the runtime: a separate tool, see `zig build inspector`.
+//! Mach inspector: interactive graphs of a running Mach program, streamed live by
+//! `mach.dvx.Inspector` (the tool connects to it like Tracy's viewer), or from a saved capture.
+//! Built with Mach itself (gfx.Sprite, gfx.Text). Not part of the runtime: a separate tool, see
+//! `zig build inspector`.
 //!
-//! Views (keys 1-4):
+//! Views (keys 1-6):
 //! 1. Systems: schedules, systems, the modules they access or call, and the schedule values
 //!    flowing between them (who puts and who reads `ctx.schedule` values).
 //! 2. Objects: modules' `mach.Objects` lists, their objects, relations between objects (IDs in
@@ -12,11 +13,15 @@
 //!    and which bind groups pipelines are drawn with. Problems found by the tracker are red.
 //! 4. Lifetimes: when each GPU object was created and released (frames), and the code creating
 //!    GPU objects with how many it created, released, and are still alive.
+//! 5. Threads: which systems run on which thread, the `mach.Objects` lists they access with the
+//!    locks held, and likely races.
+//! 6. Timeline: what each thread ran in the last 50 ms.
 //!
 //! Mouse: drag the background to pan, scroll or pinch to zoom, click a node to see its details
-//! and highlight its connections, drag a node to move it. Keys: F fit, R reload, H show released
-//! GPU objects, P problems, L relayout (forget moved nodes), Esc deselect, arrows pan, +/- zoom.
-//! The file is reloaded whenever the app writes a new snapshot.
+//! and highlight its connections, drag a node to move it, click a schedule's bool params to
+//! toggle them in the running app. Keys: G layout, C coloring, F fit, R request a snapshot,
+//! W save a capture, S export SVG, H show released GPU objects, P problems, L relayout,
+//! Esc deselect, arrows pan, +/- zoom. See README.md.
 const std = @import("std");
 const mach = @import("mach");
 const gpu = mach.gpu;
@@ -24,6 +29,8 @@ const gfx = mach.gfx;
 const math = mach.math;
 const Model = @import("Model.zig");
 const Force = @import("Force.zig");
+const Live = @import("Live.zig");
+const protocol = mach.dvx.inspector_protocol;
 
 const vec2 = math.vec2;
 const vec3 = math.vec3;
@@ -155,7 +162,7 @@ io: std.Io,
 window: mach.ObjectID,
 app_thread: mach.Thread,
 
-// MACH_INSPECTOR_SCREENSHOT=path.ppm: render one frame offscreen, save it, and exit.
+// `--screenshot path.ppm` (testing aid): render one frame offscreen, save it, and exit.
 screenshot_path: ?[]const u8 = null,
 shot_timer: ?mach.time.Timer = null,
 shot_texture: ?*gpu.Texture = null,
@@ -176,8 +183,12 @@ ui_text: mach.ObjectID = undefined,
 styles: [@typeInfo(TextStyle).@"enum".field_names.len]mach.ObjectID = undefined,
 
 // The snapshot file.
-path: []const u8,
+/// A capture file to show, or null to connect live to a running app.
+path: ?[]const u8,
 mtime: i96 = 0,
+live: Live,
+/// The raw JSON of the current snapshot, for saving captures.
+snapshot_json: ?[]u8 = null,
 reload_timer: mach.time.Timer,
 snapshot_arena: std.heap.ArenaAllocator,
 snapshot: ?Model.Snapshot = null,
@@ -194,7 +205,6 @@ moved: std.AutoHashMapUnmanaged(u64, [2]f32) = .empty,
 selected: ?u32 = null,
 show_problems: bool = true,
 needs_fit: bool = true,
-exported: bool = false,
 /// How graph views are laid out: a force simulation on the GPU (`G` toggles), or columns.
 layout_mode: enum { gravity, columns } = .gravity,
 /// How nodes are colored (`C` cycles).
@@ -204,6 +214,8 @@ components: []const Model.Component = &.{},
 force: Force,
 /// Fit the view once the force simulation settles.
 fit_on_settle: bool = false,
+/// Node positions of the previous scene, by key, to keep them when a new snapshot arrives.
+prev_positions: std.AutoHashMapUnmanaged(u64, [2]f32) = .empty,
 /// The zoom edges were last sized for.
 edges_zoom: f32 = 0,
 
@@ -230,6 +242,8 @@ ui_texts: std.ArrayList(mach.ObjectID) = .empty,
 /// The problem shown on each line of the problems panel, for clicks.
 problem_lines: std.ArrayList(u32) = .empty,
 problems_panel: [4]f32 = .{ 0, 0, 0, 0 },
+/// Clickable lines of the details panel: toggles of the selected schedule's bool params.
+toggle_lines: std.ArrayList(struct { y: f32, toggle: Model.Toggle }) = .empty,
 /// Other panels (x, y, w, h in window units, y down), which swallow clicks.
 panels: std.ArrayList([4]f32) = .empty,
 
@@ -241,36 +255,45 @@ pub fn init(core: *mach.Core, app: *App, app_mod: mach.Mod(App), core_mod: mach.
         .width = 1440,
         .height = 900,
     });
-    // The file: the first argument, or MACH_INSPECTOR_FILE, or mach-inspect.json.
-    var path: []const u8 = if (std.c.getenv("MACH_INSPECTOR_FILE")) |p| std.mem.span(p) else "mach-inspect.json";
+    // Arguments: an optional capture file to open (else connect live to a running app), and
+    // testing aids: `--view <name>` and `--screenshot <out.ppm>` (render once, save, exit).
+    var path: ?[]const u8 = null;
+    var view: Model.View = .gpu;
+    var screenshot: ?[]const u8 = null;
     if (mach.process_args) |args| {
         var it = try args.iterateAllocator(ctx.allocator);
+        defer it.deinit();
         _ = it.skip();
-        if (it.next()) |arg| path = try ctx.allocator.dupe(u8, arg);
-        it.deinit();
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--view")) {
+                if (it.next()) |v| view = std.meta.stringToEnum(Model.View, v) orelse view;
+            } else if (std.mem.eql(u8, arg, "--screenshot")) {
+                if (it.next()) |v| screenshot = try ctx.allocator.dupe(u8, v);
+            } else path = try ctx.allocator.dupe(u8, arg);
+        }
     }
-    const view: Model.View = if (std.c.getenv("MACH_INSPECTOR_VIEW")) |v| std.meta.stringToEnum(Model.View, std.mem.span(v)) orelse .gpu else .gpu;
-    const color_component = if (std.c.getenv("MACH_INSPECTOR_COLOR")) |v| std.mem.eql(u8, std.mem.span(v), "component") else false;
-    const columns = if (std.c.getenv("MACH_INSPECTOR_LAYOUT")) |v| std.mem.eql(u8, std.mem.span(v), "columns") else false;
     app.* = .{
-        .color_mode = if (color_component) .component else .kind,
-        .layout_mode = if (columns) .columns else .gravity,
-        .screenshot_path = if (std.c.getenv("MACH_INSPECTOR_SCREENSHOT")) |p| std.mem.span(p) else null,
+        .screenshot_path = screenshot,
         .view = view,
         .allocator = ctx.allocator,
         .io = ctx.io,
         .window = window,
         .path = path,
+        .live = Live.init(ctx.allocator, ctx.io),
         .reload_timer = mach.time.Timer.start(ctx.io),
         .force = Force.init(ctx.allocator, ctx.io),
         .snapshot_arena = .init(ctx.allocator),
         .graph_arena = .init(ctx.allocator),
         .app_thread = try mach.startThread(core, app_mod.id.tick, core_mod, .app),
     };
+    if (path == null) try app.live.start();
 }
 
 pub fn deinit(app: *App, sprite_mod: mach.Mod(gfx.Sprite), text_mod: mach.Mod(gfx.Text)) void {
     app.app_thread.join();
+    app.live.deinit();
+    app.prev_positions.deinit(app.allocator);
+    app.toggle_lines.deinit(app.allocator);
     // On the render thread, which owns the simulation's GPU resources.
     app.force.releaseGpu();
     app.force.deinit();
@@ -318,7 +341,11 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
                     app.fit();
                     dirty_camera = true;
                 },
-                .r => app.mtime = 0,
+                .r => {
+                    app.mtime = 0;
+                    if (app.path == null) app.live.send(.{ .cmd = "snapshot" });
+                },
+                .w => app.saveCapture(),
                 .s => app.exportSvg(app.view, "mach-inspect"),
                 .h => {
                     app.options.show_released = !app.options.show_released;
@@ -430,16 +457,9 @@ pub fn appTick(core: *mach.Core, app: *App, sprite: *gfx.Sprite, text: *gfx.Text
     }
 
     // Reload the snapshot when the file changes.
-    if (app.reload_timer.read() > 0.5 and app.drag == .none) {
+    if (app.reload_timer.read() > (if (app.path == null) @as(f64, 0.1) else 0.5) and app.drag == .none) {
         _ = app.reload_timer.lap();
-        if (app.reload()) {
-            dirty_scene = true;
-            // MACH_INSPECTOR_SVG=prefix: export every view of the first snapshot.
-            if (!app.exported) if (std.c.getenv("MACH_INSPECTOR_SVG")) |prefix| {
-                app.exported = true;
-                for ([_]Model.View{ .systems, .objects, .gpu, .lifetimes }) |v| app.exportSvg(v, std.mem.span(prefix));
-            };
-        }
+        if (app.reload()) dirty_scene = true;
     }
 
     if (app.simulating() and !dirty_scene) {
@@ -509,31 +529,62 @@ fn fit(app: *App) void {
     app.cam_y = (b[1] + b[3]) / 2 + (top_bar_h / 2) / app.zoom;
 }
 
-/// Reads the snapshot if the file changed. Returns whether it did.
+/// Takes the latest snapshot: from the live connection, or the capture file if it changed.
+/// Returns whether there was a new one.
 fn reload(app: *App) bool {
+    const path = app.path orelse {
+        var name_buf: [64]u8 = undefined;
+        const st = app.live.status(&name_buf);
+        if (!st.connected) {
+            app.setStatus("searching for a running Mach app on 127.0.0.1:{d}-{d} (Debug builds serve the inspector)", .{ protocol.first_port, protocol.first_port + protocol.num_ports - 1 });
+            return false;
+        }
+        const json = app.live.take() orelse {
+            app.setStatus("live: {s} (pid {d}, port {d}), {d} snapshots", .{ st.app, st.pid, st.port, st.snapshots });
+            return false;
+        };
+        app.setStatus("live: {s} (pid {d}, port {d}), {d} snapshots", .{ st.app, st.pid, st.port, st.snapshots });
+        return app.load(json);
+    };
     const cwd = std.Io.Dir.cwd();
-    const stat = cwd.statFile(app.io, app.path, .{}) catch {
-        app.setStatus("no snapshot at {s} (run your app with MACH_INSPECT=1)", .{app.path});
+    const stat = cwd.statFile(app.io, path, .{}) catch {
+        app.setStatus("can't open capture {s}", .{path});
         return false;
     };
     const mtime = stat.mtime.nanoseconds;
     if (mtime == app.mtime) return false;
-    _ = app.snapshot_arena.reset(.retain_capacity);
-    const a = app.snapshot_arena.allocator();
-    const json = cwd.readFileAlloc(app.io, app.path, a, .limited(512 * 1024 * 1024)) catch |err| {
-        app.setStatus("reading {s}: {s}", .{ app.path, @errorName(err) });
+    const json = cwd.readFileAlloc(app.io, path, app.allocator, .limited(512 * 1024 * 1024)) catch |err| {
+        app.setStatus("reading {s}: {s}", .{ path, @errorName(err) });
         return false;
     };
-    const snapshot = Model.parse(a, json) catch |err| {
-        // Possibly caught mid-write by a non-atomic writer: retry next time.
-        app.setStatus("parsing {s}: {s}", .{ app.path, @errorName(err) });
-        app.snapshot = null;
+    app.mtime = mtime;
+    app.setStatus("capture {s}", .{path});
+    return app.load(json);
+}
+
+/// Parses a snapshot, taking ownership of `json`.
+fn load(app: *App, json: []u8) bool {
+    if (app.snapshot_json) |old| app.allocator.free(old);
+    app.snapshot_json = json;
+    _ = app.snapshot_arena.reset(.retain_capacity);
+    app.snapshot = Model.parse(app.snapshot_arena.allocator(), json) catch |err| {
+        app.setStatus("parsing snapshot: {s}", .{@errorName(err)});
         return true;
     };
-    app.mtime = mtime;
-    app.snapshot = snapshot;
-    app.setStatus("{s}", .{app.path});
     return true;
+}
+
+/// Saves the current snapshot as a capture file, which the tool can open later.
+fn saveCapture(app: *App) void {
+    const json = app.snapshot_json orelse return;
+    const s = app.snapshot orelse return;
+    var name: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&name, "mach-capture-{d}.json", .{s.sequence}) catch return;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = json }) catch |err| {
+        app.setStatus("saving {s}: {s}", .{ path, @errorName(err) });
+        return;
+    };
+    app.setStatus("saved {s} (open it with: zig build inspector -- {s})", .{ path, path });
 }
 
 fn setStatus(app: *App, comptime fmt: []const u8, args: anytype) void {
@@ -555,7 +606,7 @@ fn exportSvg(app: *App, view: Model.View, prefix: []const u8) void {
         };
     }
     const path = std.fmt.allocPrint(a, "{s}-{s}.svg", .{ prefix, @tagName(view) }) catch return;
-    const title = std.fmt.allocPrint(a, "Mach inspector: {s} ({s}, snapshot #{d})", .{ view.title(), app.path, s.sequence }) catch return;
+    const title = std.fmt.allocPrint(a, "Mach inspector: {s} ({s}, snapshot #{d})", .{ view.title(), app.path orelse "live", s.sequence }) catch return;
     var out: std.Io.Writer.Allocating = .init(a);
     Model.writeSvg(&g, &out.writer, &palette, title) catch return;
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.written() }) catch |err| {
@@ -648,6 +699,11 @@ fn edgeTouchesSelection(app: *const App, e: Model.Edge) bool {
 fn rebuildScene(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
     if (!app.ready) return;
     app.deleteAll(sprite, text);
+    // Keep positions across snapshots of the same view.
+    app.prev_positions.clearRetainingCapacity();
+    if (!app.needs_fit) {
+        for (app.graph.nodes.items) |n| app.prev_positions.put(app.allocator, n.key, .{ n.x, n.y }) catch break;
+    }
     _ = app.graph_arena.reset(.retain_capacity);
     app.graph = .{};
     const s = app.snapshot orelse return;
@@ -666,7 +722,17 @@ fn rebuildScene(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
         app.components = try Model.colorByComponent(app.graph_arena.allocator(), &app.graph);
     }
     if (app.simulating()) {
-        try app.force.setGraph(&app.graph);
+        var known: usize = 0;
+        for (app.graph.nodes.items) |*n| {
+            if (app.prev_positions.get(n.key)) |pos| {
+                n.x = pos[0];
+                n.y = pos[1];
+                known += 1;
+            }
+        }
+        // Mostly the same graph (e.g. a new live snapshot): only settle what changed.
+        const warm = known * 10 >= app.graph.nodes.items.len * 9;
+        try app.force.setGraph(&app.graph, if (warm) 0.1 else 1);
         if (app.needs_fit) app.fit_on_settle = true;
     }
 
@@ -882,6 +948,15 @@ fn rebuildUi(app: *App, sprite: *gfx.Sprite, text: *gfx.Text) !void {
             if (e.to == sel) ins += 1;
             if (e.from == sel) outs += 1;
         }
+        app.toggle_lines.clearRetainingCapacity();
+        if (n.toggles.len > 0) {
+            d.add(.accent, "{s}", .{if (app.path == null) "params (click to toggle in the running app):" else "params (connect live to toggle):"});
+            for (n.toggles) |t| {
+                // Panel text starts 20 below the top bar; lines are ui_line_h apart.
+                try app.toggle_lines.append(app.allocator, .{ .y = top_bar_h + 20 + @as(f32, @floatFromInt(d.n)) * ui_line_h, .toggle = t });
+                d.add(if (t.value) .title else .dim, "  [{s}] .{s}", .{ if (t.value) "x" else " ", t.field });
+            }
+        }
         if (ins > 0) d.add(.accent, "from ({d}):", .{ins});
         for (app.graph.edges.items) |e| if (e.to == sel) d.add(.dim, "  <- {s}  {s}", .{ app.graph.nodes.items[e.from].label, e.label });
         if (outs > 0) d.add(.accent, "to ({d}):", .{outs});
@@ -951,6 +1026,18 @@ fn clickUi(app: *App, dirty_scene: *bool, dirty_camera: *bool) bool {
         const index = line / 2;
         if (index < app.problem_lines.items.len) app.showGpuObject(app.problem_lines.items[index], dirty_scene, dirty_camera);
         return true;
+    }
+    // Toggling a schedule param in the running app.
+    if (app.selected != null and app.mouse_x >= app.win_w - details_width - 10) {
+        for (app.toggle_lines.items) |l| {
+            if (app.mouse_y >= l.y - 2 and app.mouse_y < l.y + ui_line_h - 2) {
+                if (app.path == null) {
+                    app.live.send(.{ .cmd = "set_param", .schedule = l.toggle.schedule, .field = l.toggle.field, .value = !l.toggle.value });
+                    app.setStatus("set {s}.{s} = {}", .{ l.toggle.schedule, l.toggle.field, !l.toggle.value });
+                }
+                return true;
+            }
+        }
     }
     for (app.panels.items) |r| {
         if (app.mouse_x >= r[0] and app.mouse_x <= r[0] + r[2] and app.mouse_y >= r[1] and app.mouse_y <= r[1] + r[3]) return true;

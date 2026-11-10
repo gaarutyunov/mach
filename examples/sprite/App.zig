@@ -297,12 +297,14 @@ pub fn deinit(
     app: *App,
     sprite: *gfx.Sprite,
     sprite_mod: mach.Mod(gfx.Sprite),
+    inspector_mod: mach.Mod(mach.dvx.Inspector),
 ) void {
     app.app_thread.join();
     if (app.pipeline_id != null) sprite.objects.delete(app.player_id);
     // Release GPU resources before mach.Core releases the device.
     sprite_mod.call(.deinit);
     if (app.texture) |t| t.release();
+    inspector_mod.call(.deinit);
 }
 
 // TODO(sprite): don't require users to copy / write this helper themselves

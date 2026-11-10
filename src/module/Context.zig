@@ -49,6 +49,7 @@ _modules: *anyopaque,
 _report_memory: *const fn (modules: *anyopaque) void,
 _memory_stats: *const fn (modules: *anyopaque, out: []ModuleMemory) []ModuleMemory,
 _inspect: *const fn (modules: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void,
+_set_schedule_param: *const fn (modules: *anyopaque, schedule_name: []const u8, field: []const u8, value: bool) bool,
 _log: *const fn (level: std.log.Level, system_name: []const u8, msg: []const u8) void,
 _log_enabled: *const fn (level: std.log.Level) bool,
 
@@ -67,6 +68,14 @@ pub fn memoryStats(ctx: Context, out: []ModuleMemory) []ModuleMemory {
 /// `mach.dvx.Inspector`). Must be called from a system, on the thread mutating the objects.
 pub fn inspect(ctx: Context, w: *std.Io.Writer) std.Io.Writer.Error!void {
     return ctx._inspect(ctx._modules, w);
+}
+
+/// Sets a bool param of a schedule declared with `mach.scheduleWith` by name, e.g.
+/// `("app.render", "show_overlay", true)`, for tools like the inspector. Returns whether the
+/// schedule has such a param. Must be called on the thread running the schedule, or the param
+/// must be a `std.atomic.Value(bool)`.
+pub fn setScheduleParam(ctx: Context, schedule_name: []const u8, field: []const u8, value: bool) bool {
+    return ctx._set_schedule_param(ctx._modules, schedule_name, field, value);
 }
 
 /// Messages longer than this are truncated.
